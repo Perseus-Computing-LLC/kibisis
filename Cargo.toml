@@ -1,0 +1,13 @@
+[package]
+name = "kibisis"
+version = "0.1.0-alpha.1"
+edition = "2021"
+authors = ["Perseus Computing LLC <contact@perseuscomputing.com>"]
+description = "Local-first encrypted cognitive memory vault with atomic concurrency leases."
+license = "MIT"
+repository = "https://github.com/Perseus-Computing-LLC/kibisis"
+readme = "README.md"
+keywords = ["ai", "agents", "cognitive", "perseus"]
+categories = ["development-tools"]
+
+[dependencies]

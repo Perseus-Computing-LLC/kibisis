@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  test-python:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -24,8 +24,19 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pydantic cryptography hatchling
+          pip install pydantic hatchling cryptography
 
       - name: Run test suite
         run: |
           PYTHONPATH=src python -m unittest discover -s tests
+
+  test-rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cargo check
+        run: cargo check --verbose
+      - name: Cargo test
+        run: cargo test --verbose

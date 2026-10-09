@@ -8,7 +8,7 @@ version = "0.1.0a1"
 description = "Local-first encrypted cognitive memory vault with atomic concurrency leases."
 readme = "README.md"
 authors = [
-    { name = "Perseus Computing LLC", email = "tcconnally@gmail.com" }
+    { name = "Perseus Computing LLC", email = "contact@perseuscomputing.com" }
 ]
 license = { text = "MIT" }
 classifiers = [
