@@ -1,6 +1,6 @@
-# Telamon Claims & Benchmark Audit Ledger
+# Telarch Claims & Benchmark Audit Ledger
 
-> In accordance with Telamon engineering principles and the Agent Memory Atlas methodology, all architectural claims and benchmark figures in Telamon documentation must correspond to committed, runnable code with deterministic verification paths. Unsubstantiated claims are formally retired.
+> In accordance with Telarch engineering principles and the Agent Memory Atlas methodology, all architectural claims and benchmark figures in Telarch documentation must correspond to committed, runnable code with deterministic verification paths. Unsubstantiated claims are formally retired.
 
 ---
 
