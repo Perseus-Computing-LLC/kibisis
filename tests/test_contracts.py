@@ -24,7 +24,7 @@ class TestKibisisContracts(unittest.TestCase):
         entity = self.vault.put(
             category="convention",
             key="code_style",
-            content="Always use clean-room implementations with zero legacy reuse.",
+            content="Always use high-assurance implementations with zero legacy reuse.",
             metadata={"priority": "high"},
         )
         self.assertEqual(entity.version, 1)
@@ -39,7 +39,7 @@ class TestKibisisContracts(unittest.TestCase):
         self.assertEqual(fetched.metadata["priority"], "high")
 
         # FTS5 search
-        results = self.vault.search("clean-room")
+        results = self.vault.search("high-assurance")
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].entity.key, "code_style")
 
@@ -47,7 +47,7 @@ class TestKibisisContracts(unittest.TestCase):
         updated = self.vault.put(
             category="convention",
             key="code_style",
-            content="Always use clean-room implementations with MIT License.",
+            content="Always use high-assurance implementations with MIT License.",
         )
         self.assertEqual(updated.version, 2)
 
@@ -55,7 +55,7 @@ class TestKibisisContracts(unittest.TestCase):
         archived = self.vault.archive("convention", "code_style")
         self.assertTrue(archived)
         # Search should omit archived by default
-        self.assertEqual(len(self.vault.search("clean-room")), 0)
+        self.assertEqual(len(self.vault.search("high-assurance")), 0)
 
     def test_crypto_envelope_roundtrip(self):
         passphrase = "super-secret-perseus-key-2026"
