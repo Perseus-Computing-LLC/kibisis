@@ -120,6 +120,144 @@ class TestKibisisContracts(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.vault.put("secret", "key1", content)
 
+    def test_vault_storage_encryption_zero_plaintext_leakage(self):
+        """Canary test: verify AES-256-GCM envelope encryption leaves NO plaintext in SQLite or FTS5."""
+        import os
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+            db_path = tf.name
+
+        try:
+            passphrase = "canary-vault-passphrase-2026"
+            canary_text = "PERSEUS_TOP_SECRET_PAYLOAD_CANARY_42"
+
+            enc_vault = SQLiteMemoryVault(
+                db_path,
+                crypto_provider=self.crypto,
+                passphrase=passphrase,
+            )
+            enc_vault.put(
+                category="classified",
+                key="target_alpha",
+                content=canary_text,
+                metadata={"clearance": "top-secret"},
+            )
+
+            # Read back through vault
+            retrieved = enc_vault.get("classified", "target_alpha")
+            self.assertIsNotNone(retrieved)
+            assert retrieved is not None
+            self.assertEqual(retrieved.content, canary_text)
+            self.assertEqual(retrieved.metadata["clearance"], "top-secret")
+
+            enc_vault.close()
+
+            # Inspect raw SQLite database bytes on disk
+            with open(db_path, "rb") as f:
+                raw_bytes = f.read()
+
+            # CANARY ASSERTION: Plaintext MUST NOT appear anywhere in the database file bytes!
+            self.assertNotIn(
+                canary_text.encode("utf-8"),
+                raw_bytes,
+                "CRITICAL SECURITY FAILURE: Plaintext canary detected in raw SQLite storage bytes!",
+            )
+
+            # Raw SQLite inspection: check content column and FTS5 table
+            import sqlite3
+            raw_conn = sqlite3.connect(db_path)
+            raw_conn.row_factory = sqlite3.Row
+            cursor = raw_conn.cursor()
+
+            cursor.execute("SELECT content, is_encrypted, encrypted_envelope_json FROM entities WHERE key = 'target_alpha'")
+            row = cursor.fetchone()
+            self.assertEqual(row["content"], "", "Plaintext leaked in content column")
+            self.assertEqual(row["is_encrypted"], 1)
+            self.assertIsNotNone(row["encrypted_envelope_json"])
+            self.assertNotIn(canary_text, row["encrypted_envelope_json"])
+
+            # Verify FTS virtual table does not contain canary
+            cursor.execute("SELECT * FROM entities_fts WHERE entities_fts MATCH 'PERSEUS_TOP_SECRET_PAYLOAD_CANARY_42'")
+            self.assertEqual(len(cursor.fetchall()), 0)
+            raw_conn.close()
+
+            # Open with wrong passphrase -> decryption must fail
+            bad_vault = SQLiteMemoryVault(
+                db_path,
+                crypto_provider=self.crypto,
+                passphrase="wrong-passphrase",
+            )
+            with self.assertRaises(Exception):
+                bad_vault.get("classified", "target_alpha")
+            bad_vault.close()
+
+        finally:
+            if os.path.exists(db_path):
+                os.remove(db_path)
+
+    def test_tombstone_evasion_hardening(self):
+        """Verify negative memory tombstones resist casing, punctuation, and unicode lookalike evasion."""
+        # Ingest baseline
+        self.vault.put("rules", "safety_directive", "Do Not Target Civilians")
+
+        # Tombstone it
+        self.vault.tombstone("rules", "safety_directive", reason="critical_policy_violation")
+        self.assertIsNone(self.vault.get("rules", "safety_directive"))
+
+        # Evasion attempts that naive SHA-256 would fail to block:
+        evasion_variants = [
+            "do not target civilians",
+            "   Do   Not    Target   Civilians  ",
+            "DO NOT TARGET CIVILIANS",
+            "Do Not Target Civilians!",
+            "“Do Not Target Civilians”",
+            "Do Not Target Civilians...",
+            "Do Not Target Civilians —",  # unicode em-dash punctuation
+            "Ｄｏ Ｎｏｔ Ｔａｒｇｅｔ Ｃｉｖｉｌｉａｎｓ",  # Unicode NFKC fullwidth
+        ]
+
+        for variant in evasion_variants:
+            self.assertTrue(
+                self.vault.is_tombstoned("rules", "safety_directive", variant),
+                f"Failed to identify tombstoned variant: {variant!r}",
+            )
+            with self.assertRaises(ValueError, msg=f"Allowed evasion variant: {variant!r}"):
+                self.vault.put("rules", "safety_directive", variant)
+
+        # Legitimate different content should succeed
+        clean = self.vault.put("rules", "safety_directive", "Authorize Defensive Intercept Only")
+        self.assertIsNotNone(clean)
+        self.assertEqual(clean.content, "Authorize Defensive Intercept Only")
+
+    def test_encrypted_vault_tombstone_and_wildcard(self):
+        """Verify tombstones work on encrypted entities and support category-wide wildcard scope."""
+        vault = SQLiteMemoryVault(
+            ":memory:",
+            crypto_provider=self.crypto,
+            passphrase="vault-encryption-test",
+        )
+
+        # Put encrypted entity
+        vault.put("intel", "loc_alpha", "Coordinates Locked at Grid 9")
+        # Tombstone it (decrypts entity, derives canonical hash, purges entity)
+        vault.tombstone("intel", "loc_alpha", reason="compromised_grid")
+        self.assertIsNone(vault.get("intel", "loc_alpha"))
+
+        # Re-assertion with casing variation must be rejected
+        with self.assertRaises(ValueError):
+            vault.put("intel", "loc_alpha", "coordinates locked at grid 9!")
+
+        # Cross-key wildcard tombstone
+        vault.tombstone("intel", "*", reason="prohibited_doctrine", content="Execute First Strike")
+        # Attempt to insert under any key in category "intel" must fail
+        with self.assertRaises(ValueError):
+            vault.put("intel", "node_12", "execute first strike!")
+        with self.assertRaises(ValueError):
+            vault.put("intel", "node_99", "Execute First Strike.")
+
+        vault.close()
+
 
 if __name__ == "__main__":
     unittest.main()
