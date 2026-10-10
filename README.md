@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.85-informational.svg)](Cargo.toml)
 
-Part of the **Perseus** suite by [Perseus Computing LLC](https://github.com/Perseus-Computing-LLC).
+Part of the **Telamon Suite** (TCI / Telamon Cognitive Infrastructure) by [Perseus Computing LLC](https://github.com/Perseus-Computing-LLC).
 
 ---
 

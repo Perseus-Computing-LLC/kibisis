@@ -1,6 +1,6 @@
-# Perseus Claims & Benchmark Audit Ledger
+# Telamon Claims & Benchmark Audit Ledger
 
-> In accordance with Perseus engineering principles and the Agent Memory Atlas methodology, all architectural claims and benchmark figures in Perseus documentation must correspond to committed, runnable code with deterministic verification paths. Unsubstantiated claims are formally retired.
+> In accordance with Telamon engineering principles and the Agent Memory Atlas methodology, all architectural claims and benchmark figures in Telamon documentation must correspond to committed, runnable code with deterministic verification paths. Unsubstantiated claims are formally retired.
 
 ---
 
