@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -87,6 +88,27 @@ class SQLiteMemoryVault(MemoryVault):
                 """
             )
 
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rejected_value_tombstones (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    category TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    value_sha256 TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    author_id TEXT,
+                    created_at REAL NOT NULL,
+                    UNIQUE(category, key, value_sha256)
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_rejected_tombstones_lookup
+                ON rejected_value_tombstones(category, key, value_sha256)
+                """
+            )
+
     def put(
         self,
         category: str,
@@ -97,9 +119,20 @@ class SQLiteMemoryVault(MemoryVault):
         now = time.time()
         meta = metadata or {}
         meta_str = json.dumps(meta, sort_keys=True)
+        val_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
 
         with self._conn:
             cursor = self._conn.cursor()
+            cursor.execute(
+                "SELECT reason, author_id FROM rejected_value_tombstones WHERE category = ? AND key = ? AND value_sha256 = ?",
+                (category, key, val_hash),
+            )
+            tomb = cursor.fetchone()
+            if tomb is not None:
+                raise ValueError(
+                    f"Write rejected by tombstone: entity '{category}:{key}' value matches rejected digest {val_hash} (reason: {tomb['reason']})"
+                )
+
             cursor.execute(
                 "SELECT id, version, created_at FROM entities WHERE category = ? AND key = ?",
                 (category, key),
@@ -314,6 +347,58 @@ class SQLiteMemoryVault(MemoryVault):
                 )
             )
         return items
+
+    def tombstone(
+        self,
+        category: str,
+        key: str,
+        reason: str = "revocation",
+        author_id: Optional[str] = None,
+    ) -> str:
+        """Tombstone the current entity value, storing only its SHA-256 digest, then purging all content from live and search tables."""
+        now = time.time()
+        with self._conn:
+            cursor = self._conn.cursor()
+            cursor.execute("SELECT content FROM entities WHERE category = ? AND key = ?", (category, key))
+            row = cursor.fetchone()
+            if row is None:
+                raise KeyError(f"Entity not found: {category}:{key}")
+            content = row["content"]
+            val_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO rejected_value_tombstones (category, key, value_sha256, reason, author_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (category, key, val_hash, reason, author_id, now),
+            )
+            # Physical purge of entity and FTS index (triggers handle FTS delete)
+            cursor.execute("DELETE FROM entities WHERE category = ? AND key = ?", (category, key))
+            return val_hash
+
+    def is_tombstoned(self, category: str, key: str, content: str) -> bool:
+        """Check if a specific content string is tombstoned under the given category and key."""
+        val_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        cursor = self._conn.cursor()
+        cursor.execute(
+            "SELECT 1 FROM rejected_value_tombstones WHERE category = ? AND key = ? AND value_sha256 = ?",
+            (category, key, val_hash),
+        )
+        return cursor.fetchone() is not None
+
+    def list_tombstones(self, category: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List tombstone records containing only digest, reason, author, and timestamp (never plaintext)."""
+        cursor = self._conn.cursor()
+        if category:
+            cursor.execute(
+                "SELECT id, category, key, value_sha256, reason, author_id, created_at FROM rejected_value_tombstones WHERE category = ? ORDER BY id",
+                (category,),
+            )
+        else:
+            cursor.execute(
+                "SELECT id, category, key, value_sha256, reason, author_id, created_at FROM rejected_value_tombstones ORDER BY id"
+            )
+        return [dict(r) for r in cursor.fetchall()]
 
     def close(self) -> None:
         self._conn.close()

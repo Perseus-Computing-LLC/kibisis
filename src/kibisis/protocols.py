@@ -84,3 +84,21 @@ class MemoryVault(Protocol):
     ) -> List[MemoryEntity]:
         """List entities matching optional category and archive filters."""
         ...
+
+    def tombstone(
+        self,
+        category: str,
+        key: str,
+        reason: str = "revocation",
+        author_id: Optional[str] = None,
+    ) -> str:
+        """Tombstone entity value by SHA-256 digest and purge plaintext content."""
+        ...
+
+    def is_tombstoned(self, category: str, key: str, content: str) -> bool:
+        """Check if content value is tombstoned under category and key."""
+        ...
+
+    def list_tombstones(self, category: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List active tombstone records (digests only, zero plaintext)."""
+        ...

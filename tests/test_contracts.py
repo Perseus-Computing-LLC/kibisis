@@ -98,6 +98,28 @@ class TestKibisisContracts(unittest.TestCase):
         self.assertEqual(lease2.fencing_token, 2)
         self.assertEqual(lease2.holder_id, "worker_beta")
 
+    def test_tombstone_and_rejection(self):
+        content = "Confidential canary payload value"
+        import hashlib
+        expected_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+        # Ingest entity
+        self.vault.put("secret", "key1", content)
+        self.assertIsNotNone(self.vault.get("secret", "key1"))
+
+        # Tombstone entity
+        tomb_hash = self.vault.tombstone("secret", "key1", reason="revocation_test")
+        self.assertEqual(tomb_hash, expected_hash)
+        self.assertTrue(self.vault.is_tombstoned("secret", "key1", content))
+
+        # Direct get and search must be empty
+        self.assertIsNone(self.vault.get("secret", "key1"))
+        self.assertEqual(len(self.vault.search("canary")), 0)
+
+        # Re-ingestion must be rejected by tombstone
+        with self.assertRaises(ValueError):
+            self.vault.put("secret", "key1", content)
+
 
 if __name__ == "__main__":
     unittest.main()
