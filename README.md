@@ -34,7 +34,7 @@ Add `kibisis` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-kibisis = "0.1.0-alpha.1"
+kibisis = "0.1.0-alpha.2"
 ```
 
 Or via Cargo:
