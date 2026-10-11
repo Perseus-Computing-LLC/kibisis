@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import string
 import time
 import unicodedata
 from typing import Any, Dict, List, Optional
+from .crypto import AESGCMCryptoEnvelopeProvider
+from .keys import MIN_PASSPHRASE_LENGTH, resolve_passphrase
 from .models import EncryptedEnvelope, MemoryEntity, SearchResult
-from .protocols import CryptoEnvelopeProvider, MemoryVault
+from .protocols import CryptoEnvelopeProvider, EncryptionRequiredError, MemoryVault
 
 
 def canonicalize_text(text: str) -> str:
@@ -38,14 +41,86 @@ class SQLiteMemoryVault(MemoryVault):
         db_path: str = ":memory:",
         crypto_provider: Optional[CryptoEnvelopeProvider] = None,
         passphrase: Optional[str] = None,
+        *,
+        allow_plaintext: bool = False,
     ) -> None:
+        """Open a vault. Entry content is encrypted by default.
+
+        The passphrase comes from the argument, then KIBISIS_PASSPHRASE_FILE, then KIBISIS_PASSPHRASE.
+        With no passphrase the vault refuses to open (EncryptionRequiredError) unless ``allow_plaintext=True``.
+        An in-memory vault never touches disk, so it may run without a passphrase.
+        """
         self.db_path = db_path
-        self.crypto_provider = crypto_provider
+        on_disk = db_path != ":memory:"
+        passphrase = resolve_passphrase(passphrase)
+        if passphrase and len(passphrase) < MIN_PASSPHRASE_LENGTH:
+            raise ValueError(f"passphrase must be at least {MIN_PASSPHRASE_LENGTH} characters")
+        if passphrase is None and crypto_provider is None and on_disk and not allow_plaintext:
+            raise EncryptionRequiredError(
+                "No passphrase supplied. Set KIBISIS_PASSPHRASE_FILE (preferred) or KIBISIS_PASSPHRASE, "
+                "pass passphrase=..., or open with allow_plaintext=True to store content unencrypted."
+            )
         self.passphrase = passphrase
+        self.crypto_provider = crypto_provider
         self._conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._configure_db()
         self._init_schema()
+        if passphrase and crypto_provider is None:
+            self.crypto_provider = AESGCMCryptoEnvelopeProvider(salt=self._vault_salt())
+        if on_disk:
+            self._restrict_permissions()
+
+    def _vault_salt(self) -> bytes:
+        """One random KDF salt per vault, stored beside the data. A salt is not a secret."""
+        with self._conn:
+            self._conn.execute("CREATE TABLE IF NOT EXISTS vault_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL)")
+            row = self._conn.execute("SELECT value FROM vault_meta WHERE key = 'kdf_salt'").fetchone()
+            if row is not None:
+                return bytes(row[0])
+            salt = os.urandom(16)
+            self._conn.execute("INSERT INTO vault_meta (key, value) VALUES ('kdf_salt', ?)", (salt,))
+            return salt
+
+    def _restrict_permissions(self) -> None:
+        for suffix in ("", "-wal", "-shm"):
+            path = self.db_path + suffix
+            try:
+                if os.path.exists(path):
+                    os.chmod(path, 0o600)
+            except OSError:
+                pass
+
+    def encryption_status(self) -> Dict[str, int]:
+        """Counts of live entries by storage form. ``plaintext`` should be 0 on an encrypted vault."""
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(is_encrypted = 1), 0) AS enc, COALESCE(SUM(is_encrypted = 0), 0) AS plain FROM entities"
+        ).fetchone()
+        return {"encrypted": int(row["enc"]), "plaintext": int(row["plain"])}
+
+    def migrate_plaintext(self) -> Dict[str, int]:
+        """Encrypt every plaintext entry in place, then remove the old plaintext from the search index,
+        the write-ahead log and free pages. Returns {"migrated": n, "remaining_plaintext": m}."""
+        if self.crypto_provider is None or not self.passphrase:
+            raise EncryptionRequiredError("migrate_plaintext needs a passphrase.")
+        rows = self._conn.execute("SELECT id, content FROM entities WHERE is_encrypted = 0").fetchall()
+        with self._conn:
+            for r in rows:
+                env = self.crypto_provider.encrypt(r["content"].encode("utf-8"), self.passphrase)
+                self._conn.execute(
+                    "UPDATE entities SET content = '', is_encrypted = 1, encrypted_envelope_json = ? WHERE id = ?",
+                    (env.model_dump_json(), r["id"]),
+                )
+        # FTS5 'delete' leaves old terms in index segments until rebuilt; WAL and free pages keep old bytes too.
+        self._conn.execute("INSERT INTO entities_fts(entities_fts) VALUES ('rebuild')")
+        self._conn.execute("INSERT INTO entities_fts(entities_fts) VALUES ('optimize')")
+        self._conn.commit()
+        if self.db_path != ":memory:":
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self._conn.execute("VACUUM")
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self._restrict_permissions()
+        return {"migrated": len(rows), "remaining_plaintext": self.encryption_status()["plaintext"]}
 
     def _configure_db(self) -> None:
         if self.db_path != ":memory:":
