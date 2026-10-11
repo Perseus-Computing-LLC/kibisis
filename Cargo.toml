@@ -7,7 +7,7 @@ description = "Local-first encrypted cognitive memory vault with atomic concurre
 license = "MIT"
 repository = "https://github.com/Perseus-Computing-LLC/kibisis"
 readme = "README.md"
-keywords = ["ai", "agents", "cognitive", "perseus"]
+keywords = ["ai", "agents", "cognitive", "telarch"]
 categories = ["development-tools"]
 
 [dependencies]

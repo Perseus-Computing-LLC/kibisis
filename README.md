@@ -129,18 +129,20 @@ vault.tombstone(category="tactical", content="Do Not Target Civilians")
 
 Measured on bare-metal Linux x86_64 (`rustc 1.85.0`, `opt-level = 3`, `lto = "fat"`):
 
-| Metric | Measurement | Test condition |
-| :--- | :--- | :--- |
-| **Lease Throughput** | **1,560,000+ ops/s** | Multi-threaded read and write contention (8 threads) |
-| **Write Throughput** | **2,100,000+ writes/s** | Sustained sequential envelope commits |
-| **Contention Race Errors** | **0 Errors** | 100% thread contention |
-| **Swarm Partition Split-Brain** | **0 Errors** | 10-node simulated partition under 50% packet drop |
-| **Recovery Latency** | **0.42 ms** | Partition heal state convergence |
+| Metric | Measurement | Test condition | Operational Guarantee |
+| :--- | :--- | :--- | :--- |
+| **Write Throughput** | **2,098,000+ writes/s** | Sustained sequential envelope commits | Local zero-contention vault ingestion |
+| **SWMR Contention (16 Workers)** | **1,696,000+ ops/s** | 16 concurrent worker threads (`adversarial_contention`) | 0.59 &micro;s latency; 0 split-brain conflicts |
+| **SWMR Contention (32 Workers)** | **1,776,000+ ops/s** | 32 concurrent worker threads (`adversarial_contention`) | 0.56 &micro;s latency; 0 fencing regressions |
+| **Swarm Partition Split-Brain** | **0 Errors** | 10-node simulated partition under 50% packet drop | 100% convergence across edge mesh (599k msgs/s) |
+| **Partition Reconciliation** | **0.42 ms** | Partition heal state convergence | Monotonic vector clock reconciliation |
 
 Run benchmarks yourself:
 
 ```bash
-cargo run --release -p perseus-benchmarks
+cargo run --release -p telarch-benchmarks
+cargo run --release -p telarch-benchmarks --bin adversarial_contention
+cargo run --release -p telarch-benchmarks --bin swarm_partition
 ```
 
 ---
