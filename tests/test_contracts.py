@@ -164,10 +164,11 @@ class TestKibisisContracts(unittest.TestCase):
                 "CRITICAL SECURITY FAILURE: Plaintext canary detected in raw SQLite storage bytes!",
             )
 
-            # Raw SQLite inspection: check content column and FTS5 table
-            import sqlite3
-            raw_conn = sqlite3.connect(db_path)
-            raw_conn.row_factory = sqlite3.Row
+            # SQLCipher inspection: check content column and FTS5 table
+            import sqlcipher3
+            raw_conn = sqlcipher3.connect(db_path)
+            raw_conn.execute(f"PRAGMA key = '{passphrase}';")
+            raw_conn.row_factory = sqlcipher3.Row
             cursor = raw_conn.cursor()
 
             cursor.execute("SELECT content, is_encrypted, encrypted_envelope_json FROM entities WHERE key = 'target_alpha'")
@@ -183,14 +184,14 @@ class TestKibisisContracts(unittest.TestCase):
             raw_conn.close()
 
             # Open with wrong passphrase -> decryption must fail
-            bad_vault = SQLiteMemoryVault(
-                db_path,
-                crypto_provider=self.crypto,
-                passphrase="wrong-passphrase",
-            )
             with self.assertRaises(Exception):
+                bad_vault = SQLiteMemoryVault(
+                    db_path,
+                    crypto_provider=self.crypto,
+                    passphrase="wrong-passphrase",
+                )
                 bad_vault.get("classified", "target_alpha")
-            bad_vault.close()
+                bad_vault.close()
 
         finally:
             if os.path.exists(db_path):

@@ -1,6 +1,7 @@
 """Encryption-by-default contract for the Kibisis vault."""
 
 import os
+import sqlcipher3
 import sqlite3
 import stat
 import tempfile
@@ -96,9 +97,8 @@ class TestEncryptionByDefault(unittest.TestCase):
         v = SQLiteMemoryVault(self.db, passphrase=PASS)
         v.put("c", "k", CANARY)
         v.close()
-        bad = SQLiteMemoryVault(self.db, passphrase="another passphrase entirely")
         with self.assertRaises(Exception):
-            bad.get("c", "k")
+            SQLiteMemoryVault(self.db, passphrase="another passphrase entirely")
 
     def test_search_finds_encrypted_content(self):
         v = SQLiteMemoryVault(self.db, passphrase=PASS)
@@ -142,17 +142,20 @@ class TestEncryptionByDefault(unittest.TestCase):
         enc.close()
         self.assertNotIn(CANARY.lower().encode(), _raw_bytes(self.db))
         self.assertEqual(SQLiteMemoryVault(self.db, passphrase=PASS).get("c", "k1").content, f"first {CANARY}")
-        raw = sqlite3.connect(self.db)
+        raw = sqlcipher3.connect(self.db)
+        raw.execute(f"PRAGMA key = '{PASS}';")
         self.assertEqual(raw.execute("SELECT count(*) FROM entities_fts WHERE entities_fts MATCH ?", ('"' + CANARY + '"',)).fetchone()[0], 0)
+        raw.close()
 
     def test_key_and_metadata_stay_plaintext_and_content_does_not(self):
-        """Documented limit: category, key and metadata are searchable plaintext. Content never is."""
+        """Zero plaintext leakage: category, key, metadata and content are completely encrypted on disk."""
         v = SQLiteMemoryVault(self.db, passphrase=PASS)
         v.put("cat-visible", "key-visible", CANARY, {"tag": "meta-visible"})
         v.close()
         raw = _raw_bytes(self.db)
-        self.assertIn(b"key-visible", raw)
-        self.assertIn(b"meta-visible", raw)
+        self.assertNotIn(b"cat-visible", raw)
+        self.assertNotIn(b"key-visible", raw)
+        self.assertNotIn(b"meta-visible", raw)
         self.assertNotIn(CANARY.lower().encode(), raw)
 
     def test_migration_is_idempotent(self):

@@ -22,7 +22,7 @@ Kibisis gives you an embedded memory vault with atomic Single-Writer Multi-Reade
 ## Key design goals
 
 - **Atomic concurrency leases:** Fast lease acquisition with automatic timeout prevents competing workers from corrupting shared keys.
-- **Encrypted by default (Python package):** An on-disk vault refuses to open without a passphrase. Entry content is encrypted with AES-256-GCM; the key comes from PBKDF2-SHA256 with 600,000 iterations (envelopes written earlier, at 100,000, still open). Category, key and metadata stay in plain text so they can be searched.
+- **Encrypted by default:** An on-disk vault refuses to open without a passphrase. Full-database page-level encryption via SQLCipher ensures zero plaintext leakage (schema, tables, keys, categories, metadata, and indexes). Entry payloads additionally feature AES-256-GCM envelope encryption with PBKDF2-SHA256 (600,000 iterations). Raw disk scans reveal zero plaintext.
 - **High throughput:** Handles over 1,560,000 lease operations per second under heavy thread contention.
 - **Offline and partition resilient:** Tested in 10-node simulated edge partitions with zero split-brain errors.
 - **Evasion-resistant tombstones:** Rejected-value tombstones use canonicalized text hashing (Unicode NFKC, casefold, punctuation stripping, whitespace normalization) to prevent prompt injection and evasion.
@@ -67,25 +67,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vault = InMemoryMemoryVault::new();
     let coordinator = InMemoryLeaseCoordinator::new();
 
-    // 1. Acquire time-bounded write lease
-    let key = "target_vector_alpha";
-    let lease = coordinator.acquire_write_lease(key, Duration::from_millis(50))?;
-    println!("Acquired write lease: {}", lease.token);
+    // 1. Acquire time-bounded write lease with fencing token
+    let resource = "target_vector_alpha";
+    let lease = coordinator.acquire(resource, "worker_0", Duration::from_millis(50))?;
+    println!("Acquired write lease: fencing_token={}", lease.fencing_token);
 
     // 2. Commit encrypted memory entity under active lease
     let entity = MemoryEntity::new(
         "spatial_plan",
-        key,
+        "waypoint_4",
         "Waypoint 4 confirmed: telemetry coordinates locked.",
     );
     vault.put(&entity)?;
 
     // 3. Explicitly release lease upon completion
-    coordinator.release_lease(&lease.token)?;
+    coordinator.release(&lease)?;
     println!("Lease released successfully.");
 
     // 4. Retrieve and query memory entities
-    let query_results = vault.search("telemetry")?;
+    let query_results = vault.search("telemetry", None, 10)?;
     for result in query_results {
         println!(
             "Matched entity [{}]: {} (score: {})",

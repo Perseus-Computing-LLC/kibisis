@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlcipher3
 import sqlite3
 import string
 import time
@@ -62,14 +63,54 @@ class SQLiteMemoryVault(MemoryVault):
             )
         self.passphrase = passphrase
         self.crypto_provider = crypto_provider
-        self._conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
+
+        # Check for unencrypted database migration if passphrase is provided
+        if on_disk and passphrase and os.path.exists(db_path) and os.path.getsize(db_path) > 0:
+            with open(db_path, "rb") as f:
+                hdr = f.read(16)
+            if hdr.startswith(b"SQLite format 3"):
+                # Migrate existing plaintext SQLite database to encrypted SQLCipher database
+                self._migrate_file_to_sqlcipher(db_path, passphrase)
+
+        self._conn = sqlcipher3.connect(db_path, timeout=30.0, check_same_thread=False)
+        self._conn.row_factory = sqlcipher3.Row
+        if passphrase:
+            escaped_pass = passphrase.replace("'", "''")
+            self._conn.execute(f"PRAGMA key = '{escaped_pass}';")
+            # Verify the key immediately by accessing sqlite_master
+            try:
+                self._conn.execute("SELECT count(*) FROM sqlite_master;").fetchall()
+            except Exception as e:
+                self._conn.close()
+                raise ValueError("Failed to authenticate or decrypt vault database with provided passphrase") from e
         self._configure_db()
         self._init_schema()
         if passphrase and crypto_provider is None:
             self.crypto_provider = AESGCMCryptoEnvelopeProvider(salt=self._vault_salt())
         if on_disk:
             self._restrict_permissions()
+
+    @staticmethod
+    def _migrate_file_to_sqlcipher(path: str, passphrase: str) -> None:
+        temp_enc = path + ".tmp_enc"
+        if os.path.exists(temp_enc):
+            os.unlink(temp_enc)
+        escaped_pass = passphrase.replace("'", "''")
+        conn_raw = sqlcipher3.connect(path)
+        try:
+            conn_raw.execute(f"ATTACH DATABASE '{temp_enc}' AS encrypted KEY '{escaped_pass}';")
+            conn_raw.execute("SELECT sqlcipher_export('encrypted');")
+            conn_raw.execute("DETACH DATABASE encrypted;")
+        finally:
+            conn_raw.close()
+        for ext in ("-wal", "-shm"):
+            p = path + ext
+            if os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+        os.replace(temp_enc, path)
 
     def _vault_salt(self) -> bytes:
         """One random KDF salt per vault, stored beside the data. A salt is not a secret."""

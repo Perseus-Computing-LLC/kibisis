@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import os
+import sqlcipher3
 import sqlite3
 import time
 from typing import Optional
+from .keys import resolve_passphrase
 from .models import Lease
 from .protocols import LeaseConflictError, LeaseCoordinator
 
@@ -12,10 +15,16 @@ from .protocols import LeaseConflictError, LeaseCoordinator
 class SQLiteLeaseCoordinator(LeaseCoordinator):
     """Atomic concurrency lease coordinator utilizing SQLite transactions and monotonic fencing tokens."""
 
-    def __init__(self, db_path: str = ":memory:") -> None:
+    def __init__(self, db_path: str = ":memory:", passphrase: Optional[str] = None) -> None:
         self.db_path = db_path
-        self._conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
+        passphrase = resolve_passphrase(passphrase)
+        self.passphrase = passphrase
+
+        self._conn = sqlcipher3.connect(db_path, timeout=30.0, check_same_thread=False)
+        self._conn.row_factory = sqlcipher3.Row
+        if passphrase:
+            esc = passphrase.replace("'", "''")
+            self._conn.execute(f"PRAGMA key = '{esc}';")
         self._init_schema()
 
     def _init_schema(self) -> None:
