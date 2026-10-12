@@ -44,10 +44,10 @@ Or via Cargo:
 cargo add kibisis
 ```
 
-For Python environments:
+For Python environments (once wheels are built, or from source):
 
 ```bash
-pip install kibisis
+pip install .
 ```
 
 ---
