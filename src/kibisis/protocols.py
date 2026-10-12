@@ -11,6 +11,11 @@ class LeaseError(Exception):
     pass
 
 
+class EncryptionRequiredError(Exception):
+    """Raised when a vault is opened without a passphrase and plaintext storage was not explicitly allowed."""
+    pass
+
+
 class LeaseConflictError(LeaseError):
     """Raised when attempting to acquire a lease already held by another active worker."""
     pass

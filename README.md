@@ -22,7 +22,7 @@ Kibisis gives you an embedded memory vault with atomic Single-Writer Multi-Reade
 ## Key design goals
 
 - **Atomic concurrency leases:** Fast lease acquisition with automatic timeout prevents competing workers from corrupting shared keys.
-- **Local authenticated encryption:** Encrypts memory entries locally using AES-256-GCM with PBKDF2-SHA256 key derivation (100,000 iterations).
+- **Encrypted by default (Python package):** An on-disk vault refuses to open without a passphrase. Entry content is encrypted with AES-256-GCM; the key comes from PBKDF2-SHA256 with 600,000 iterations (envelopes written earlier, at 100,000, still open). Category, key and metadata stay in plain text so they can be searched.
 - **High throughput:** Handles over 1,560,000 lease operations per second under heavy thread contention.
 - **Offline and partition resilient:** Tested in 10-node simulated edge partitions with zero split-brain errors.
 - **Evasion-resistant tombstones:** Rejected-value tombstones use canonicalized text hashing (Unicode NFKC, casefold, punctuation stripping, whitespace normalization) to prevent prompt injection and evasion.
@@ -97,31 +97,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Python (with AES-256-GCM Envelope Encryption and Hardened Tombstones)
+### Python (encrypted by default)
 
 ```python
-from kibisis import SQLiteMemoryVault, AESGCMCryptoEnvelopeProvider, MemoryEntity
+from kibisis import SQLiteMemoryVault, generate_keyfile
 
-# 1. Initialize envelope encryption provider (AES-256-GCM / PBKDF2-SHA256)
-crypto = AESGCMCryptoEnvelopeProvider.from_passphrase("agent-secure-passphrase")
+# One-time: create a random 256-bit key file readable only by you (mode 0600). It never overwrites.
+generate_keyfile("/secure/location/kibisis.key")
 
-# 2. Open vault with encryption wired to the storage engine
-vault = SQLiteMemoryVault("memory.db", crypto_provider=crypto)
+# Point Kibisis at the key file. A file with group/other permissions is refused.
+#   export KIBISIS_PASSPHRASE_FILE=/secure/location/kibisis.key
+# (or pass passphrase="..." directly, 12+ characters; KIBISIS_PASSPHRASE also works)
 
-# 3. Store memory entity securely (encrypted on disk, FTS cleartext protected)
-entity = MemoryEntity(
-    category="tactical",
-    key="target_coords",
-    content="Waypoint 4 locked at sector 7-G."
-)
-vault.put(entity)
+vault = SQLiteMemoryVault("memory.db")          # no passphrase anywhere -> EncryptionRequiredError
+vault.put("tactical", "waypoint", "Waypoint 4 locked at sector 7-G.")   # content is encrypted on disk
+print(vault.encryption_status())                # {'encrypted': 1, 'plaintext': 0}
 
-# 4. Enforce negative memory tombstones (evasion-resistant canonicalization)
-vault.tombstone(category="tactical", content="Do Not Target Civilians")
+# Evasion-resistant tombstone: variants of the same text with different case or punctuation are rejected too.
+vault.tombstone("tactical", "waypoint", reason="revoked")
 
-# Any variant with different casing, whitespace, or punctuation is blocked:
-# vault.put(MemoryEntity(category="tactical", key="k", content="do not target civilians!")) -> Rejected!
+# Opening a vault you want unencrypted takes an explicit opt-in:
+#   SQLiteMemoryVault("memory.db", allow_plaintext=True)
+# Moving an existing plaintext vault to encrypted (also clears old text from the search index, log and free pages):
+#   SQLiteMemoryVault("old.db", passphrase="...", allow_plaintext=True).migrate_plaintext()
 ```
+
 
 ---
 

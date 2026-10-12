@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -14,22 +15,39 @@ from .protocols import CryptoEnvelopeProvider
 class AESGCMCryptoEnvelopeProvider(CryptoEnvelopeProvider):
     """AES-256-GCM authenticated encryption with PBKDF2-HMAC-SHA256 key derivation."""
 
-    ITERATIONS = 100_000
+    ITERATIONS = 600_000  # new envelopes; older ones carry their own count
     KEY_LENGTH = 32  # 256-bit key
     SALT_LENGTH = 16
     NONCE_LENGTH = 12
 
-    def _derive_key(self, passphrase: str, salt: bytes) -> bytes:
+    def __init__(self, salt: bytes | None = None) -> None:
+        """``salt``: optional fixed salt (a vault passes its own). One salt per vault means one key derivation,
+        not one per entry; every message still gets a fresh random nonce."""
+        if salt is not None and len(salt) < self.SALT_LENGTH:
+            raise ValueError(f"salt must be at least {self.SALT_LENGTH} bytes")
+        self._salt = salt
+        self._cache: dict[tuple[bytes, bytes, int], bytes] = {}
+
+    def _derive_key(self, passphrase: str, salt: bytes, iterations: int | None = None) -> bytes:
+        iters = iterations or self.ITERATIONS
+        ck = (hashlib.sha256(passphrase.encode("utf-8")).digest(), salt, iters)
+        hit = self._cache.get(ck)
+        if hit is not None:
+            return hit
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=self.KEY_LENGTH,
             salt=salt,
-            iterations=self.ITERATIONS,
+            iterations=iters,
         )
-        return kdf.derive(passphrase.encode("utf-8"))
+        key = kdf.derive(passphrase.encode("utf-8"))
+        if len(self._cache) >= 64:
+            self._cache.clear()
+        self._cache[ck] = key
+        return key
 
     def encrypt(self, plaintext: bytes, passphrase: str) -> EncryptedEnvelope:
-        salt = os.urandom(self.SALT_LENGTH)
+        salt = self._salt if self._salt is not None else os.urandom(self.SALT_LENGTH)
         nonce = os.urandom(self.NONCE_LENGTH)
         key = self._derive_key(passphrase, salt)
 
@@ -43,6 +61,7 @@ class AESGCMCryptoEnvelopeProvider(CryptoEnvelopeProvider):
         return EncryptedEnvelope(
             cipher="aes-256-gcm",
             kdf="pbkdf2-sha256",
+            iterations=self.ITERATIONS,
             salt_b64=base64.b64encode(salt).decode("ascii"),
             nonce_b64=base64.b64encode(nonce).decode("ascii"),
             ciphertext_b64=base64.b64encode(ciphertext).decode("ascii"),
@@ -59,7 +78,7 @@ class AESGCMCryptoEnvelopeProvider(CryptoEnvelopeProvider):
         tag = base64.b64decode(envelope.tag_b64) if envelope.tag_b64 else b""
 
         full_payload = ciphertext + tag
-        key = self._derive_key(passphrase, salt)
+        key = self._derive_key(passphrase, salt, envelope.iterations)
         aesgcm = AESGCM(key)
 
         return aesgcm.decrypt(nonce, full_payload, associated_data=None)

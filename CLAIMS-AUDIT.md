@@ -45,7 +45,7 @@ All metrics below are reproducible via `cargo run --release -p telarch-benchmark
 
 1. **Storage-Engine Encryption**:
    * Algorithm: AES-256-GCM (`cryptography.hazmat.primitives.ciphers.aead.AESGCM`).
-   * Key Derivation: PBKDF2HMAC with SHA-256, 100,000 iterations, 16-byte random salt.
+   * Key Derivation: PBKDF2HMAC with SHA-256, 600,000 iterations for new envelopes (envelopes written before this field existed carry 100,000 and still decrypt); one 16-byte random salt per vault, a fresh 12-byte nonce per entry.
    * SQLite Storage: Encrypted payloads stored as authenticated binary envelopes (`ciphertext`, `nonce`, `salt`, `algo`).
    * Plaintext Leakage Prevention: When encryption is active, raw content is never inserted into unencrypted FTS5 virtual tables.
 

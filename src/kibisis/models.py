@@ -24,6 +24,7 @@ class EncryptedEnvelope(BaseModel):
     """Encrypted data envelope carrying ciphertext and KDF/cipher parameters."""
     cipher: str = Field(default="aes-256-gcm", description="Cipher identifier.")
     kdf: str = Field(default="pbkdf2-sha256", description="Key derivation function.")
+    iterations: int = Field(default=100_000, ge=1, description="PBKDF2 iteration count. Envelopes written before this field existed used 100,000.")
     salt_b64: str = Field(description="Base64-encoded KDF salt.")
     nonce_b64: str = Field(description="Base64-encoded cipher initialization nonce/IV.")
     ciphertext_b64: str = Field(description="Base64-encoded ciphertext.")

@@ -3,6 +3,7 @@
 from .models import EncryptedEnvelope, Lease, MemoryEntity, SearchResult
 from .protocols import (
     CryptoEnvelopeProvider,
+    EncryptionRequiredError,
     LeaseConflictError,
     LeaseCoordinator,
     LeaseError,
@@ -10,6 +11,7 @@ from .protocols import (
 )
 from .crypto import AESGCMCryptoEnvelopeProvider
 from .lease import SQLiteLeaseCoordinator
+from .keys import generate_keyfile, resolve_passphrase
 from .vault import SQLiteMemoryVault
 
 __version__ = "0.1.0a1"
@@ -20,6 +22,7 @@ __all__ = [
     "MemoryEntity",
     "SearchResult",
     "CryptoEnvelopeProvider",
+    "EncryptionRequiredError",
     "LeaseConflictError",
     "LeaseCoordinator",
     "LeaseError",
@@ -27,4 +30,6 @@ __all__ = [
     "AESGCMCryptoEnvelopeProvider",
     "SQLiteLeaseCoordinator",
     "SQLiteMemoryVault",
+    "generate_keyfile",
+    "resolve_passphrase",
 ]
