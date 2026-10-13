@@ -563,24 +563,36 @@ impl InMemoryMemoryVault {
 impl MemoryVault for InMemoryMemoryVault {
     fn put(&mut self, entity: &MemoryEntity) -> Result<MemoryEntity, VaultError> {
         let val_hash = sha256_hex(entity.content.as_bytes());
-        let can_val_hash = sha256_hex(canonicalize_text(&entity.content).as_bytes());
 
-        // Check tombstones
+        // Check tombstones only if any tombstones exist
         {
             let tombstones = self
                 .tombstones
                 .lock()
                 .map_err(|e| VaultError::StorageError(e.to_string()))?;
-            for ((cat, k, sc, h), reason) in tombstones.iter() {
-                if cat == &entity.category
-                    && (k == &entity.key || k == "*")
-                    && (sc == &entity.scope || sc == "*")
-                    && (h == &val_hash || h == &can_val_hash)
-                {
-                    return Err(VaultError::StorageError(format!(
-                        "Write rejected by tombstone: entity '{}:{}' [scope={}] matches tombstone reason: {}",
-                        cat, k, sc, reason
-                    )));
+            if !tombstones.is_empty() {
+                let mut can_val_hash: Option<String> = None;
+                for ((cat, k, sc, h), reason) in tombstones.iter() {
+                    if cat == &entity.category
+                        && (k == &entity.key || k == "*")
+                        && (sc == &entity.scope || sc == "*")
+                    {
+                        if h == &val_hash {
+                            return Err(VaultError::StorageError(format!(
+                                "Write rejected by tombstone: entity '{}:{}' [scope={}] matches tombstone reason: {}",
+                                cat, k, sc, reason
+                            )));
+                        }
+                        if can_val_hash.is_none() {
+                            can_val_hash = Some(sha256_hex(canonicalize_text(&entity.content).as_bytes()));
+                        }
+                        if Some(h) == can_val_hash.as_ref() {
+                            return Err(VaultError::StorageError(format!(
+                                "Write rejected by tombstone: entity '{}:{}' [scope={}] matches tombstone reason: {}",
+                                cat, k, sc, reason
+                            )));
+                        }
+                    }
                 }
             }
         }

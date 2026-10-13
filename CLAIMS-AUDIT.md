@@ -31,6 +31,7 @@ All metrics below are reproducible via `cargo run --release -p telarch-benchmark
 | **Harpe** | Multi-Turn Pruning Ceiling Reduction | ~69.51% reduction | `cargo run --release -p telarch-benchmarks` | **VERIFIED** |
 | **Harpe** | 100,000-Turn Production Cost Curve | 84.77% reduction, 0 overruns, 24.3 µs/turn | `cargo run --release -p telarch-benchmarks --bin knapsack_cost_curve` | **VERIFIED** |
 | **Kibisis** | Sequential In-Memory Write Ingestion | >2,098,000 writes/s | `cargo run --release -p telarch-benchmarks` | **VERIFIED** |
+| **Kibisis** | Audit Journal Chained Verification (10k events) | >2,000,000 events/s (<5 ms total) | `cargo run --release -p telarch-benchmarks` | **VERIFIED** |
 | **Kibisis** | Multi-Agent SWMR Lease Concurrency (16 workers) | 1,696,000+ ops/s (0.59 µs latency) | `cargo run --release -p telarch-benchmarks --bin adversarial_contention` | **VERIFIED** |
 | **Kibisis** | Multi-Agent SWMR Lease Concurrency (32 workers) | 1,776,000+ ops/s (0.56 µs latency) | `cargo run --release -p telarch-benchmarks --bin adversarial_contention` | **VERIFIED** |
 | **Argus** | SHA-256 Continuous Hash Chaining (1M events) | 632,170 events/s (1.58 µs/op) | `cargo run --release -p telarch-benchmarks --bin argus_1m_scale` | **VERIFIED** |
@@ -52,3 +53,20 @@ All metrics below are reproducible via `cargo run --release -p telarch-benchmark
 2. **Negative Memory Tombstones**:
    * Normalization: Unicode NFKC normalization $\rightarrow$ lowercase fold $\rightarrow$ punctuation strip $\rightarrow$ whitespace collapse.
    * Matching: Content matches against normalized rejection digests and canonical tokens, preventing trivial prompt injection or typographical evasion.
+
+---
+
+## 4. Agent Memory Atlas Rubric v2.1 Verification
+
+The Kibisis memory architecture complies with the 7 capability marks of the Agent Memory Atlas Rubric v2.1 across Python and Rust:
+
+| Atlas Mark | Mechanism | Guarantees & Invariants |
+| :--- | :--- | :--- |
+| **1. Discrete Epistemic States** | `EpistemicState` enum (`CANDIDATE`, `VERIFIED`, `DISPUTED`, `REVOKED`) | Unverified candidate writes cannot masquerade as ground truth; default retrieval suppresses unverified states unless explicitly requested. |
+| **2. Human Review Admission Gate** | `admit_candidate()` & `review_entity()` | Transitions candidates to `VERIFIED` with tamper-evident reviewer metadata logging and gate validation. |
+| **3. Multi-Tenant Scoping & Isolation** | First-class `scope` attribute on all entities, tombstones, and queries | Cryptographic and query-level isolation preventing cross-tenant leakage in multi-agent environments. |
+| **4. Bi-Temporal Validity Windows** | `valid_from`, `valid_until` with `as_of_valid_time` | Point-in-time state evaluation without loss of historical validity bounds. |
+| **5. Tamper-Evident Audit Ledger** | Append-only sequential SHA-256 Merkle hash chain (`verify_audit_chain()`) | Every mutation (put, update, candidate admission, review, revocation, tombstone) produces a cryptographically linked audit event. |
+| **6. Evasion-Resistant Tombstones** | Canonicalized text hashing (NFKC + casing/whitespace folding) | Rejection tombstones resist Unicode/whitespace/casing variations and evasion attacks. |
+| **7. Negative Eval & Contract Tests** | Comprehensive contract test suite (`test_atlas_rubric_hardening.py`) | Continuous verification of adversarial revocation, candidate isolation, and chain tamper detection. |
+

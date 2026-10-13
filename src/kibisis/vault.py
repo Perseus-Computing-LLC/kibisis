@@ -87,6 +87,18 @@ class SQLiteMemoryVault(MemoryVault):
             self._conn.execute("PRAGMA secure_delete = ON;")
         self._configure_db()
         self._init_schema()
+        # Fast cache for whether tombstones exist in the database
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT COUNT(*) AS cnt FROM rejected_value_tombstones")
+        self._has_tombstones = (cursor.fetchone()["cnt"] > 0)
+        cursor.execute("SELECT sequence, event_hash FROM audit_journal ORDER BY sequence DESC LIMIT 1")
+        last_audit = cursor.fetchone()
+        if last_audit:
+            self._last_audit_seq = last_audit["sequence"]
+            self._last_audit_hash = last_audit["event_hash"]
+        else:
+            self._last_audit_seq = 0
+            self._last_audit_hash = "0" * 64
         if passphrase and crypto_provider is None:
             self.crypto_provider = AESGCMCryptoEnvelopeProvider(salt=self._vault_salt())
         if on_disk:
@@ -331,14 +343,20 @@ class SQLiteMemoryVault(MemoryVault):
         """Append a tamper-evident audit record chaining from the previous event's hash."""
         now = time.time()
         meta_dict = metadata or {}
-        cursor.execute("SELECT sequence, event_hash FROM audit_journal ORDER BY sequence DESC LIMIT 1")
-        last_row = cursor.fetchone()
-        if last_row is None:
-            prev_hash = "0" * 64
-            seq = 1
+
+        # Use cached sequence & hash if available to avoid index scan on hot write path
+        if hasattr(self, "_last_audit_seq") and hasattr(self, "_last_audit_hash") and self._last_audit_seq > 0:
+            seq = self._last_audit_seq + 1
+            prev_hash = self._last_audit_hash
         else:
-            prev_hash = last_row["event_hash"]
-            seq = last_row["sequence"] + 1
+            cursor.execute("SELECT sequence, event_hash FROM audit_journal ORDER BY sequence DESC LIMIT 1")
+            last_row = cursor.fetchone()
+            if last_row is None:
+                prev_hash = "0" * 64
+                seq = 1
+            else:
+                prev_hash = last_row["event_hash"]
+                seq = last_row["sequence"] + 1
 
         payload_to_hash = (
             f"{seq}:{now:.6f}:{action}:{category}:{key}:{scope}:{value_sha256}:{prev_hash}:{author_id or ''}"
@@ -356,6 +374,8 @@ class SQLiteMemoryVault(MemoryVault):
             """,
             (seq, now, action, category, key, scope, value_sha256, prev_hash, event_hash, author_id, meta_json),
         )
+        self._last_audit_seq = seq
+        self._last_audit_hash = event_hash
         return AuditEvent(
             sequence=seq,
             timestamp=now,
@@ -395,29 +415,30 @@ class SQLiteMemoryVault(MemoryVault):
         meta = metadata or {}
         meta_str = json.dumps(meta, sort_keys=True)
         val_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        can_text = canonicalize_text(content)
-        can_hash = hashlib.sha256(can_text.encode("utf-8")).hexdigest()
 
         # Validate epistemic_state enum string
         ep_state = EpistemicState(epistemic_state) if epistemic_state else EpistemicState.VERIFIED
 
         with self._conn:
             cursor = self._conn.cursor()
-            # Check for exact hash OR canonicalized evasion-resistant match within scope (or global wildcard)
-            cursor.execute(
-                """
-                SELECT reason, author_id FROM rejected_value_tombstones
-                WHERE category = ? AND (key = ? OR key = '*') AND (scope = ? OR scope = '*')
-                  AND (value_sha256 = ? OR (canonical_sha256 != '' AND canonical_sha256 = ?))
-                """,
-                (category, key, scope, val_hash, can_hash),
-            )
-            tomb = cursor.fetchone()
-            if tomb is not None:
-                raise ValueError(
-                    f"Write rejected by tombstone: entity '{category}:{key}' [scope={scope}] matches rejected tombstone "
-                    f"(digest: {val_hash[:12]}..., reason: {tomb['reason']})"
+            # Fast check: skip tombstone lookups and text canonicalization if no tombstones exist in the vault
+            if getattr(self, "_has_tombstones", True):
+                can_text = canonicalize_text(content)
+                can_hash = hashlib.sha256(can_text.encode("utf-8")).hexdigest()
+                cursor.execute(
+                    """
+                    SELECT reason, author_id FROM rejected_value_tombstones
+                    WHERE category = ? AND (key = ? OR key = '*') AND (scope = ? OR scope = '*')
+                      AND (value_sha256 = ? OR (canonical_sha256 != '' AND canonical_sha256 = ?))
+                    """,
+                    (category, key, scope, val_hash, can_hash),
                 )
+                tomb = cursor.fetchone()
+                if tomb is not None:
+                    raise ValueError(
+                        f"Write rejected by tombstone: entity '{category}:{key}' [scope={scope}] matches rejected tombstone "
+                        f"(digest: {val_hash[:12]}..., reason: {tomb['reason']})"
+                    )
 
             is_encrypted = 0
             stored_content = content
@@ -865,6 +886,7 @@ class SQLiteMemoryVault(MemoryVault):
                 author_id=author_id,
                 metadata={"reason": reason, "canonical_sha256": can_hash},
             )
+            self._has_tombstones = True
             return val_hash
 
     def is_tombstoned(
