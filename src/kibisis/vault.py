@@ -5,7 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import sqlcipher3
+try:
+    import sqlcipher3
+except ImportError:
+    import sqlite3 as sqlcipher3
 import sqlite3
 import string
 import time

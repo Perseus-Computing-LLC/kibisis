@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
-import sqlcipher3
+try:
+    import sqlcipher3
+except ImportError:
+    import sqlite3 as sqlcipher3
 import sqlite3
 import time
 from typing import Optional
