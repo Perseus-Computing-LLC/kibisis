@@ -24,7 +24,9 @@ class SQLiteLeaseCoordinator(LeaseCoordinator):
         self._conn.row_factory = sqlcipher3.Row
         if passphrase:
             esc = passphrase.replace("'", "''")
+            self._conn.execute("PRAGMA cipher_memory_security = ON;")
             self._conn.execute(f"PRAGMA key = '{esc}';")
+            self._conn.execute("PRAGMA secure_delete = ON;")
         self._init_schema()
 
     def _init_schema(self) -> None:

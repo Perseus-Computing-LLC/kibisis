@@ -12,3 +12,4 @@ categories = ["development-tools"]
 
 [dependencies]
 rusqlite = { version = "0.31.0", features = ["bundled-sqlcipher"] }
+zeroize = { version = "1.9.0", default-features = false, features = ["alloc"] }

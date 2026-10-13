@@ -113,8 +113,19 @@ vault = SQLiteMemoryVault("memory.db")          # no passphrase anywhere -> Encr
 vault.put("tactical", "waypoint", "Waypoint 4 locked at sector 7-G.")   # content is encrypted on disk
 print(vault.encryption_status())                # {'encrypted': 1, 'plaintext': 0}
 
+# Human review and candidate admission lifecycle:
+candidate = vault.admit_candidate("hypothesis", "exoplanet_b", "Atmosphere contains methane.", scope="project_alpha")
+# Unverified candidates are withheld from normal search until approved
+reviewed = vault.review_entity("hypothesis", "exoplanet_b", verdict="verified", scope="project_alpha", reviewer_id="dr_ellis")
+
+# Bi-temporal validity (real-world valid time bounds):
+vault.put("policy", "travel", "Travel subsidy active", valid_from=1700000000.0, valid_until=1800000000.0)
+
 # Evasion-resistant tombstone: variants of the same text with different case or punctuation are rejected too.
 vault.tombstone("tactical", "waypoint", reason="revoked")
+
+# Tamper-evident mutation hash chain:
+assert vault.verify_audit_chain() is True
 
 # Opening a vault you want unencrypted takes an explicit opt-in:
 #   SQLiteMemoryVault("memory.db", allow_plaintext=True)

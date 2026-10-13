@@ -1,6 +1,6 @@
 """kibisis: Local-first encrypted cognitive memory vault with atomic concurrency leases."""
 
-from .models import EncryptedEnvelope, Lease, MemoryEntity, SearchResult
+from .models import AuditEvent, EncryptedEnvelope, EpistemicState, Lease, MemoryEntity, SearchResult
 from .protocols import (
     CryptoEnvelopeProvider,
     EncryptionRequiredError,
@@ -17,7 +17,9 @@ from .vault import SQLiteMemoryVault
 __version__ = "0.1.0a2"
 
 __all__ = [
+    "AuditEvent",
     "EncryptedEnvelope",
+    "EpistemicState",
     "Lease",
     "MemoryEntity",
     "SearchResult",

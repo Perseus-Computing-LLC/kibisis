@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
-from .models import EncryptedEnvelope, Lease, MemoryEntity, SearchResult
+from .models import EncryptedEnvelope, EpistemicState, Lease, MemoryEntity, SearchResult
 
 
 class LeaseError(Exception):
@@ -61,12 +61,22 @@ class MemoryVault(Protocol):
         key: str,
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
+        epistemic_state: Optional[str] = None,
+        valid_from: Optional[float] = None,
+        valid_until: Optional[float] = None,
+        scope: str = "default",
+        author_id: Optional[str] = None,
     ) -> MemoryEntity:
-        """Insert or update a memory entity."""
+        """Insert or update a memory entity with epistemic status, bi-temporal bounds, and scope."""
         ...
 
-    def get(self, category: str, key: str) -> Optional[MemoryEntity]:
-        """Fetch a memory entity by category and key."""
+    def get(
+        self,
+        category: str,
+        key: str,
+        scope: str = "default",
+    ) -> Optional[MemoryEntity]:
+        """Fetch a memory entity by category, key, and scope."""
         ...
 
     def search(
@@ -74,11 +84,21 @@ class MemoryVault(Protocol):
         query: str,
         category: Optional[str] = None,
         limit: int = 10,
+        scope: str = "default",
+        epistemic_state: Optional[str] = None,
+        as_of_valid_time: Optional[float] = None,
+        include_unverified: bool = False,
     ) -> List[SearchResult]:
-        """Search memory entities using full-text indexing."""
+        """Search memory entities with strict scope filtering, epistemic filtering, and bi-temporal point-in-time evaluation."""
         ...
 
-    def archive(self, category: str, key: str) -> bool:
+    def archive(
+        self,
+        category: str,
+        key: str,
+        scope: str = "default",
+        author_id: Optional[str] = None,
+    ) -> bool:
         """Soft-delete an entity by setting its archived flag."""
         ...
 
@@ -86,8 +106,12 @@ class MemoryVault(Protocol):
         self,
         category: Optional[str] = None,
         include_archived: bool = False,
+        scope: str = "default",
+        epistemic_state: Optional[str] = None,
+        as_of_valid_time: Optional[float] = None,
+        include_unverified: bool = False,
     ) -> List[MemoryEntity]:
-        """List entities matching optional category and archive filters."""
+        """List entities matching optional category, archive, epistemic, and scope filters."""
         ...
 
     def tombstone(
@@ -96,14 +120,64 @@ class MemoryVault(Protocol):
         key: str,
         reason: str = "revocation",
         author_id: Optional[str] = None,
+        scope: str = "default",
     ) -> str:
         """Tombstone entity value by SHA-256 digest and purge plaintext content."""
         ...
 
-    def is_tombstoned(self, category: str, key: str, content: str) -> bool:
-        """Check if content value is tombstoned under category and key."""
+    def is_tombstoned(
+        self,
+        category: str,
+        key: str,
+        content: str,
+        scope: str = "default",
+    ) -> bool:
+        """Check if content value is tombstoned under category, key, and scope."""
         ...
 
-    def list_tombstones(self, category: Optional[str] = None) -> List[Dict[str, Any]]:
+    def admit_candidate(
+        self,
+        category: str,
+        key: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        valid_from: Optional[float] = None,
+        valid_until: Optional[float] = None,
+        scope: str = "default",
+        author_id: Optional[str] = None,
+    ) -> MemoryEntity:
+        """Stage an unverified memory candidate into the vault awaiting verification/human review."""
+        ...
+
+    def review_entity(
+        self,
+        category: str,
+        key: str,
+        verdict: str,
+        scope: str = "default",
+        reviewer_id: Optional[str] = None,
+        notes: Optional[str] = None,
+    ) -> MemoryEntity:
+        """Human review gate: update epistemic state based on review decision (verified, disputed, revoked)."""
+        ...
+
+    def list_audit_events(
+        self,
+        scope: Optional[str] = None,
+        category: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Any]:
+        """Fetch chronological audit records from the tamper-evident hash chain."""
+        ...
+
+    def verify_audit_chain(self, scope: Optional[str] = None) -> bool:
+        """Verify the cryptographic integrity of the append-only mutation journal hash chain."""
+        ...
+
+    def list_tombstones(
+        self,
+        category: Optional[str] = None,
+        scope: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """List active tombstone records (digests only, zero plaintext)."""
         ...

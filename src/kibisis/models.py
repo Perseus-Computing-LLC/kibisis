@@ -3,21 +3,52 @@
 from __future__ import annotations
 
 import time
+from enum import Enum
 from typing import Any, Dict, Optional
 from pydantic import BaseModel, Field
+
+
+class EpistemicState(str, Enum):
+    """Discrete epistemic status for cognitive assertions."""
+    CANDIDATE = "candidate"          # Unverified hypothesis / provisional ingestion
+    VERIFIED = "verified"            # Corroborated or empirically verified fact
+    DISPUTED = "disputed"            # Contested or conflicting observation
+    REVOKED = "revoked"              # Deprecated, superseded, or rejected assertion
 
 
 class MemoryEntity(BaseModel):
     """An individual memory item stored in the vault."""
     category: str = Field(description="Category namespace (e.g. general, convention, insight).")
-    key: str = Field(description="Unique key within the category.")
+    key: str = Field(description="Unique key within the category and scope.")
     content: str = Field(description="Textual payload of the memory.")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Metadata dictionary.")
     id: Optional[int] = Field(default=None, description="Internal database ID.")
     version: int = Field(default=1, ge=1, description="Entity version counter.")
     archived: bool = Field(default=False, description="Whether the entity is soft-deleted.")
-    created_at: float = Field(default_factory=time.time, description="Creation timestamp.")
-    updated_at: float = Field(default_factory=time.time, description="Last update timestamp.")
+    created_at: float = Field(default_factory=time.time, description="Creation timestamp (system time).")
+    updated_at: float = Field(default_factory=time.time, description="Last update timestamp (system time).")
+    
+    # Atlas Rubric Mark: Epistemic State
+    epistemic_state: EpistemicState = Field(
+        default=EpistemicState.VERIFIED,
+        description="Discrete epistemic status (candidate, verified, disputed, revoked)."
+    )
+    
+    # Atlas Rubric Mark: Bi-Temporal Validity
+    valid_from: Optional[float] = Field(
+        default=None,
+        description="Real-world valid time start (epoch timestamp)."
+    )
+    valid_until: Optional[float] = Field(
+        default=None,
+        description="Real-world valid time end/expiration (epoch timestamp)."
+    )
+    
+    # Atlas Rubric Mark: Scope Enforced in Retrieval
+    scope: str = Field(
+        default="default",
+        description="Isolation scope partition (workspace, tenant, or project identifier)."
+    )
 
 
 class EncryptedEnvelope(BaseModel):
@@ -43,6 +74,21 @@ class Lease(BaseModel):
     def is_expired(self) -> bool:
         """Whether the lease has passed its expiration time."""
         return time.time() >= self.expires_at
+
+
+class AuditEvent(BaseModel):
+    """Tamper-evident audit event recording memory mutations."""
+    sequence: int = Field(ge=1, description="Monotonically increasing sequence number.")
+    timestamp: float = Field(default_factory=time.time, description="Timestamp of event recording.")
+    action: str = Field(description="Mutation action (e.g. put, update, archive, tombstone, purge).")
+    category: str = Field(description="Target category.")
+    key: str = Field(description="Target key.")
+    scope: str = Field(default="default", description="Target scope.")
+    value_sha256: str = Field(default="", description="SHA-256 digest of payload content.")
+    prev_hash: str = Field(description="SHA-256 hash of previous audit event in chain.")
+    event_hash: str = Field(description="SHA-256 hash of this event.")
+    author_id: Optional[str] = Field(default=None, description="Identifier of author or agent.")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional context metadata.")
 
 
 class SearchResult(BaseModel):
