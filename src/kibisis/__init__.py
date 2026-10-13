@@ -14,7 +14,7 @@ from .lease import SQLiteLeaseCoordinator
 from .keys import generate_keyfile, resolve_passphrase
 from .vault import SQLiteMemoryVault
 
-__version__ = "0.1.0a1"
+__version__ = "0.1.0a2"
 
 __all__ = [
     "EncryptedEnvelope",
