@@ -13,7 +13,8 @@ import sqlite3
 import string
 import time
 import unicodedata
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 from .crypto import AESGCMCryptoEnvelopeProvider
 from .keys import MIN_PASSPHRASE_LENGTH, resolve_passphrase
 from .models import AuditEvent, EncryptedEnvelope, EpistemicState, MemoryEntity, SearchResult
@@ -24,15 +25,28 @@ def canonicalize_text(text: str) -> str:
     """Normalize text for evasion-resistant tombstone matching.
 
     Transforms text by:
-    1. Unicode NFKC normalization (replaces lookalikes, fullwidth chars, etc.)
-    2. Case folding (.lower())
-    3. Stripping all unicode punctuation and symbols
-    4. Collapsing all whitespace runs into single spaces and trimming
+    1. Unicode NFKC normalization (replaces lookalikes, fullwidth chars, compatibility ligatures)
+    2. Unicode case folding (.casefold())
+    3. Stripping invisible Unicode format/control characters (Cf/Cc, e.g., zero-width spaces/joiners, soft hyphens)
+    4. Stripping all Unicode punctuation and symbols (replacing with space separators)
+    5. Collapsing all whitespace runs into single spaces and trimming
     """
     if not text:
         return ""
-    normalized = unicodedata.normalize("NFKC", text).lower()
-    chars = [(" " if unicodedata.category(ch).startswith(("P", "S")) else ch) for ch in normalized]
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    chars: List[str] = []
+    for ch in normalized:
+        if ch.isspace():
+            chars.append(" ")
+            continue
+        cat = unicodedata.category(ch)
+        if cat in ("Cf", "Cc"):
+            # Drop invisible format/control characters (e.g. \u200b, \u200c, \u200d, \ufeff, \u00ad)
+            continue
+        if cat.startswith(("P", "S")):
+            chars.append(" ")
+        else:
+            chars.append(ch)
     return " ".join("".join(chars).split())
 
 
@@ -42,7 +56,7 @@ class SQLiteMemoryVault(MemoryVault):
 
     def __init__(
         self,
-        db_path: str = ":memory:",
+        db_path: Union[str, Path] = ":memory:",
         crypto_provider: Optional[CryptoEnvelopeProvider] = None,
         passphrase: Optional[str] = None,
         *,
@@ -54,8 +68,8 @@ class SQLiteMemoryVault(MemoryVault):
         With no passphrase the vault refuses to open (EncryptionRequiredError) unless ``allow_plaintext=True``.
         An in-memory vault never touches disk, so it may run without a passphrase.
         """
-        self.db_path = db_path
-        on_disk = db_path != ":memory:"
+        self.db_path = str(db_path)
+        on_disk = self.db_path != ":memory:"
         passphrase = resolve_passphrase(passphrase)
         if passphrase and len(passphrase) < MIN_PASSPHRASE_LENGTH:
             raise ValueError(f"passphrase must be at least {MIN_PASSPHRASE_LENGTH} characters")
@@ -68,14 +82,14 @@ class SQLiteMemoryVault(MemoryVault):
         self.crypto_provider = crypto_provider
 
         # Check for unencrypted database migration if passphrase is provided
-        if on_disk and passphrase and os.path.exists(db_path) and os.path.getsize(db_path) > 0:
-            with open(db_path, "rb") as f:
+        if on_disk and passphrase and os.path.exists(self.db_path) and os.path.getsize(self.db_path) > 0:
+            with open(self.db_path, "rb") as f:
                 hdr = f.read(16)
             if hdr.startswith(b"SQLite format 3"):
                 # Migrate existing plaintext SQLite database to encrypted SQLCipher database
-                self._migrate_file_to_sqlcipher(db_path, passphrase)
+                self._migrate_file_to_sqlcipher(self.db_path, passphrase)
 
-        self._conn = sqlcipher3.connect(db_path, timeout=30.0, check_same_thread=False)
+        self._conn = sqlcipher3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         self._conn.row_factory = sqlcipher3.Row
         if passphrase:
             escaped_pass = passphrase.replace("'", "''")
@@ -413,9 +427,18 @@ class SQLiteMemoryVault(MemoryVault):
         valid_until: Optional[float] = None,
         scope: str = "default",
         author_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        principal_id: Optional[str] = None,
+        derived_from: Optional[List[str]] = None,
     ) -> MemoryEntity:
         now = time.time()
-        meta = metadata or {}
+        meta = dict(metadata or {})
+        if tenant_id:
+            meta["tenant_id"] = tenant_id
+        if principal_id:
+            meta["principal_id"] = principal_id
+        if derived_from:
+            meta["derived_from"] = derived_from
         meta_str = json.dumps(meta, sort_keys=True)
         val_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
 
@@ -427,7 +450,7 @@ class SQLiteMemoryVault(MemoryVault):
             # Fast check: skip tombstone lookups and text canonicalization if no tombstones exist in the vault
             if getattr(self, "_has_tombstones", True):
                 can_text = canonicalize_text(content)
-                can_hash = hashlib.sha256(can_text.encode("utf-8")).hexdigest()
+                can_hash = hashlib.sha256(can_text.encode("utf-8")).hexdigest() if can_text else ""
                 cursor.execute(
                     """
                     SELECT reason, author_id FROM rejected_value_tombstones
@@ -631,10 +654,13 @@ class SQLiteMemoryVault(MemoryVault):
         query: str,
         category: Optional[str] = None,
         limit: int = 10,
-        scope: str = "default",
+        scope: Optional[str] = "default",
         epistemic_state: Optional[str] = None,
         as_of_valid_time: Optional[float] = None,
         include_unverified: bool = False,
+        tenant_id: Optional[str] = None,
+        principal_id: Optional[str] = None,
+        authorized_lineage_roots: Optional[List[str]] = None,
     ) -> List[SearchResult]:
         if not query.strip():
             return []
@@ -647,9 +673,15 @@ class SQLiteMemoryVault(MemoryVault):
         results: List[SearchResult] = []
         cursor = self._conn.cursor()
 
+        # Normalize scope: None or empty string defaults to "default"
+        target_scope = "default" if scope is None or scope == "" else scope
+
         # Build dynamic SQL WHERE conditions for scope, epistemic status, and validity bounds
-        where_clauses = ["entities_fts MATCH ?", "e.archived = 0", "e.scope = ?"]
-        params: List[Any] = [fts_query, scope]
+        where_clauses = ["entities_fts MATCH ?", "e.archived = 0"]
+        params: List[Any] = [fts_query]
+        if target_scope != "*":
+            where_clauses.append("e.scope = ?")
+            params.append(target_scope)
 
         if category:
             where_clauses.append("e.category = ?")
@@ -688,8 +720,11 @@ class SQLiteMemoryVault(MemoryVault):
         except sqlite3.OperationalError:
             # Fallback for environments where FTS query syntax or schema differs
             pattern = f"%{query}%"
-            fb_clauses = ["(content LIKE ? OR key LIKE ?)", "archived = 0", "scope = ?"]
-            fb_params: List[Any] = [pattern, pattern, scope]
+            fb_clauses = ["(content LIKE ? OR key LIKE ?)", "archived = 0"]
+            fb_params: List[Any] = [pattern, pattern]
+            if target_scope != "*":
+                fb_clauses.append("scope = ?")
+                fb_params.append(target_scope)
             if category:
                 fb_clauses.append("category = ?")
                 fb_params.append(category)
@@ -749,11 +784,12 @@ class SQLiteMemoryVault(MemoryVault):
         # If encrypted and user searched for content terms that weren't indexed in plaintext FTS,
         # scan active entities within scope if we have crypto provider and haven't hit limit:
         if self.crypto_provider is not None and len(results) < limit:
-            query_lower = query.lower()
+            query_lower = query.lower().strip()
+            terms = [t.lower() for t in query.split() if len(t) >= 2]
             all_entities = self.list_entities(
                 category=category,
                 include_archived=False,
-                scope=scope,
+                scope=target_scope,
                 epistemic_state=epistemic_state,
                 as_of_valid_time=as_of_valid_time,
                 include_unverified=include_unverified,
@@ -761,13 +797,31 @@ class SQLiteMemoryVault(MemoryVault):
             for ent in all_entities:
                 if ent.id in matched_ids:
                     continue
-                if query_lower in ent.content.lower():
+                ent_text = f"{ent.category} {ent.key} {ent.content}".lower()
+                if query_lower in ent_text or (terms and all(t in ent_text for t in terms)):
                     results.append(SearchResult(entity=ent, rank_score=-0.5, snippet=f"...{query}..."))
                     matched_ids.add(ent.id)
                     if len(results) >= limit:
                         break
 
-        return results
+        # Hard post-retrieval governance gating (MemLeak arXiv:2610.04195 & Lineage AMU arXiv:2610.07258)
+        filtered_results: List[SearchResult] = []
+        for res in results:
+            meta = res.entity.metadata or {}
+            # 1. Hard tenant boundary check
+            if tenant_id and meta.get("tenant_id") and meta.get("tenant_id") != tenant_id:
+                continue
+            # 2. Hard principal/user boundary check if specified
+            if principal_id and meta.get("principal_id") and meta.get("principal_id") != principal_id:
+                continue
+            # 3. Derivation-gated lineage check (AMU)
+            if authorized_lineage_roots is not None:
+                ent_lineage = meta.get("derived_from", [])
+                if any(root not in authorized_lineage_roots for root in ent_lineage):
+                    continue
+            filtered_results.append(res)
+
+        return filtered_results
 
     def list_entities(
         self,
@@ -864,7 +918,7 @@ class SQLiteMemoryVault(MemoryVault):
             assert content is not None
             val_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
             can_text = canonicalize_text(content)
-            can_hash = hashlib.sha256(can_text.encode("utf-8")).hexdigest()
+            can_hash = hashlib.sha256(can_text.encode("utf-8")).hexdigest() if can_text else ""
 
             cursor.execute(
                 """
@@ -902,7 +956,7 @@ class SQLiteMemoryVault(MemoryVault):
         """Check if a specific content string is tombstoned under the given category, key, and scope (exact or canonical)."""
         val_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
         can_text = canonicalize_text(content)
-        can_hash = hashlib.sha256(can_text.encode("utf-8")).hexdigest()
+        can_hash = hashlib.sha256(can_text.encode("utf-8")).hexdigest() if can_text else ""
         cursor = self._conn.cursor()
         cursor.execute(
             """
@@ -943,6 +997,9 @@ class SQLiteMemoryVault(MemoryVault):
         valid_until: Optional[float] = None,
         scope: str = "default",
         author_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        principal_id: Optional[str] = None,
+        derived_from: Optional[List[str]] = None,
     ) -> MemoryEntity:
         """Stage an unverified memory candidate into the vault awaiting verification/human review."""
         return self.put(
@@ -955,6 +1012,9 @@ class SQLiteMemoryVault(MemoryVault):
             valid_until=valid_until,
             scope=scope,
             author_id=author_id,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            derived_from=derived_from,
         )
 
     def review_entity(

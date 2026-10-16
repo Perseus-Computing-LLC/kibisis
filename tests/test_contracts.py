@@ -216,6 +216,8 @@ class TestKibisisContracts(unittest.TestCase):
             "Do Not Target Civilians...",
             "Do Not Target Civilians —",  # unicode em-dash punctuation
             "Ｄｏ Ｎｏｔ Ｔａｒｇｅｔ Ｃｉｖｉｌｉａｎｓ",  # Unicode NFKC fullwidth
+            "Do\u200b Not\u200c Target\u200d Civilians\ufeff",  # Zero-width characters / BOM
+            "Do\u00ad Not Target Civilians",  # Soft hyphen evasion
         ]
 
         for variant in evasion_variants:
@@ -225,11 +227,63 @@ class TestKibisisContracts(unittest.TestCase):
             )
             with self.assertRaises(ValueError, msg=f"Allowed evasion variant: {variant!r}"):
                 self.vault.put("rules", "safety_directive", variant)
+            with self.assertRaises(ValueError, msg=f"Allowed candidate evasion variant: {variant!r}"):
+                self.vault.admit_candidate("rules", "safety_directive", variant)
+
+        # Punctuation-only tombstone must not falsely block distinct punctuation-only strings
+        self.vault.tombstone("rules", "punct_only", reason="test", content="???")
+        self.assertTrue(self.vault.is_tombstoned("rules", "punct_only", "???"))
+        self.assertFalse(self.vault.is_tombstoned("rules", "punct_only", "!!!"))
 
         # Legitimate different content should succeed
         clean = self.vault.put("rules", "safety_directive", "Authorize Defensive Intercept Only")
         self.assertIsNotNone(clean)
         self.assertEqual(clean.content, "Authorize Defensive Intercept Only")
+
+    def test_lease_fencing_validation_and_multithreaded_contention(self):
+        """Verify monotonic fencing token validation, double-release protection, and thread-safe contention."""
+        import threading
+
+        l1 = self.coordinator.acquire("shared_state", "worker_a", ttl_seconds=10.0)
+        self.assertEqual(l1.fencing_token, 1)
+        self.assertTrue(self.coordinator.validate_fencing_token("shared_state", "worker_a", 1))
+        self.assertFalse(self.coordinator.validate_fencing_token("shared_state", "worker_b", 1))
+        self.assertFalse(self.coordinator.validate_fencing_token("shared_state", "worker_a", 2))
+
+        with self.assertRaises(ValueError):
+            self.coordinator.acquire("shared_state", "worker_a", ttl_seconds=0)
+        with self.assertRaises(ValueError):
+            self.coordinator.renew(l1, ttl_seconds=-1.0)
+
+        # Release once succeeds; second release of already-released lease returns False
+        self.assertTrue(self.coordinator.release(l1))
+        self.assertFalse(self.coordinator.release(l1))
+        self.assertFalse(self.coordinator.validate_fencing_token("shared_state", "worker_a", 1))
+
+        # Concurrent multi-threaded contention on shared coordinator
+        acquired_tokens = []
+        lock = threading.Lock()
+
+        def worker(tid: int) -> None:
+            for _ in range(10):
+                try:
+                    lease = self.coordinator.acquire("contended_res", f"w_{tid}", ttl_seconds=5.0)
+                    with lock:
+                        acquired_tokens.append(lease.fencing_token)
+                    self.coordinator.release(lease)
+                except LeaseConflictError:
+                    pass
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertGreater(len(acquired_tokens), 0)
+        # All granted fencing tokens must be strictly unique and monotonically increasing
+        self.assertEqual(len(acquired_tokens), len(set(acquired_tokens)))
+        self.assertEqual(acquired_tokens, sorted(acquired_tokens))
 
     def test_encrypted_vault_tombstone_and_wildcard(self):
         """Verify tombstones work on encrypted entities and support category-wide wildcard scope."""
@@ -258,6 +312,28 @@ class TestKibisisContracts(unittest.TestCase):
             vault.put("intel", "node_99", "Execute First Strike.")
 
         vault.close()
+
+    def test_vault_search_scope_normalization_and_pathlib(self):
+        """Verify SQLiteMemoryVault accepts pathlib.Path and handles scope=None and scope='*' in search."""
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+            p = Path(tmp.name)
+            vault = SQLiteMemoryVault(p, allow_plaintext=True)
+            vault.put("rules", "alpha", "Mission Alpha Directive", scope="default")
+            vault.put("rules", "beta", "Mission Beta Directive", scope="custom")
+
+            # search with scope=None must default to "default"
+            res_none = vault.search("Directive", scope=None)
+            self.assertEqual(len(res_none), 1)
+            self.assertEqual(res_none[0].entity.key, "alpha")
+
+            # search with scope="*" must match across all scopes
+            res_all = vault.search("Directive", scope="*")
+            self.assertEqual(len(res_all), 2)
+
+            vault.close()
 
 
 if __name__ == "__main__":

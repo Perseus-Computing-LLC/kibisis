@@ -50,6 +50,10 @@ class LeaseCoordinator(Protocol):
         """Release an active lease so other holders may acquire it."""
         ...
 
+    def validate_fencing_token(self, resource: str, holder_id: str, fencing_token: int) -> bool:
+        """Verify that ``holder_id`` holds an active, un-preempted lease on ``resource`` with ``fencing_token``."""
+        ...
+
 
 @runtime_checkable
 class MemoryVault(Protocol):
@@ -66,6 +70,9 @@ class MemoryVault(Protocol):
         valid_until: Optional[float] = None,
         scope: str = "default",
         author_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        principal_id: Optional[str] = None,
+        derived_from: Optional[List[str]] = None,
     ) -> MemoryEntity:
         """Insert or update a memory entity with epistemic status, bi-temporal bounds, and scope."""
         ...
@@ -84,10 +91,13 @@ class MemoryVault(Protocol):
         query: str,
         category: Optional[str] = None,
         limit: int = 10,
-        scope: str = "default",
+        scope: Optional[str] = "default",
         epistemic_state: Optional[str] = None,
         as_of_valid_time: Optional[float] = None,
         include_unverified: bool = False,
+        tenant_id: Optional[str] = None,
+        principal_id: Optional[str] = None,
+        authorized_lineage_roots: Optional[List[str]] = None,
     ) -> List[SearchResult]:
         """Search memory entities with strict scope filtering, epistemic filtering, and bi-temporal point-in-time evaluation."""
         ...
@@ -120,6 +130,7 @@ class MemoryVault(Protocol):
         key: str,
         reason: str = "revocation",
         author_id: Optional[str] = None,
+        content: Optional[str] = None,
         scope: str = "default",
     ) -> str:
         """Tombstone entity value by SHA-256 digest and purge plaintext content."""
@@ -145,6 +156,9 @@ class MemoryVault(Protocol):
         valid_until: Optional[float] = None,
         scope: str = "default",
         author_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        principal_id: Optional[str] = None,
+        derived_from: Optional[List[str]] = None,
     ) -> MemoryEntity:
         """Stage an unverified memory candidate into the vault awaiting verification/human review."""
         ...

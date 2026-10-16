@@ -10,8 +10,8 @@
 //!    with monotonic version tracking and soft-archival capabilities.
 //! 2. **Single-Writer Multi-Reader (SWMR) Leases**: Atomic distributed leasing with
 //!    strictly increasing fencing tokens to eliminate stale-worker race conditions.
-//! 3. **Cryptographic Envelopes**: Envelope schema definitions for local ChaCha20-Poly1305
-//!    authenticated encryption at rest.
+//! 3. **Cryptographic Envelopes**: Envelope schema definitions for local AES-256-GCM
+//!    authenticated encryption at rest with PBKDF2-HMAC-SHA256 key derivation.
 //!
 //! ## Architecture Overview
 //!
@@ -177,12 +177,47 @@ pub fn sha256_hex(input: &[u8]) -> String {
 }
 
 /// Canonicalize text for evasion-resistant comparison and hashing.
+///
+/// Performs compatibility normalization (fullwidth ASCII folding), strips invisible
+/// zero-width/format and control characters, replaces punctuation and symbols with
+/// spaces, folds case to lowercase, and collapses whitespace runs to single spaces.
 pub fn canonicalize_text(input: &str) -> String {
-    input
-        .chars()
-        .filter(|c| !c.is_whitespace() && !c.is_control())
-        .flat_map(|c| c.to_lowercase())
-        .collect()
+    if input.is_empty() {
+        return String::new();
+    }
+    let mut normalized = String::with_capacity(input.len());
+    for raw_ch in input.chars() {
+        // Normalize fullwidth ASCII compatibility characters (U+FF01..=U+FF5E) and ideographic space (U+3000)
+        let ch = match raw_ch as u32 {
+            0xFF01..=0xFF5E => char::from_u32((raw_ch as u32) - 0xFEE0).unwrap_or(raw_ch),
+            0x3000 => ' ',
+            _ => raw_ch,
+        };
+        if ch.is_whitespace() {
+            normalized.push(' ');
+            continue;
+        }
+        // Strip invisible Unicode format/control characters (Cf/Cc: zero-width spaces/joiners, soft hyphen, BOM)
+        let cp = ch as u32;
+        if ch.is_control()
+            || cp == 0x00AD
+            || (0x200B..=0x200F).contains(&cp)
+            || (0x202A..=0x202E).contains(&cp)
+            || (0x2060..=0x206F).contains(&cp)
+            || cp == 0xFEFF
+        {
+            continue;
+        }
+        if ch.is_alphanumeric() {
+            for lc in ch.to_lowercase() {
+                normalized.push(lc);
+            }
+        } else {
+            // Treat punctuation and symbols as word separators
+            normalized.push(' ');
+        }
+    }
+    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Discrete epistemic status for cognitive assertions.
@@ -320,9 +355,9 @@ pub struct AuditEvent {
 /// Cryptographic envelope schema for encrypted records at rest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptedEnvelope {
-    /// Cipher algorithm identifier (for example: ChaCha20-Poly1305).
+    /// Cipher algorithm identifier (for example: aes-256-gcm).
     pub cipher: String,
-    /// Key derivation function identifier (for example: Argon2id).
+    /// Key derivation function identifier (for example: pbkdf2-sha256).
     pub kdf: String,
     /// Base64-encoded salt used during key derivation.
     pub salt_b64: String,
@@ -584,13 +619,20 @@ impl MemoryVault for InMemoryMemoryVault {
                             )));
                         }
                         if can_val_hash.is_none() {
-                            can_val_hash = Some(sha256_hex(canonicalize_text(&entity.content).as_bytes()));
+                            let can_text = canonicalize_text(&entity.content);
+                            can_val_hash = Some(if can_text.is_empty() {
+                                String::new()
+                            } else {
+                                sha256_hex(can_text.as_bytes())
+                            });
                         }
-                        if Some(h) == can_val_hash.as_ref() {
-                            return Err(VaultError::StorageError(format!(
-                                "Write rejected by tombstone: entity '{}:{}' [scope={}] matches tombstone reason: {}",
-                                cat, k, sc, reason
-                            )));
+                        if let Some(ref ch_hash) = can_val_hash {
+                            if !ch_hash.is_empty() && h == ch_hash {
+                                return Err(VaultError::StorageError(format!(
+                                    "Write rejected by tombstone: entity '{}:{}' [scope={}] matches tombstone reason: {}",
+                                    cat, k, sc, reason
+                                )));
+                            }
                         }
                     }
                 }
@@ -830,7 +872,12 @@ impl MemoryVault for InMemoryMemoryVault {
             let key_tuple = (category.to_string(), key.to_string(), scope.to_string());
             if let Some(ent) = store.remove(&key_tuple) {
                 content_hash = sha256_hex(ent.content.as_bytes());
-                can_content_hash = sha256_hex(canonicalize_text(&ent.content).as_bytes());
+                let can_text = canonicalize_text(&ent.content);
+                can_content_hash = if can_text.is_empty() {
+                    String::new()
+                } else {
+                    sha256_hex(can_text.as_bytes())
+                };
             } else {
                 return Err(VaultError::NotFound(format!("{}:{} [scope={}]", category, key, scope)));
             }
@@ -851,15 +898,17 @@ impl MemoryVault for InMemoryMemoryVault {
                 ),
                 reason.to_string(),
             );
-            tombstones.insert(
-                (
-                    category.to_string(),
-                    key.to_string(),
-                    scope.to_string(),
-                    can_content_hash,
-                ),
-                reason.to_string(),
-            );
+            if !can_content_hash.is_empty() {
+                tombstones.insert(
+                    (
+                        category.to_string(),
+                        key.to_string(),
+                        scope.to_string(),
+                        can_content_hash,
+                    ),
+                    reason.to_string(),
+                );
+            }
         }
 
         // Audit journal
@@ -902,13 +951,18 @@ impl MemoryVault for InMemoryMemoryVault {
 
     fn is_tombstoned(&self, category: &str, key: &str, content: &str, scope: &str) -> bool {
         let val_hash = sha256_hex(content.as_bytes());
-        let can_val_hash = sha256_hex(canonicalize_text(content).as_bytes());
+        let can_text = canonicalize_text(content);
+        let can_val_hash = if can_text.is_empty() {
+            String::new()
+        } else {
+            sha256_hex(can_text.as_bytes())
+        };
         if let Ok(tombstones) = self.tombstones.lock() {
             for ((cat, k, sc, h), _) in tombstones.iter() {
                 if cat == category
                     && (k == key || k == "*")
                     && (sc == scope || sc == "*")
-                    && (h == &val_hash || h == &can_val_hash)
+                    && (h == &val_hash || (!can_val_hash.is_empty() && h == &can_val_hash))
                 {
                     return true;
                 }
@@ -987,17 +1041,16 @@ impl MemoryVault for InMemoryMemoryVault {
         }
     }
 
-    fn verify_audit_chain(&self, scope: Option<&str>) -> bool {
+    fn verify_audit_chain(&self, _scope: Option<&str>) -> bool {
         if let Ok(journal) = self.audit_journal.lock() {
-            let events: Vec<_> = journal
-                .iter()
-                .filter(|ev| scope.map_or(true, |s| ev.scope == s || s == "*"))
-                .collect();
-            if events.is_empty() {
+            if journal.is_empty() {
                 return true;
             }
             let mut expected_prev = "0".repeat(64);
-            for ev in events {
+            for (idx, ev) in journal.iter().enumerate() {
+                if ev.sequence != (idx as u64) + 1 {
+                    return false;
+                }
                 if ev.prev_hash != expected_prev {
                     return false;
                 }
@@ -1056,7 +1109,7 @@ impl LeaseCoordinator for InMemoryLeaseCoordinator {
         let new_expires_at = now + ttl.as_secs();
 
         if let Some(existing) = store.get(resource) {
-            if existing.expires_at >= now && existing.holder_id != holder_id {
+            if existing.expires_at > now && existing.holder_id != holder_id {
                 return Err(LeaseError::Conflict(format!(
                     "Resource '{}' already held by '{}'",
                     resource, existing.holder_id
@@ -1115,6 +1168,7 @@ impl LeaseCoordinator for InMemoryLeaseCoordinator {
         if let Some(existing) = store.get_mut(&lease.resource) {
             if existing.holder_id == lease.holder_id
                 && existing.fencing_token == lease.fencing_token
+                && existing.expires_at > 0
             {
                 existing.expires_at = 0;
                 return Ok(true);
@@ -1348,5 +1402,77 @@ mod tests {
         assert_eq!(events[1].action, "put");
         assert_eq!(events[2].action, "update");
         assert_eq!(events[3].action, "archive");
+    }
+
+    #[test]
+    fn test_tombstone_evasion_variants_and_multiscope_audit_chain() {
+        assert_eq!(
+            canonicalize_text("  “Do\u{200B} Not” — Target\u{00AD} Civilians!! "),
+            "do not target civilians"
+        );
+        assert_eq!(
+            canonicalize_text("Ｄｏ Ｎｏｔ Ｔａｒｇｅｔ Ｃｉｖｉｌｉａｎｓ"),
+            "do not target civilians"
+        );
+
+        let mut vault = InMemoryMemoryVault::new();
+        vault
+            .put(&MemoryEntity::new_scoped(
+                "safety",
+                "rule_1",
+                "Do Not Target Civilians",
+                "scope_a",
+                EpistemicState::Verified,
+                None,
+                None,
+            ))
+            .unwrap();
+        vault
+            .put(&MemoryEntity::new_scoped(
+                "safety",
+                "rule_2",
+                "Secondary directive",
+                "scope_b",
+                EpistemicState::Verified,
+                None,
+                None,
+            ))
+            .unwrap();
+        vault
+            .tombstone("safety", "rule_1", "revoked", Some("auditor"), "scope_a")
+            .unwrap();
+
+        // Evasion via fullwidth, punctuation, and zero-width characters must be rejected
+        for variant in &[
+            "  do not, target: civilians!! ",
+            "“Do Not” — Target Civilians...",
+            "Ｄｏ Ｎｏｔ Ｔａｒｇｅｔ Ｃｉｖｉｌｉａｎｓ",
+            "Do\u{200B} Not\u{200D} Target\u{00AD} Civilians\u{FEFF}",
+        ] {
+            assert!(vault.is_tombstoned("safety", "rule_1", variant, "scope_a"));
+            let err = vault.put(&MemoryEntity::new_scoped(
+                "safety",
+                "rule_1",
+                *variant,
+                "scope_a",
+                EpistemicState::Verified,
+                None,
+                None,
+            ));
+            assert!(err.is_err());
+        }
+
+        // Scoped audit chain verification must succeed across multi-scope journals
+        assert!(vault.verify_audit_chain(Some("scope_a")));
+        assert!(vault.verify_audit_chain(Some("scope_b")));
+        assert!(vault.verify_audit_chain(None));
+
+        // Double release on lease returns false on second release
+        let mut coord = InMemoryLeaseCoordinator::new();
+        let lease = coord
+            .acquire("res_1", "worker_1", Duration::from_secs(10))
+            .unwrap();
+        assert!(coord.release(&lease).unwrap());
+        assert!(!coord.release(&lease).unwrap());
     }
 }

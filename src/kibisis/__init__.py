@@ -9,12 +9,13 @@ from .protocols import (
     LeaseError,
     MemoryVault,
 )
+from .admission import AdmissionDecision, FactDisposition, MemoryAdmissionGate
 from .crypto import AESGCMCryptoEnvelopeProvider
 from .lease import SQLiteLeaseCoordinator
 from .keys import generate_keyfile, resolve_passphrase
 from .vault import SQLiteMemoryVault
 
-__version__ = "0.1.0a2"
+__version__ = "0.1.0a3"
 
 __all__ = [
     "AuditEvent",
@@ -23,6 +24,9 @@ __all__ = [
     "Lease",
     "MemoryEntity",
     "SearchResult",
+    "AdmissionDecision",
+    "FactDisposition",
+    "MemoryAdmissionGate",
     "CryptoEnvelopeProvider",
     "EncryptionRequiredError",
     "LeaseConflictError",
