@@ -492,6 +492,7 @@ pub trait MemoryVault: Send + Sync {
     ) -> Result<Vec<SearchResult>, VaultError>;
 
     /// Search memory entries with strict scope, epistemic status, and bi-temporal validity filtering.
+    #[allow(clippy::too_many_arguments)]
     fn search_scoped(
         &self,
         query: &str,
@@ -579,6 +580,7 @@ pub trait CryptoEnvelope: Send + Sync {
 
 /// In-memory reference implementation of [`MemoryVault`].
 #[derive(Default, Clone)]
+#[allow(clippy::type_complexity)]
 pub struct InMemoryMemoryVault {
     // Key: (category, key, scope)
     entities: Arc<Mutex<HashMap<(String, String, String), MemoryEntity>>>,
@@ -958,7 +960,7 @@ impl MemoryVault for InMemoryMemoryVault {
             sha256_hex(can_text.as_bytes())
         };
         if let Ok(tombstones) = self.tombstones.lock() {
-            for ((cat, k, sc, h), _) in tombstones.iter() {
+            for (cat, k, sc, h) in tombstones.keys() {
                 if cat == category
                     && (k == key || k == "*")
                     && (sc == scope || sc == "*")
@@ -1032,7 +1034,7 @@ impl MemoryVault for InMemoryMemoryVault {
         if let Ok(journal) = self.audit_journal.lock() {
             journal
                 .iter()
-                .filter(|ev| scope.map_or(true, |s| ev.scope == s || s == "*"))
+                .filter(|ev| scope.is_none_or(|s| ev.scope == s || s == "*"))
                 .take(limit)
                 .cloned()
                 .collect()

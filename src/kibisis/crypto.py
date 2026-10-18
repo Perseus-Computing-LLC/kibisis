@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import os
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -82,3 +83,17 @@ class AESGCMCryptoEnvelopeProvider(CryptoEnvelopeProvider):
         aesgcm = AESGCM(key)
 
         return aesgcm.decrypt(nonce, full_payload, associated_data=None)
+
+
+def sign_tenant_payload(key: bytes, tenant_id: str, entity_id: str, content: str) -> str:
+    """Compute HMAC-SHA256 signature for post-retrieval tenant ownership validation (MemLeak mitigation)."""
+    msg = f"{tenant_id}:{entity_id}:{content}".encode("utf-8")
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()
+
+
+def verify_tenant_payload(key: bytes, tenant_id: str, entity_id: str, content: str, signature: str) -> bool:
+    """Verify HMAC-SHA256 signature using constant-time comparison."""
+    if not signature:
+        return False
+    expected = sign_tenant_payload(key, tenant_id, entity_id, content)
+    return hmac.compare_digest(signature, expected)

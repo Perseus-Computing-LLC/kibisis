@@ -1,3 +1,4 @@
+import os
 """Tests for kibisis-vault plugin integration and prefetch/recall behavior."""
 
 import importlib.util
@@ -30,8 +31,12 @@ class TestKibisisVaultPlugin(unittest.TestCase):
         self.plugin = load_plugin_module()
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db")
         self.db_path = Path(self.tmp.name)
+        self._saved_pass = os.environ.get("KIBISIS_PASSPHRASE")
+        self._saved_file = os.environ.get("KIBISIS_PASSPHRASE_FILE")
+        os.environ.pop("KIBISIS_PASSPHRASE_FILE", None)
+        os.environ["KIBISIS_PASSPHRASE"] = "test-passphrase-integration-123"
         # Seed test database
-        vault = SQLiteMemoryVault(self.db_path, allow_plaintext=True)
+        vault = SQLiteMemoryVault(self.db_path, passphrase="test-passphrase-integration-123")
         vault.put(
             category="convention",
             key="clean_room_rule",
@@ -56,6 +61,14 @@ class TestKibisisVaultPlugin(unittest.TestCase):
         vault.close()
 
     def tearDown(self):
+        if self._saved_pass is not None:
+            os.environ["KIBISIS_PASSPHRASE"] = self._saved_pass
+        else:
+            os.environ.pop("KIBISIS_PASSPHRASE", None)
+        if self._saved_file is not None:
+            os.environ["KIBISIS_PASSPHRASE_FILE"] = self._saved_file
+        else:
+            os.environ.pop("KIBISIS_PASSPHRASE_FILE", None)
         try:
             self.tmp.close()
         except Exception:

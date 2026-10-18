@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Union, runtime_checkable
 from .models import EncryptedEnvelope, EpistemicState, Lease, MemoryEntity, SearchResult
 
 
@@ -75,6 +75,31 @@ class MemoryVault(Protocol):
         derived_from: Optional[List[str]] = None,
     ) -> MemoryEntity:
         """Insert or update a memory entity with epistemic status, bi-temporal bounds, and scope."""
+        ...
+
+    def store(
+        self,
+        category: str,
+        key: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        epistemic_state: Optional[str] = None,
+        valid_from: Optional[float] = None,
+        valid_until: Optional[float] = None,
+        scope: str = "default",
+        author_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        principal_id: Optional[str] = None,
+        derived_from: Optional[List[str]] = None,
+    ) -> MemoryEntity:
+        """Alias for put() for ergonomic convenience."""
+        ...
+
+    def put_batch(
+        self,
+        items: Sequence[Union[Dict[str, Any], MemoryEntity]],
+    ) -> List[MemoryEntity]:
+        """Insert or update multiple entities in a single database transaction."""
         ...
 
     def get(
@@ -194,4 +219,29 @@ class MemoryVault(Protocol):
         scope: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """List active tombstone records (digests only, zero plaintext)."""
+        ...
+
+    def set_persona_slot(
+        self,
+        content: str,
+        scope: str = "default",
+        metadata: Optional[Dict[str, Any]] = None,
+        author_id: Optional[str] = None,
+    ) -> MemoryEntity:
+        """Store or update the dedicated user persona / preference slot."""
+        ...
+
+    def get_persona_slot(
+        self,
+        scope: str = "default",
+    ) -> Optional[MemoryEntity]:
+        """Fetch the dedicated persona / preference slot for the specified scope."""
+        ...
+
+    def get_persona_context_item(
+        self,
+        scope: str = "default",
+        role: str = "system",
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch persona slot formatted as a pinned Harpe ContextItem dict."""
         ...

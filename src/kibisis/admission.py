@@ -18,6 +18,7 @@ class FactDisposition(str, Enum):
     """Disposition of candidate memory during formation."""
     ADMIT = "admit"                  # Established, factual, verified assertion
     SPECULATION = "speculation"      # Plan, future possibility, conditional intent
+    CORRECTION = "correction"        # Superseding update, retraction, or factual correction
     TRANSIENT = "transient"          # Immediate situational or emotional state
     REJECT = "reject"                # Explicitly contradictory or low-salience noise
 
@@ -35,7 +36,7 @@ class AdmissionDecision:
     @property
     def is_admissible(self) -> bool:
         """Whether the candidate fact is admitted directly into active memory."""
-        return self.disposition == FactDisposition.ADMIT
+        return self.disposition in (FactDisposition.ADMIT, FactDisposition.CORRECTION)
 
 
 class MemoryAdmissionGate:
@@ -59,6 +60,12 @@ class MemoryAdmissionGate:
         re.compile(r"\b(just woke up|having lunch|heading out shortly)\b", re.IGNORECASE),
     ]
 
+    # Explicit factual correction patterns
+    CORRECTION_PATTERNS = [
+        re.compile(r"\b(actually|correction|no longer|updated to|instead of|mistake|corrected to)\b", re.IGNORECASE),
+        re.compile(r"\b(supersedes|revised|changed from|replace prior|was incorrect)\b", re.IGNORECASE),
+    ]
+
     def __init__(self, strict_mode: bool = False) -> None:
         self.strict_mode = strict_mode
 
@@ -76,7 +83,7 @@ class MemoryAdmissionGate:
             context: Optional contextual parameters (e.g. prior turns, speaker ID).
 
         Returns:
-            AdmissionDecision indicating ADMIT, SPECULATION, TRANSIENT, or REJECT.
+            AdmissionDecision indicating ADMIT, SPECULATION, CORRECTION, TRANSIENT, or REJECT.
         """
         text = content.strip()
         if not text:
@@ -93,6 +100,17 @@ class MemoryAdmissionGate:
                     reason=f"Matched transient situational pattern: {pat.pattern}",
                     cleaned_fact=text,
                     provenance="transient",
+                )
+
+        # Check for explicit correction markers
+        for pat in self.CORRECTION_PATTERNS:
+            if pat.search(text):
+                return AdmissionDecision(
+                    disposition=FactDisposition.CORRECTION,
+                    reason=f"Matched correction pattern: {pat.pattern}",
+                    cleaned_fact=text,
+                    provenance="correction",
+                    metadata={"is_correction": True},
                 )
 
         # Check for speculative intent
@@ -113,3 +131,15 @@ class MemoryAdmissionGate:
             cleaned_fact=text,
             provenance="direct",
         )
+
+    @staticmethod
+    def route_epistemic_state(decision: AdmissionDecision) -> str:
+        """Maps an admission decision to the appropriate EpistemicState string ('verified', 'candidate', 'disputed', 'revoked')."""
+        if decision.disposition == FactDisposition.ADMIT:
+            return "verified"
+        elif decision.disposition == FactDisposition.SPECULATION:
+            return "candidate"
+        elif decision.disposition == FactDisposition.CORRECTION:
+            return "verified"
+        else:
+            return "revoked"

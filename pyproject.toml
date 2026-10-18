@@ -29,7 +29,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Perseus-Computing-LLC/kibisis"
+Homepage = "https://telarch.ai/kibisis"
+Documentation = "https://docs.rs/kibisis"
 Repository = "https://github.com/Perseus-Computing-LLC/kibisis"
 
 [tool.pytest.ini_options]

@@ -14,6 +14,7 @@ from .crypto import AESGCMCryptoEnvelopeProvider
 from .lease import SQLiteLeaseCoordinator
 from .keys import generate_keyfile, resolve_passphrase
 from .vault import SQLiteMemoryVault
+from .mcp_server import KibisisMCPServer
 
 __version__ = "0.1.0a3"
 
@@ -36,6 +37,7 @@ __all__ = [
     "AESGCMCryptoEnvelopeProvider",
     "SQLiteLeaseCoordinator",
     "SQLiteMemoryVault",
+    "KibisisMCPServer",
     "generate_keyfile",
     "resolve_passphrase",
 ]
