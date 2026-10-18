@@ -1,163 +1,105 @@
-# kibisis
+# Kibisis
 
-> Local-first encrypted memory vault with atomic leases for AI agents.
+> Local-first encrypted cognitive memory vault with atomic concurrency leases.
 
 [![Crates.io](https://img.shields.io/crates/v/kibisis.svg)](https://crates.io/crates/kibisis)
+[![PyPI](https://img.shields.io/pypi/v/kibisis.svg)](https://pypi.org/project/kibisis/)
 [![docs.rs](https://docs.rs/kibisis/badge.svg)](https://docs.rs/kibisis)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.85-informational.svg)](Cargo.toml)
+[![MSRV: 1.85](https://img.shields.io/badge/MSRV-1.85-informational.svg)](Cargo.toml)
 
-Part of the **Telarch Suite** (TCI / Telarch Cognitive Infrastructure) by [Perseus Computing LLC](https://github.com/Perseus-Computing-LLC).
+Part of the **Telarch Suite** by [Perseus Computing LLC](https://perseuscomputing.com).
 
----
+## What it does
 
-## Why Kibisis exists
-
-When multiple agent workers share memory without coordination, they overwrite each other's keys, read half-written state, and cause silent bugs.
-
-Kibisis gives you an embedded memory vault with atomic Single-Writer Multi-Reader (SWMR) leases. Agents grab time-bounded write leases before modifying entries, and read concurrently without blocking. Payloads are encrypted locally with AES-256-GCM so memory at rest stays secure on disk.
-
----
-
-## Key design goals
-
-- **Atomic concurrency leases:** Fast lease acquisition with automatic timeout prevents competing workers from corrupting shared keys.
-- **Encrypted by default:** An on-disk vault refuses to open without a passphrase. Full-database page-level encryption via SQLCipher ensures zero plaintext leakage (schema, tables, keys, categories, metadata, and indexes). Entry payloads additionally feature AES-256-GCM envelope encryption with PBKDF2-SHA256 (600,000 iterations). Raw disk scans reveal zero plaintext.
-- **High throughput:** Handles 1.5–1.6 million lease operations per second with 16 to 32 contending threads.
-- **Offline and partition resilient:** Tested in 10-node simulated edge partitions with zero split-brain errors.
-- **Evasion-resistant tombstones:** Rejected-value tombstones use canonicalized text hashing (Unicode NFKC, casefold, punctuation stripping, whitespace normalization) to prevent prompt injection and evasion.
-
----
+When multiple agent workers share memory without coordination, they overwrite keys, read inconsistent state, and cause silent bugs. Kibisis provides:
+- **Atomic concurrency leases:** Agents take time-limited write leases before modifying shared state. Leases issue monotonically increasing fencing tokens that prevent delayed writes from corrupting data.
+- **Local encrypted storage (Python):** The Python package uses SQLCipher full-page encryption and AES-256-GCM envelopes (PBKDF2-HMAC-SHA256, 600,000 iterations). Raw disk scans reveal zero plaintext.
+- **In-memory coordinator (Rust):** The Rust crate provides fast in-process leasing and in-memory vault management.
+- **Zero network code:** Operates completely locally on your hardware without external cloud dependencies or telemetry.
 
 ## Installation
 
-Add `kibisis` to your `Cargo.toml`:
+### Rust
+
+Add `kibisis` to `Cargo.toml`:
 
 ```toml
 [dependencies]
-kibisis = "0.1.0-alpha.2"
+kibisis = "0.1.0-alpha.3"
 ```
 
-Or via Cargo:
+### Python
+
+Install via pip:
 
 ```bash
-cargo add kibisis
+pip install kibisis
 ```
 
-For Python environments (once wheels are built, or from source):
+## Quickstart
 
-```bash
-pip install .
-```
-
----
-
-## Examples
-
-### Rust
+### Rust (10 lines)
 
 ```rust
-use kibisis::{
-    InMemoryLeaseCoordinator, InMemoryMemoryVault, LeaseCoordinator, MemoryEntity,
-    MemoryVault,
-};
+use kibisis::{InMemoryLeaseCoordinator, InMemoryMemoryVault, LeaseCoordinator, MemoryEntity, MemoryVault};
 use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let vault = InMemoryMemoryVault::new();
-    let coordinator = InMemoryLeaseCoordinator::new();
-
-    // 1. Acquire time-bounded write lease with fencing token
-    let resource = "target_vector_alpha";
-    let lease = coordinator.acquire(resource, "worker_0", Duration::from_millis(50))?;
-    println!("Acquired write lease: fencing_token={}", lease.fencing_token);
-
-    // 2. Commit encrypted memory entity under active lease
-    let entity = MemoryEntity::new(
-        "spatial_plan",
-        "waypoint_4",
-        "Waypoint 4 confirmed: telemetry coordinates locked.",
-    );
+    let mut vault = InMemoryMemoryVault::new();
+    let mut coordinator = InMemoryLeaseCoordinator::new();
+    let lease = coordinator.acquire("sector_7", "worker_a", Duration::from_secs(1))?;
+    let entity = MemoryEntity::new("tactical", "target_01", "Coordinates locked: 34.05,-118.25");
     vault.put(&entity)?;
-
-    // 3. Explicitly release lease upon completion
     coordinator.release(&lease)?;
-    println!("Lease released successfully.");
-
-    // 4. Retrieve and query memory entities
-    let query_results = vault.search("telemetry", None, 10)?;
-    for result in query_results {
-        println!(
-            "Matched entity [{}]: {} (score: {})",
-            result.entity.category, result.entity.key, result.score
-        );
-    }
-
+    println!("Saved entity with fencing token {}", lease.fencing_token);
     Ok(())
 }
 ```
 
-### Python (encrypted by default)
+### Python (10 lines)
 
 ```python
-from kibisis import SQLiteMemoryVault, generate_keyfile
+from kibisis import SQLiteMemoryVault, SQLiteLeaseCoordinator
 
-# One-time: create a random 256-bit key file readable only by you (mode 0600). It never overwrites.
-generate_keyfile("/secure/location/kibisis.key")
-
-# Point Kibisis at the key file. A file with group/other permissions is refused.
-#   export KIBISIS_PASSPHRASE_FILE=/secure/location/kibisis.key
-# (or pass passphrase="..." directly, 12+ characters; KIBISIS_PASSPHRASE also works)
-
-vault = SQLiteMemoryVault("memory.db")          # no passphrase anywhere -> EncryptionRequiredError
-vault.put("tactical", "waypoint", "Waypoint 4 locked at sector 7-G.")   # content is encrypted on disk
-print(vault.encryption_status())                # {'encrypted': 1, 'plaintext': 0}
-
-# Human review and candidate admission lifecycle:
-candidate = vault.admit_candidate("hypothesis", "exoplanet_b", "Atmosphere contains methane.", scope="project_alpha")
-# Unverified candidates are withheld from normal search until approved
-reviewed = vault.review_entity("hypothesis", "exoplanet_b", verdict="verified", scope="project_alpha", reviewer_id="dr_ellis")
-
-# Bi-temporal validity (real-world valid time bounds):
-vault.put("policy", "travel", "Travel subsidy active", valid_from=1700000000.0, valid_until=1800000000.0)
-
-# Evasion-resistant tombstone: variants of the same text with different case or punctuation are rejected too.
-vault.tombstone("tactical", "waypoint", reason="revoked")
-
-# Tamper-evident mutation hash chain:
-assert vault.verify_audit_chain() is True
-
-# Opening a vault you want unencrypted takes an explicit opt-in:
-#   SQLiteMemoryVault("memory.db", allow_plaintext=True)
-# Moving an existing plaintext vault to encrypted (also clears old text from the search index, log and free pages):
-#   SQLiteMemoryVault("old.db", passphrase="...", allow_plaintext=True).migrate_plaintext()
+vault = SQLiteMemoryVault("memory.db", passphrase="secret_master_passphrase")
+coordinator = SQLiteLeaseCoordinator("memory.db", passphrase="secret_master_passphrase")
+lease = coordinator.acquire("sector_7", "worker_a", ttl_seconds=1.0)
+vault.put("tactical", "target_01", "Coordinates locked: 34.05,-118.25")
+coordinator.release(lease)
+print(f"Committed memory entity under fencing token {lease.fencing_token}")
 ```
 
+## What we measured
 
----
+Figures trace to reports committed in [telarch-benchmarks](https://github.com/Perseus-Computing-LLC/telarch-benchmarks) (Linux x86_64, Intel Core i5-13500, `rustc 1.97.1`):
 
-## Benchmark results
+| Metric | Result | Range | Scope | Method |
+|---|---|---|---|---|
+| **Write Ingestion Rate** | **271,222 ops/s** | 271k–343k ops/s | In-memory writes, hashed into audit log | `telarch-benchmarks` |
+| **Lease Throughput (16 workers)** | **1,466,471 ops/s** | 1.46M–1.78M ops/s | 16 threads, 50 ms requested TTL | `adversarial_contention` |
+| **Lease Throughput (32 workers)** | **1,597,354 ops/s** | 1.59M–1.87M ops/s | 32 threads, 50 ms requested TTL | `adversarial_contention` |
+| **Split-Brain Violations** | **0 events** | 0 events | 64,000 contention cycles (16 & 32 workers) | `adversarial_contention` |
+| **Fencing Token Regressions** | **0 events** | 0 events | 64,000 contention cycles | `adversarial_contention` |
+| **Multi-Process Split-Brain** | **0 events** | 0 events | 2 to 32 separate OS child processes | `gap3_kibisis_multiproc` |
+| **Stale Writes Accepted** | **0 writes** | 0 writes | SIGSTOP holder past TTL; write to sink | `gap3_kibisis_multiproc` |
+| **Formal Model Verification** | **100% valid** | 6,869 states | TLA+ specification, 30,040 transitions | `gap4_kibisis_model_check` |
 
-Measured with the [`telarch-benchmarks`](https://github.com/Perseus-Computing-LLC/telarch-benchmarks) suite on bare-metal Linux x86_64 (Intel Core i5-13500, runs pinned to the performance cores, `rustc 1.97.1`, default release profile). The figures come from that repository's committed reports.
+## Limits
 
-| Metric | Measurement | Test condition | Operational Guarantee |
-| :--- | :--- | :--- | :--- |
-| **Write Throughput** | **271,222 writes/s** | Sequential in-memory writes, each hashed and chained into the audit journal | Local zero-contention vault ingestion |
-| **SWMR Contention (16 Workers)** | **1,466,471 ops/s** | 16 concurrent worker threads, 50 ms leases (`adversarial_contention`) | 0.68 &micro;s latency; 0 split-brain conflicts |
-| **SWMR Contention (32 Workers)** | **1,597,354 ops/s** | 32 concurrent worker threads, 50 ms leases (`adversarial_contention`) | 0.63 &micro;s latency; 0 fencing regressions |
-| **Swarm Partition Split-Brain** | **0 Errors** | 10-node simulated partition under 50% packet drop | 100% convergence across edge mesh (265k msgs/s) |
-| **Partition Reconciliation** | **127–191 ms** | 10-node mesh healing after the simulated partition, 0–50% packet loss | Monotonic vector clock reconciliation |
+- **Alpha release:** APIs will evolve before 1.0.
+- **Encryption scope:** In the Python package, database pages are encrypted with SQLCipher and payloads are envelope-encrypted with AES-256-GCM. The Rust crate holds memory in RAM and does not encrypt at rest.
+- **Lease coordination scope:** Leases coordinate threads in one process or processes sharing a local filesystem via SQLite transactions. They are not a distributed consensus service.
+- **TTL resolution:** The in-process Rust coordinator tracks deadlines in whole seconds and rounds up, so a lease is held for at least its TTL and at most one second longer. The Python SQLite coordinator uses floating-point second timestamps.
+- **Not independently assessed:** Designed for local and disconnected use.
 
-Run benchmarks yourself:
+## Links
 
-```bash
-cargo run --release -p telarch-benchmarks
-cargo run --release -p telarch-benchmarks --bin adversarial_contention
-cargo run --release -p telarch-benchmarks --bin swarm_partition
-```
-
----
+- [Documentation (docs.rs)](https://docs.rs/kibisis)
+- [Evidence & Claims](https://telarch.ai/evidence)
+- [Security Policy](https://github.com/Perseus-Computing-LLC/.github/blob/main/SECURITY.md)
+- [Telarch Overview](https://telarch.ai)
 
 ## License
 
-Copyright &copy; 2026 Perseus Computing LLC. Released under the [MIT License](LICENSE).
+Released under the [MIT License](LICENSE) © 2026 Perseus Computing LLC.

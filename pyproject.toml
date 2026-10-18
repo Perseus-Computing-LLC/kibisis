@@ -25,11 +25,12 @@ requires-python = ">=3.11"
 dependencies = [
     "cryptography>=42",
     "pydantic>=2",
-    "sqlcipher3-binary>=0.5",
+    "sqlcipher3>=0.5",
 ]
 
 [project.urls]
-Homepage = "https://github.com/Perseus-Computing-LLC/kibisis"
+Homepage = "https://telarch.ai/kibisis"
+Documentation = "https://docs.rs/kibisis"
 Repository = "https://github.com/Perseus-Computing-LLC/kibisis"
 
 [tool.pytest.ini_options]

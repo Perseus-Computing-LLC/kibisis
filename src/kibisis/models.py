@@ -50,6 +50,35 @@ class MemoryEntity(BaseModel):
         description="Isolation scope partition (workspace, tenant, or project identifier)."
     )
 
+    # Post-Retrieval Ownership Validation (MemLeak defense)
+    tenant_sig: Optional[str] = Field(
+        default=None,
+        description="HMAC-SHA256 signature for post-retrieval tenant ownership validation."
+    )
+
+    def to_context_item(
+        self,
+        pinned: bool = False,
+        priority: int = 1,
+        role: str = "system",
+    ) -> Dict[str, Any]:
+        """Convert memory entity to a dictionary compatible with Harpe ContextItem."""
+        meta = self.metadata.copy() if self.metadata else {}
+        meta.setdefault("category", self.category)
+        meta.setdefault("key", self.key)
+        meta.setdefault("scope", self.scope)
+        state_val = self.epistemic_state.value if isinstance(self.epistemic_state, EpistemicState) else str(self.epistemic_state)
+        meta.setdefault("epistemic_state", state_val)
+        return {
+            "id": f"kibisis_{self.category}_{self.key}",
+            "item_id": f"kibisis_{self.category}_{self.key}",
+            "content": self.content,
+            "role": role,
+            "priority": priority,
+            "pinned": pinned,
+            "metadata": meta,
+        }
+
 
 class EncryptedEnvelope(BaseModel):
     """Encrypted data envelope carrying ciphertext and KDF/cipher parameters."""

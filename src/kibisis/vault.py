@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 try:
     import sqlcipher3
@@ -14,11 +15,13 @@ import string
 import time
 import unicodedata
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
-from .crypto import AESGCMCryptoEnvelopeProvider
+from typing import Any, Dict, List, Optional, Sequence, Union
+from .crypto import AESGCMCryptoEnvelopeProvider, sign_tenant_payload, verify_tenant_payload
 from .keys import MIN_PASSPHRASE_LENGTH, resolve_passphrase
 from .models import AuditEvent, EncryptedEnvelope, EpistemicState, MemoryEntity, SearchResult
-from .protocols import CryptoEnvelopeProvider, EncryptionRequiredError, MemoryVault
+from .protocols import CryptoEnvelopeProvider, EncryptionRequiredError, LeaseConflictError, LeaseCoordinator, MemoryVault
+
+logger = logging.getLogger(__name__)
 
 
 def canonicalize_text(text: str) -> str:
@@ -61,6 +64,8 @@ class SQLiteMemoryVault(MemoryVault):
         passphrase: Optional[str] = None,
         *,
         allow_plaintext: bool = False,
+        coordinator: Optional[LeaseCoordinator] = None,
+        enforce_fencing: bool = False,
     ) -> None:
         """Open a vault. Entry content is encrypted by default.
 
@@ -69,6 +74,9 @@ class SQLiteMemoryVault(MemoryVault):
         An in-memory vault never touches disk, so it may run without a passphrase.
         """
         self.db_path = str(db_path)
+        self.coordinator = coordinator
+        self.enforce_fencing = enforce_fencing
+        self._fallback_search_warned = False
         on_disk = self.db_path != ":memory:"
         passphrase = resolve_passphrase(passphrase)
         if passphrase and len(passphrase) < MIN_PASSPHRASE_LENGTH:
@@ -81,6 +89,10 @@ class SQLiteMemoryVault(MemoryVault):
         self.passphrase = passphrase
         self.crypto_provider = crypto_provider
 
+        # Master key for post-retrieval HMAC tenant ownership checks (MemLeak defense)
+        sig_seed = passphrase if passphrase else self.db_path
+        self._signing_key = hashlib.sha256(f"kibisis-tenant-sig:{sig_seed}".encode("utf-8")).digest()
+
         # Check for unencrypted database migration if passphrase is provided
         if on_disk and passphrase and os.path.exists(self.db_path) and os.path.getsize(self.db_path) > 0:
             with open(self.db_path, "rb") as f:
@@ -91,6 +103,7 @@ class SQLiteMemoryVault(MemoryVault):
 
         self._conn = sqlcipher3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         self._conn.row_factory = sqlcipher3.Row
+        self._sqlcipher_active = False
         if passphrase:
             escaped_pass = passphrase.replace("'", "''")
             self._conn.execute("PRAGMA cipher_memory_security = ON;")
@@ -98,6 +111,9 @@ class SQLiteMemoryVault(MemoryVault):
             # Verify the key immediately by accessing sqlite_master
             try:
                 self._conn.execute("SELECT count(*) FROM sqlite_master;").fetchall()
+                row = self._conn.execute("PRAGMA cipher_version;").fetchone()
+                if row and row[0]:
+                    self._sqlcipher_active = True
             except Exception as e:
                 self._conn.close()
                 raise ValueError("Failed to authenticate or decrypt vault database with provided passphrase") from e
@@ -108,6 +124,43 @@ class SQLiteMemoryVault(MemoryVault):
             self.crypto_provider = AESGCMCryptoEnvelopeProvider(salt=self._vault_salt())
         if on_disk:
             self._restrict_permissions()
+
+    def _validate_fencing(
+        self,
+        fencing_token: Optional[int],
+        resource: Optional[str],
+        holder_id: Optional[str] = None,
+    ) -> None:
+        """Validate an atomic fencing token against the attached lease coordinator."""
+        if self.enforce_fencing and (fencing_token is None or resource is None):
+            raise LeaseConflictError("enforce_fencing is enabled on vault, but fencing_token or resource was not provided")
+
+        if fencing_token is None and resource is None:
+            return
+
+        if self.coordinator is None:
+            raise LeaseConflictError("Fencing token validation requested but no LeaseCoordinator is configured on vault")
+
+        if resource is None or fencing_token is None:
+            raise LeaseConflictError(
+                f"Both resource and fencing_token must be specified for fencing validation (got resource={resource}, token={fencing_token})"
+            )
+
+        if holder_id is not None:
+            if not self.coordinator.validate_fencing_token(resource, holder_id, fencing_token):
+                raise LeaseConflictError(
+                    f"Stale or invalid fencing token {fencing_token} for resource '{resource}' (holder={holder_id})"
+                )
+        else:
+            lease = self.coordinator.get_lease(resource)
+            if lease is None:
+                raise LeaseConflictError(f"No active lease found for resource '{resource}'")
+            if lease.fencing_token != fencing_token:
+                raise LeaseConflictError(
+                    f"Stale fencing token {fencing_token} for resource '{resource}' (active token is {lease.fencing_token})"
+                )
+            if lease.expires_at <= time.time():
+                raise LeaseConflictError(f"Expired lease with fencing token {fencing_token} for resource '{resource}'")
 
     @staticmethod
     def _migrate_file_to_sqlcipher(path: str, passphrase: str) -> None:
@@ -163,13 +216,14 @@ class SQLiteMemoryVault(MemoryVault):
         the write-ahead log and free pages. Returns {"migrated": n, "remaining_plaintext": m}."""
         if self.crypto_provider is None or not self.passphrase:
             raise EncryptionRequiredError("migrate_plaintext needs a passphrase.")
-        rows = self._conn.execute("SELECT id, content FROM entities WHERE is_encrypted = 0").fetchall()
+        rows = self._conn.execute("SELECT id, category, key, scope, content FROM entities WHERE is_encrypted = 0").fetchall()
         with self._conn:
             for r in rows:
                 env = self.crypto_provider.encrypt(r["content"].encode("utf-8"), self.passphrase)
+                new_sig = sign_tenant_payload(self._signing_key, r["scope"], f"{r['category']}:{r['key']}", r["content"])
                 self._conn.execute(
-                    "UPDATE entities SET content = '', is_encrypted = 1, encrypted_envelope_json = ? WHERE id = ?",
-                    (env.model_dump_json(), r["id"]),
+                    "UPDATE entities SET content = '', is_encrypted = 1, encrypted_envelope_json = ?, tenant_sig = ? WHERE id = ?",
+                    (env.model_dump_json(), new_sig, r["id"]),
                 )
         # FTS5 'delete' leaves old terms in index segments until rebuilt; WAL and free pages keep old bytes too.
         self._conn.execute("INSERT INTO entities_fts(entities_fts) VALUES ('rebuild')")
@@ -208,6 +262,7 @@ class SQLiteMemoryVault(MemoryVault):
                     epistemic_state TEXT NOT NULL DEFAULT 'verified',
                     valid_from REAL DEFAULT NULL,
                     valid_until REAL DEFAULT NULL,
+                    tenant_sig TEXT DEFAULT NULL,
                     UNIQUE(category, key, scope)
                 )
                 """
@@ -229,6 +284,16 @@ class SQLiteMemoryVault(MemoryVault):
                 self._conn.execute("ALTER TABLE entities ADD COLUMN valid_from REAL DEFAULT NULL")
             if "valid_until" not in cols:
                 self._conn.execute("ALTER TABLE entities ADD COLUMN valid_until REAL DEFAULT NULL")
+            if "tenant_sig" not in cols:
+                self._conn.execute("ALTER TABLE entities ADD COLUMN tenant_sig TEXT DEFAULT NULL")
+
+            # Covering B-Tree index for bitemporal point-in-time and interval queries
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_entities_bitemporal
+                ON entities (scope, category, epistemic_state, valid_from, valid_until)
+                """
+            )
 
             self._conn.execute(
                 """
@@ -462,6 +527,9 @@ class SQLiteMemoryVault(MemoryVault):
                 # Plaintext is zeroed out to prevent leaking into entities or FTS index
                 stored_content = ""
 
+            # Cryptographic tenant signature for MemLeak isolation
+            tenant_sig = sign_tenant_payload(self._signing_key, scope, f"{category}:{key}", content)
+
             cursor.execute(
                 "SELECT id, version, created_at FROM entities WHERE category = ? AND key = ? AND scope = ?",
                 (category, key, scope),
@@ -475,13 +543,13 @@ class SQLiteMemoryVault(MemoryVault):
                     INSERT INTO entities (
                         category, key, content, metadata_json, version, archived,
                         created_at, updated_at, is_encrypted, encrypted_envelope_json,
-                        scope, epistemic_state, valid_from, valid_until
+                        scope, epistemic_state, valid_from, valid_until, tenant_sig
                     )
-                    VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         category, key, stored_content, meta_str, now, now,
-                        is_encrypted, envelope_json, scope, ep_state.value, valid_from, valid_until
+                        is_encrypted, envelope_json, scope, ep_state.value, valid_from, valid_until, tenant_sig
                     ),
                 )
                 entity_id = cursor.lastrowid
@@ -497,12 +565,12 @@ class SQLiteMemoryVault(MemoryVault):
                     UPDATE entities
                     SET content = ?, metadata_json = ?, version = ?, archived = 0, updated_at = ?,
                         is_encrypted = ?, encrypted_envelope_json = ?, epistemic_state = ?,
-                        valid_from = ?, valid_until = ?
+                        valid_from = ?, valid_until = ?, tenant_sig = ?
                     WHERE id = ?
                     """,
                     (
                         stored_content, meta_str, version, now, is_encrypted, envelope_json,
-                        ep_state.value, valid_from, valid_until, entity_id
+                        ep_state.value, valid_from, valid_until, tenant_sig, entity_id
                     ),
                 )
 
@@ -532,7 +600,65 @@ class SQLiteMemoryVault(MemoryVault):
             valid_from=valid_from,
             valid_until=valid_until,
             scope=scope,
+            tenant_sig=tenant_sig,
         )
+
+    def store(
+        self,
+        category: str,
+        key: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        epistemic_state: Optional[str] = None,
+        valid_from: Optional[float] = None,
+        valid_until: Optional[float] = None,
+        scope: str = "default",
+        author_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        principal_id: Optional[str] = None,
+        derived_from: Optional[List[str]] = None,
+    ) -> MemoryEntity:
+        """Alias for put() for ergonomic convenience."""
+        return self.put(
+            category=category,
+            key=key,
+            content=content,
+            metadata=metadata,
+            epistemic_state=epistemic_state,
+            valid_from=valid_from,
+            valid_until=valid_until,
+            scope=scope,
+            author_id=author_id,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            derived_from=derived_from,
+        )
+
+    def put_batch(
+        self,
+        items: Sequence[Union[Dict[str, Any], MemoryEntity]],
+    ) -> List[MemoryEntity]:
+        """Insert or update multiple entities in a single database transaction."""
+        results: List[MemoryEntity] = []
+        with self._conn:
+            for item in items:
+                if isinstance(item, MemoryEntity):
+                    res = self.put(
+                        category=item.category,
+                        key=item.key,
+                        content=item.content,
+                        metadata=item.metadata,
+                        epistemic_state=item.epistemic_state.value if isinstance(item.epistemic_state, EpistemicState) else str(item.epistemic_state),
+                        valid_from=item.valid_from,
+                        valid_until=item.valid_until,
+                        scope=item.scope,
+                    )
+                elif isinstance(item, dict):
+                    res = self.put(**item)
+                else:
+                    raise TypeError(f"Expected dict or MemoryEntity, got {type(item)}")
+                results.append(res)
+        return results
 
     def get(
         self,
@@ -544,7 +670,7 @@ class SQLiteMemoryVault(MemoryVault):
         cursor.execute(
             """
             SELECT id, category, key, content, metadata_json, version, archived, created_at, updated_at,
-                   is_encrypted, encrypted_envelope_json, scope, epistemic_state, valid_from, valid_until
+                   is_encrypted, encrypted_envelope_json, scope, epistemic_state, valid_from, valid_until, tenant_sig
             FROM entities
             WHERE category = ? AND key = ? AND scope = ?
             """,
@@ -559,6 +685,12 @@ class SQLiteMemoryVault(MemoryVault):
         else:
             content = row["content"]
 
+        row_keys = row.keys()
+        sig = row["tenant_sig"] if "tenant_sig" in row_keys else None
+        if sig:
+            if not verify_tenant_payload(self._signing_key, row["scope"], f"{row['category']}:{row['key']}", content, sig):
+                raise PermissionError(f"MemLeak validation failure: invalid tenant signature for key '{key}' in scope '{scope}'.")
+
         return MemoryEntity(
             id=row["id"],
             category=row["category"],
@@ -569,10 +701,11 @@ class SQLiteMemoryVault(MemoryVault):
             archived=bool(row["archived"]),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
-            epistemic_state=EpistemicState(row["epistemic_state"]) if "epistemic_state" in row.keys() else EpistemicState.VERIFIED,
-            valid_from=row["valid_from"] if "valid_from" in row.keys() else None,
-            valid_until=row["valid_until"] if "valid_until" in row.keys() else None,
-            scope=row["scope"] if "scope" in row.keys() else "default",
+            epistemic_state=EpistemicState(row["epistemic_state"]) if "epistemic_state" in row_keys else EpistemicState.VERIFIED,
+            valid_from=row["valid_from"] if "valid_from" in row_keys else None,
+            valid_until=row["valid_until"] if "valid_until" in row_keys else None,
+            scope=row["scope"] if "scope" in row_keys else "default",
+            tenant_sig=sig,
         )
 
     def archive(
@@ -690,7 +823,7 @@ class SQLiteMemoryVault(MemoryVault):
             sql = f"""
                 SELECT e.id, e.category, e.key, e.content, e.metadata_json, e.version, e.archived,
                        e.created_at, e.updated_at, e.is_encrypted, e.encrypted_envelope_json,
-                       e.scope, e.epistemic_state, e.valid_from, e.valid_until,
+                       e.scope, e.epistemic_state, e.valid_from, e.valid_until, e.tenant_sig,
                        rank, snippet(entities_fts, 2, '<b>', '</b>', '...', 16) AS snip
                 FROM entities_fts
                 JOIN entities e ON e.id = entities_fts.rowid
@@ -726,7 +859,7 @@ class SQLiteMemoryVault(MemoryVault):
                 f"""
                 SELECT id, category, key, content, metadata_json, version, archived,
                        created_at, updated_at, is_encrypted, encrypted_envelope_json,
-                       scope, epistemic_state, valid_from, valid_until,
+                       scope, epistemic_state, valid_from, valid_until, tenant_sig,
                        0.0 as rank, '' as snip
                 FROM entities
                 WHERE {fb_sql}
@@ -747,6 +880,12 @@ class SQLiteMemoryVault(MemoryVault):
             else:
                 content = r["content"]
 
+            sig = r["tenant_sig"] if "tenant_sig" in r.keys() else None
+            if sig and content != "[ENCRYPTED]":
+                if not verify_tenant_payload(self._signing_key, r["scope"], f"{r['category']}:{r['key']}", content, sig):
+                    # Cross-tenant corruption or tamper detected; skip tainted entity
+                    continue
+
             entity = MemoryEntity(
                 id=r["id"],
                 category=r["category"],
@@ -761,6 +900,7 @@ class SQLiteMemoryVault(MemoryVault):
                 valid_from=r["valid_from"] if "valid_from" in r.keys() else None,
                 valid_until=r["valid_until"] if "valid_until" in r.keys() else None,
                 scope=r["scope"] if "scope" in r.keys() else "default",
+                tenant_sig=sig,
             )
             results.append(SearchResult(entity=entity, rank_score=float(r["rank"]), snippet=str(r["snip"])))
 
@@ -819,7 +959,7 @@ class SQLiteMemoryVault(MemoryVault):
         query_sql = (
             "SELECT id, category, key, content, metadata_json, version, archived, "
             "created_at, updated_at, is_encrypted, encrypted_envelope_json, "
-            "scope, epistemic_state, valid_from, valid_until FROM entities WHERE 1=1"
+            "scope, epistemic_state, valid_from, valid_until, tenant_sig FROM entities WHERE 1=1"
         )
         params: List[Any] = []
 
@@ -853,6 +993,12 @@ class SQLiteMemoryVault(MemoryVault):
             else:
                 content = r["content"]
 
+            sig = r["tenant_sig"] if "tenant_sig" in r.keys() else None
+            if sig and content != "[ENCRYPTED]":
+                if not verify_tenant_payload(self._signing_key, r["scope"], f"{r['category']}:{r['key']}", content, sig):
+                    # Cross-tenant corruption or tamper detected; skip tainted entity
+                    continue
+
             items.append(
                 MemoryEntity(
                     id=r["id"],
@@ -868,6 +1014,7 @@ class SQLiteMemoryVault(MemoryVault):
                     valid_from=r["valid_from"] if "valid_from" in r.keys() else None,
                     valid_until=r["valid_until"] if "valid_until" in r.keys() else None,
                     scope=r["scope"] if "scope" in r.keys() else "default",
+                    tenant_sig=sig,
                 )
             )
         return items
@@ -1116,6 +1263,270 @@ class SQLiteMemoryVault(MemoryVault):
                 return False
             expected_prev = ev.event_hash
         return True
+
+    def set_persona_slot(
+        self,
+        content: str,
+        scope: str = "default",
+        metadata: Optional[Dict[str, Any]] = None,
+        author_id: Optional[str] = None,
+    ) -> MemoryEntity:
+        """Store or update the dedicated user persona / preference slot."""
+        meta = metadata.copy() if metadata else {}
+        meta["is_persona_slot"] = True
+        return self.put(
+            category="persona",
+            key="user_profile",
+            content=content,
+            metadata=meta,
+            scope=scope,
+            author_id=author_id,
+            epistemic_state=EpistemicState.VERIFIED.value,
+        )
+
+    def get_persona_slot(
+        self,
+        scope: str = "default",
+    ) -> Optional[MemoryEntity]:
+        """Fetch the dedicated persona / preference slot for the specified scope."""
+        return self.get(category="persona", key="user_profile", scope=scope)
+
+    def get_persona_context_item(
+        self,
+        scope: str = "default",
+        role: str = "system",
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch persona slot formatted as a pinned Harpe ContextItem dict."""
+        ent = self.get_persona_slot(scope=scope)
+        if ent is None:
+            return None
+        return ent.to_context_item(pinned=True, priority=0, role=role)
+
+    def validate_tenant_ownership(self, entity: MemoryEntity, expected_scope: str) -> bool:
+        """Validate cryptographic HMAC ownership of an entity against expected scope (MemLeak defense)."""
+        if entity.scope != expected_scope:
+            return False
+        if not entity.tenant_sig:
+            return True
+        return verify_tenant_payload(
+            self._signing_key,
+            entity.scope,
+            f"{entity.category}:{entity.key}",
+            entity.content,
+            entity.tenant_sig,
+        )
+
+    def export_snapshot(
+        self,
+        path: Optional[Union[str, Path]] = None,
+        scope: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Export a deterministic, portable snapshot of entities, tombstones, and audit events.
+
+        Computes a SHA-256 integrity manifest over the exported payload.
+        If path is provided, writes the serialized JSON atomically to disk.
+        """
+        cursor = self._conn.cursor()
+
+        if scope and scope != "*":
+            cursor.execute(
+                """
+                SELECT category, key, content, metadata_json, version, archived,
+                       created_at, updated_at, is_encrypted, encrypted_envelope_json,
+                       scope, epistemic_state, valid_from, valid_until, tenant_sig
+                FROM entities
+                WHERE scope = ?
+                ORDER BY scope, category, key
+                """,
+                (scope,),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT category, key, content, metadata_json, version, archived,
+                       created_at, updated_at, is_encrypted, encrypted_envelope_json,
+                       scope, epistemic_state, valid_from, valid_until, tenant_sig
+                FROM entities
+                ORDER BY scope, category, key
+                """
+            )
+
+        raw_entities = cursor.fetchall()
+        entities_data = []
+        for r in raw_entities:
+            if r["is_encrypted"] == 1:
+                content = self._decrypt_content(r["encrypted_envelope_json"])
+            else:
+                content = r["content"]
+            entities_data.append({
+                "category": r["category"],
+                "key": r["key"],
+                "content": content,
+                "metadata": json.loads(r["metadata_json"]),
+                "version": r["version"],
+                "archived": bool(r["archived"]),
+                "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+                "scope": r["scope"],
+                "epistemic_state": r["epistemic_state"],
+                "valid_from": r["valid_from"],
+                "valid_until": r["valid_until"],
+            })
+
+        cursor.execute(
+            """
+            SELECT category, key, value_sha256, canonical_sha256, reason, author_id, created_at, scope
+            FROM rejected_value_tombstones
+            ORDER BY category, key, scope
+            """
+        )
+        tombstones_data = [
+            {
+                "category": r["category"],
+                "key": r["key"],
+                "value_sha256": r["value_sha256"],
+                "canonical_sha256": r["canonical_sha256"],
+                "reason": r["reason"],
+                "author_id": r["author_id"],
+                "created_at": r["created_at"],
+                "scope": r["scope"],
+            }
+            for r in cursor.fetchall()
+        ]
+
+        audit_events = self.list_audit_events(limit=1_000_000)
+        events_data = [ev.model_dump() for ev in audit_events]
+
+        snapshot: Dict[str, Any] = {
+            "format_version": "1.0",
+            "exported_at": time.time(),
+            "scope": scope or "*",
+            "entity_count": len(entities_data),
+            "tombstone_count": len(tombstones_data),
+            "audit_event_count": len(events_data),
+            "entities": entities_data,
+            "tombstones": tombstones_data,
+            "audit_events": events_data,
+        }
+
+        canonical_bytes = json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        manifest_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
+        snapshot["manifest_sha256"] = manifest_sha256
+
+        if path is not None:
+            out_p = Path(path)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            tmp_p = out_p.with_suffix(f".tmp.{os.getpid()}")
+            with open(tmp_p, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, indent=2, sort_keys=True)
+            tmp_p.replace(out_p)
+
+        return snapshot
+
+    def import_snapshot(
+        self,
+        snapshot_or_path: Union[str, Path, Dict[str, Any]],
+        *,
+        clear_existing: bool = False,
+    ) -> int:
+        """Import a snapshot into the vault.
+
+        Validates manifest hash integrity.
+        Returns the number of restored entities.
+        """
+        if isinstance(snapshot_or_path, (str, Path)):
+            with open(snapshot_or_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        elif isinstance(snapshot_or_path, dict):
+            data = snapshot_or_path
+        else:
+            raise TypeError("Expected snapshot dict or path")
+
+        manifest_sha = data.get("manifest_sha256")
+        if manifest_sha:
+            check_data = {k: v for k, v in data.items() if k != "manifest_sha256"}
+            canonical_bytes = json.dumps(check_data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            recomputed = hashlib.sha256(canonical_bytes).hexdigest()
+            if recomputed != manifest_sha:
+                raise ValueError(f"Snapshot integrity violation: manifest mismatch {recomputed} != {manifest_sha}")
+
+        imported_count = 0
+        with self._conn:
+            cursor = self._conn.cursor()
+            if clear_existing:
+                cursor.execute("DELETE FROM entities")
+                cursor.execute("DELETE FROM entities_fts")
+                cursor.execute("DELETE FROM rejected_value_tombstones")
+                cursor.execute("DELETE FROM audit_log")
+
+            for ent_data in data.get("entities", []):
+                self.put(
+                    category=ent_data["category"],
+                    key=ent_data["key"],
+                    content=ent_data["content"],
+                    metadata=ent_data.get("metadata"),
+                    epistemic_state=ent_data.get("epistemic_state", "verified"),
+                    valid_from=ent_data.get("valid_from"),
+                    valid_until=ent_data.get("valid_until"),
+                    scope=ent_data.get("scope", "default"),
+                )
+                imported_count += 1
+
+            for ts in data.get("tombstones", []):
+                cursor.execute(
+                    """
+                    INSERT OR REPLACE INTO rejected_value_tombstones (
+                        category, key, value_sha256, canonical_sha256, reason, author_id, created_at, scope
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ts["category"],
+                        ts["key"],
+                        ts["value_sha256"],
+                        ts.get("canonical_sha256", ""),
+                        ts.get("reason", "imported"),
+                        ts.get("author_id"),
+                        ts.get("created_at", time.time()),
+                        ts.get("scope", "default"),
+                    ),
+                )
+
+        return imported_count
+
+    def evaluate_epistemic_abstention(
+        self,
+        negative_probes: List[str],
+        scope: str = "default",
+    ) -> Dict[str, Any]:
+        """Evaluate vault abstention on negative out-of-scope probes.
+
+        Ensures the vault does not return fabricated or false positive recall results
+        when probed with out-of-scope or non-existent topics.
+        """
+        total = len(negative_probes)
+        abstained = 0
+        false_positives = []
+
+        for probe in negative_probes:
+            res = self.search(probe, scope=scope)
+            if len(res) == 0:
+                abstained += 1
+            else:
+                false_positives.append({
+                    "probe": probe,
+                    "matched_keys": [r.entity.key for r in res],
+                })
+
+        abstention_rate = (abstained / total) if total > 0 else 1.0
+        return {
+            "total_probes": total,
+            "abstained_count": abstained,
+            "false_positive_count": len(false_positives),
+            "abstention_rate": abstention_rate,
+            "false_positives": false_positives,
+            "perfect_abstention": (abstained == total),
+        }
 
     def close(self) -> None:
         self._conn.close()

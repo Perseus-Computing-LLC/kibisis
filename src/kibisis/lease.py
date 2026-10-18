@@ -40,6 +40,19 @@ class SQLiteLeaseCoordinator(LeaseCoordinator):
             self._conn.execute("PRAGMA secure_delete = ON;")
         self._configure_db()
         self._init_schema()
+        if self.db_path != ":memory:":
+            self._restrict_permissions()
+
+    def _restrict_permissions(self) -> None:
+        """Lock down database file and WAL/SHM artifacts to 0o600."""
+        for suffix in ("", "-wal", "-shm"):
+            p = self.db_path + suffix
+            if not os.path.exists(p):
+                continue
+            try:
+                os.chmod(p, 0o600)
+            except OSError:
+                pass
 
     def _configure_db(self) -> None:
         self._conn.execute("PRAGMA busy_timeout = 30000")
@@ -56,6 +69,8 @@ class SQLiteLeaseCoordinator(LeaseCoordinator):
             try:
                 yield cursor
                 self._conn.execute("COMMIT")
+                if self.db_path != ":memory:":
+                    self._restrict_permissions()
             except BaseException:
                 try:
                     self._conn.execute("ROLLBACK")

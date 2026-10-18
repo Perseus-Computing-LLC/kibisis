@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Union, runtime_checkable
 from .models import EncryptedEnvelope, EpistemicState, Lease, MemoryEntity, SearchResult
 
 
@@ -50,6 +50,10 @@ class LeaseCoordinator(Protocol):
         """Release an active lease so other holders may acquire it."""
         ...
 
+    def get_lease(self, resource: str) -> Optional[Lease]:
+        """Fetch current lease record for resource, if any."""
+        ...
+
     def validate_fencing_token(self, resource: str, holder_id: str, fencing_token: int) -> bool:
         """Verify that ``holder_id`` holds an active, un-preempted lease on ``resource`` with ``fencing_token``."""
         ...
@@ -73,8 +77,39 @@ class MemoryVault(Protocol):
         tenant_id: Optional[str] = None,
         principal_id: Optional[str] = None,
         derived_from: Optional[List[str]] = None,
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
     ) -> MemoryEntity:
-        """Insert or update a memory entity with epistemic status, bi-temporal bounds, and scope."""
+        """Insert or update a memory entity with epistemic status, bi-temporal bounds, scope, and fencing token validation."""
+        ...
+
+    def store(
+        self,
+        category: str,
+        key: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        epistemic_state: Optional[str] = None,
+        valid_from: Optional[float] = None,
+        valid_until: Optional[float] = None,
+        scope: str = "default",
+        author_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        principal_id: Optional[str] = None,
+        derived_from: Optional[List[str]] = None,
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
+    ) -> MemoryEntity:
+        """Alias for put() for ergonomic convenience."""
+        ...
+
+    def put_batch(
+        self,
+        items: Sequence[Union[Dict[str, Any], MemoryEntity]],
+    ) -> List[MemoryEntity]:
+        """Insert or update multiple entities in a single database transaction."""
         ...
 
     def get(
@@ -108,6 +143,10 @@ class MemoryVault(Protocol):
         key: str,
         scope: str = "default",
         author_id: Optional[str] = None,
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
+        missing_ok: bool = True,
     ) -> bool:
         """Soft-delete an entity by setting its archived flag."""
         ...
@@ -132,6 +171,10 @@ class MemoryVault(Protocol):
         author_id: Optional[str] = None,
         content: Optional[str] = None,
         scope: str = "default",
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
+        missing_ok: bool = False,
     ) -> str:
         """Tombstone entity value by SHA-256 digest and purge plaintext content."""
         ...
@@ -159,6 +202,9 @@ class MemoryVault(Protocol):
         tenant_id: Optional[str] = None,
         principal_id: Optional[str] = None,
         derived_from: Optional[List[str]] = None,
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
     ) -> MemoryEntity:
         """Stage an unverified memory candidate into the vault awaiting verification/human review."""
         ...
@@ -194,4 +240,29 @@ class MemoryVault(Protocol):
         scope: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """List active tombstone records (digests only, zero plaintext)."""
+        ...
+
+    def set_persona_slot(
+        self,
+        content: str,
+        scope: str = "default",
+        metadata: Optional[Dict[str, Any]] = None,
+        author_id: Optional[str] = None,
+    ) -> MemoryEntity:
+        """Store or update the dedicated user persona / preference slot."""
+        ...
+
+    def get_persona_slot(
+        self,
+        scope: str = "default",
+    ) -> Optional[MemoryEntity]:
+        """Fetch the dedicated persona / preference slot for the specified scope."""
+        ...
+
+    def get_persona_context_item(
+        self,
+        scope: str = "default",
+        role: str = "system",
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch persona slot formatted as a pinned Harpe ContextItem dict."""
         ...
