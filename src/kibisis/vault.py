@@ -104,18 +104,6 @@ class SQLiteMemoryVault(MemoryVault):
             self._conn.execute("PRAGMA secure_delete = ON;")
         self._configure_db()
         self._init_schema()
-        # Fast cache for whether tombstones exist in the database
-        cursor = self._conn.cursor()
-        cursor.execute("SELECT COUNT(*) AS cnt FROM rejected_value_tombstones")
-        self._has_tombstones = (cursor.fetchone()["cnt"] > 0)
-        cursor.execute("SELECT sequence, event_hash FROM audit_journal ORDER BY sequence DESC LIMIT 1")
-        last_audit = cursor.fetchone()
-        if last_audit:
-            self._last_audit_seq = last_audit["sequence"]
-            self._last_audit_hash = last_audit["event_hash"]
-        else:
-            self._last_audit_seq = 0
-            self._last_audit_hash = "0" * 64
         if passphrase and crypto_provider is None:
             self.crypto_provider = AESGCMCryptoEnvelopeProvider(salt=self._vault_salt())
         if on_disk:
@@ -361,19 +349,14 @@ class SQLiteMemoryVault(MemoryVault):
         now = time.time()
         meta_dict = metadata or {}
 
-        # Use cached sequence & hash if available to avoid index scan on hot write path
-        if hasattr(self, "_last_audit_seq") and hasattr(self, "_last_audit_hash") and self._last_audit_seq > 0:
-            seq = self._last_audit_seq + 1
-            prev_hash = self._last_audit_hash
-        else:
-            cursor.execute("SELECT sequence, event_hash FROM audit_journal ORDER BY sequence DESC LIMIT 1")
-            last_row = cursor.fetchone()
-            if last_row is None:
-                prev_hash = "0" * 64
-                seq = 1
-            else:
-                prev_hash = last_row["event_hash"]
-                seq = last_row["sequence"] + 1
+        # Read the head inside the caller's write transaction, never from a per-instance cache: other
+        # processes append to the same journal, so a cached head goes stale and every later insert
+        # reuses an existing sequence. BEGIN IMMEDIATE covers a caller that has not written yet.
+        if not self._conn.in_transaction:
+            cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("SELECT sequence, event_hash FROM audit_journal ORDER BY sequence DESC LIMIT 1")
+        last_row = cursor.fetchone()
+        seq, prev_hash = (last_row["sequence"] + 1, last_row["event_hash"]) if last_row else (1, "0" * 64)
 
         payload_to_hash = (
             f"{seq}:{now:.6f}:{action}:{category}:{key}:{scope}:{value_sha256}:{prev_hash}:{author_id or ''}"
@@ -391,8 +374,6 @@ class SQLiteMemoryVault(MemoryVault):
             """,
             (seq, now, action, category, key, scope, value_sha256, prev_hash, event_hash, author_id, meta_json),
         )
-        self._last_audit_seq = seq
-        self._last_audit_hash = event_hash
         return AuditEvent(
             sequence=seq,
             timestamp=now,
@@ -447,8 +428,10 @@ class SQLiteMemoryVault(MemoryVault):
 
         with self._conn:
             cursor = self._conn.cursor()
-            # Fast check: skip tombstone lookups and text canonicalization if no tombstones exist in the vault
-            if getattr(self, "_has_tombstones", True):
+            # Skip canonicalization when the vault has no tombstones. Asked of the database on every
+            # write: a flag cached at open misses tombstones that other processes add later.
+            cursor.execute("SELECT EXISTS (SELECT 1 FROM rejected_value_tombstones)")
+            if cursor.fetchone()[0]:
                 can_text = canonicalize_text(content)
                 can_hash = hashlib.sha256(can_text.encode("utf-8")).hexdigest() if can_text else ""
                 cursor.execute(
@@ -943,7 +926,6 @@ class SQLiteMemoryVault(MemoryVault):
                 author_id=author_id,
                 metadata={"reason": reason, "canonical_sha256": can_hash},
             )
-            self._has_tombstones = True
             return val_hash
 
     def is_tombstoned(
