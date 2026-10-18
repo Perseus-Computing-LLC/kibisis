@@ -11,13 +11,16 @@ import unittest
 
 from kibisis import SQLiteMemoryVault
 
+# An explicit passphrase keeps these tests independent of KIBISIS_PASSPHRASE(_FILE) in the environment.
+PASSPHRASE = "shared-vault-file-test-passphrase"
+
 
 class TestSharedVaultFile(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         path = os.path.join(self.tmp.name, "vault.sqlite")
-        self.first = SQLiteMemoryVault(path, allow_plaintext=True)
-        self.second = SQLiteMemoryVault(path, allow_plaintext=True)
+        self.first = SQLiteMemoryVault(path, passphrase=PASSPHRASE)
+        self.second = SQLiteMemoryVault(path, passphrase=PASSPHRASE)
 
     def tearDown(self):
         self.first.close()
