@@ -1091,6 +1091,15 @@ impl InMemoryLeaseCoordinator {
     }
 }
 
+/// Expiry, in whole seconds since the UNIX epoch, of a lease granted at `now` for `ttl`.
+///
+/// Rounded up: the lease is held for at least `ttl`, sub-second TTLs included, and at most one
+/// second longer. Rounding down made a sub-second lease expire in the instant it was granted.
+fn lease_deadline(now: Duration, ttl: Duration) -> u64 {
+    let deadline = now.saturating_add(ttl);
+    deadline.as_secs() + u64::from(deadline.subsec_nanos() > 0)
+}
+
 impl LeaseCoordinator for InMemoryLeaseCoordinator {
     fn acquire(
         &mut self,
@@ -1102,11 +1111,11 @@ impl LeaseCoordinator for InMemoryLeaseCoordinator {
             .leases
             .lock()
             .map_err(|e| LeaseError::Conflict(e.to_string()))?;
-        let now = SystemTime::now()
+        let clock = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let new_expires_at = now + ttl.as_secs();
+            .unwrap_or_default();
+        let now = clock.as_secs();
+        let new_expires_at = lease_deadline(clock, ttl);
 
         if let Some(existing) = store.get(resource) {
             if existing.expires_at > now && existing.holder_id != holder_id {
@@ -1143,17 +1152,17 @@ impl LeaseCoordinator for InMemoryLeaseCoordinator {
             .leases
             .lock()
             .map_err(|e| LeaseError::Conflict(e.to_string()))?;
-        let now = SystemTime::now()
+        let clock = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+            .unwrap_or_default();
+        let now = clock.as_secs();
 
         if let Some(existing) = store.get_mut(&lease.resource) {
             if existing.holder_id == lease.holder_id
                 && existing.fencing_token == lease.fencing_token
                 && existing.expires_at >= now
             {
-                existing.expires_at = now + ttl.as_secs();
+                existing.expires_at = lease_deadline(clock, ttl);
                 return Ok(true);
             }
         }
@@ -1226,6 +1235,63 @@ mod tests {
         // Second agent acquires with fencing token 2
         let lease2 = coordinator.acquire("resource_x", "agent_2", ttl).unwrap();
         assert_eq!(lease2.fencing_token, 2);
+    }
+
+    #[test]
+    fn test_sub_second_lease_excludes_other_holders() {
+        // A 50 ms TTL used to round down to a deadline of "now", so the lease expired as it was
+        // granted and a competing holder acquired it as well.
+        let mut coordinator = InMemoryLeaseCoordinator::new();
+        let ttl = Duration::from_millis(50);
+        let lease = coordinator.acquire("bus", "agent_1", ttl).unwrap();
+        assert!(!lease.is_expired());
+        assert!(coordinator.acquire("bus", "agent_2", ttl).is_err());
+        assert!(coordinator.release(&lease).unwrap());
+        assert_eq!(
+            coordinator
+                .acquire("bus", "agent_2", ttl)
+                .unwrap()
+                .fencing_token,
+            2
+        );
+    }
+
+    #[test]
+    fn test_lease_is_held_for_at_least_its_ttl() {
+        let mut coordinator = InMemoryLeaseCoordinator::new();
+        for (i, ttl) in [
+            Duration::from_millis(50),
+            Duration::from_millis(1_500),
+            Duration::from_secs(10),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let resource = format!("resource_{i}");
+            let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+            let lease = coordinator.acquire(&resource, "agent_1", ttl).unwrap();
+            let after = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+            let deadline = Duration::from_secs(lease.expires_at);
+            assert!(
+                deadline >= before + ttl,
+                "{ttl:?}: deadline {deadline:?} is before {:?}",
+                before + ttl
+            );
+            assert!(
+                deadline <= after + ttl + Duration::from_secs(1),
+                "{ttl:?}: rounded up by more than 1 s"
+            );
+
+            let renewed_from = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+            assert!(coordinator.renew(&lease, ttl).unwrap());
+            let held = coordinator.acquire(&resource, "agent_2", ttl);
+            assert!(held.is_err(), "{ttl:?}: renewed lease was taken over");
+            let store = coordinator.leases.lock().unwrap();
+            assert!(
+                Duration::from_secs(store[&resource].expires_at) >= renewed_from + ttl,
+                "{ttl:?}: renewal"
+            );
+        }
     }
 
     #[test]
