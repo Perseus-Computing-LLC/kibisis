@@ -25,7 +25,7 @@ requires-python = ">=3.11"
 dependencies = [
     "cryptography>=42",
     "pydantic>=2",
-    "sqlcipher3-binary>=0.5",
+    "sqlcipher3>=0.5",
 ]
 
 [project.urls]

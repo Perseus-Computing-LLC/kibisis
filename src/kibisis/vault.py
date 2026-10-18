@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 try:
     import sqlcipher3
@@ -18,7 +19,9 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 from .crypto import AESGCMCryptoEnvelopeProvider, sign_tenant_payload, verify_tenant_payload
 from .keys import MIN_PASSPHRASE_LENGTH, resolve_passphrase
 from .models import AuditEvent, EncryptedEnvelope, EpistemicState, MemoryEntity, SearchResult
-from .protocols import CryptoEnvelopeProvider, EncryptionRequiredError, MemoryVault
+from .protocols import CryptoEnvelopeProvider, EncryptionRequiredError, LeaseConflictError, LeaseCoordinator, MemoryVault
+
+logger = logging.getLogger(__name__)
 
 
 def canonicalize_text(text: str) -> str:
@@ -61,6 +64,8 @@ class SQLiteMemoryVault(MemoryVault):
         passphrase: Optional[str] = None,
         *,
         allow_plaintext: bool = False,
+        coordinator: Optional[LeaseCoordinator] = None,
+        enforce_fencing: bool = False,
     ) -> None:
         """Open a vault. Entry content is encrypted by default.
 
@@ -69,6 +74,9 @@ class SQLiteMemoryVault(MemoryVault):
         An in-memory vault never touches disk, so it may run without a passphrase.
         """
         self.db_path = str(db_path)
+        self.coordinator = coordinator
+        self.enforce_fencing = enforce_fencing
+        self._fallback_search_warned = False
         on_disk = self.db_path != ":memory:"
         passphrase = resolve_passphrase(passphrase)
         if passphrase and len(passphrase) < MIN_PASSPHRASE_LENGTH:
@@ -95,6 +103,7 @@ class SQLiteMemoryVault(MemoryVault):
 
         self._conn = sqlcipher3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         self._conn.row_factory = sqlcipher3.Row
+        self._sqlcipher_active = False
         if passphrase:
             escaped_pass = passphrase.replace("'", "''")
             self._conn.execute("PRAGMA cipher_memory_security = ON;")
@@ -102,6 +111,9 @@ class SQLiteMemoryVault(MemoryVault):
             # Verify the key immediately by accessing sqlite_master
             try:
                 self._conn.execute("SELECT count(*) FROM sqlite_master;").fetchall()
+                row = self._conn.execute("PRAGMA cipher_version;").fetchone()
+                if row and row[0]:
+                    self._sqlcipher_active = True
             except Exception as e:
                 self._conn.close()
                 raise ValueError("Failed to authenticate or decrypt vault database with provided passphrase") from e
@@ -112,6 +124,43 @@ class SQLiteMemoryVault(MemoryVault):
             self.crypto_provider = AESGCMCryptoEnvelopeProvider(salt=self._vault_salt())
         if on_disk:
             self._restrict_permissions()
+
+    def _validate_fencing(
+        self,
+        fencing_token: Optional[int],
+        resource: Optional[str],
+        holder_id: Optional[str] = None,
+    ) -> None:
+        """Validate an atomic fencing token against the attached lease coordinator."""
+        if self.enforce_fencing and (fencing_token is None or resource is None):
+            raise LeaseConflictError("enforce_fencing is enabled on vault, but fencing_token or resource was not provided")
+
+        if fencing_token is None and resource is None:
+            return
+
+        if self.coordinator is None:
+            raise LeaseConflictError("Fencing token validation requested but no LeaseCoordinator is configured on vault")
+
+        if resource is None or fencing_token is None:
+            raise LeaseConflictError(
+                f"Both resource and fencing_token must be specified for fencing validation (got resource={resource}, token={fencing_token})"
+            )
+
+        if holder_id is not None:
+            if not self.coordinator.validate_fencing_token(resource, holder_id, fencing_token):
+                raise LeaseConflictError(
+                    f"Stale or invalid fencing token {fencing_token} for resource '{resource}' (holder={holder_id})"
+                )
+        else:
+            lease = self.coordinator.get_lease(resource)
+            if lease is None:
+                raise LeaseConflictError(f"No active lease found for resource '{resource}'")
+            if lease.fencing_token != fencing_token:
+                raise LeaseConflictError(
+                    f"Stale fencing token {fencing_token} for resource '{resource}' (active token is {lease.fencing_token})"
+                )
+            if lease.expires_at <= time.time():
+                raise LeaseConflictError(f"Expired lease with fencing token {fencing_token} for resource '{resource}'")
 
     @staticmethod
     def _migrate_file_to_sqlcipher(path: str, passphrase: str) -> None:

@@ -50,6 +50,10 @@ class LeaseCoordinator(Protocol):
         """Release an active lease so other holders may acquire it."""
         ...
 
+    def get_lease(self, resource: str) -> Optional[Lease]:
+        """Fetch current lease record for resource, if any."""
+        ...
+
     def validate_fencing_token(self, resource: str, holder_id: str, fencing_token: int) -> bool:
         """Verify that ``holder_id`` holds an active, un-preempted lease on ``resource`` with ``fencing_token``."""
         ...
@@ -73,8 +77,11 @@ class MemoryVault(Protocol):
         tenant_id: Optional[str] = None,
         principal_id: Optional[str] = None,
         derived_from: Optional[List[str]] = None,
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
     ) -> MemoryEntity:
-        """Insert or update a memory entity with epistemic status, bi-temporal bounds, and scope."""
+        """Insert or update a memory entity with epistemic status, bi-temporal bounds, scope, and fencing token validation."""
         ...
 
     def store(
@@ -91,6 +98,9 @@ class MemoryVault(Protocol):
         tenant_id: Optional[str] = None,
         principal_id: Optional[str] = None,
         derived_from: Optional[List[str]] = None,
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
     ) -> MemoryEntity:
         """Alias for put() for ergonomic convenience."""
         ...
@@ -133,6 +143,10 @@ class MemoryVault(Protocol):
         key: str,
         scope: str = "default",
         author_id: Optional[str] = None,
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
+        missing_ok: bool = True,
     ) -> bool:
         """Soft-delete an entity by setting its archived flag."""
         ...
@@ -157,6 +171,10 @@ class MemoryVault(Protocol):
         author_id: Optional[str] = None,
         content: Optional[str] = None,
         scope: str = "default",
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
+        missing_ok: bool = False,
     ) -> str:
         """Tombstone entity value by SHA-256 digest and purge plaintext content."""
         ...
@@ -184,6 +202,9 @@ class MemoryVault(Protocol):
         tenant_id: Optional[str] = None,
         principal_id: Optional[str] = None,
         derived_from: Optional[List[str]] = None,
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
     ) -> MemoryEntity:
         """Stage an unverified memory candidate into the vault awaiting verification/human review."""
         ...
