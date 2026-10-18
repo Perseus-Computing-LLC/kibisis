@@ -23,7 +23,7 @@ Kibisis gives you an embedded memory vault with atomic Single-Writer Multi-Reade
 
 - **Atomic concurrency leases:** Fast lease acquisition with automatic timeout prevents competing workers from corrupting shared keys.
 - **Encrypted by default:** An on-disk vault refuses to open without a passphrase. Full-database page-level encryption via SQLCipher ensures zero plaintext leakage (schema, tables, keys, categories, metadata, and indexes). Entry payloads additionally feature AES-256-GCM envelope encryption with PBKDF2-SHA256 (600,000 iterations). Raw disk scans reveal zero plaintext.
-- **High throughput:** Handles over 1,560,000 lease operations per second under heavy thread contention.
+- **High throughput:** Handles 1.5–1.6 million lease operations per second with 16 to 32 contending threads.
 - **Offline and partition resilient:** Tested in 10-node simulated edge partitions with zero split-brain errors.
 - **Evasion-resistant tombstones:** Rejected-value tombstones use canonicalized text hashing (Unicode NFKC, casefold, punctuation stripping, whitespace normalization) to prevent prompt injection and evasion.
 
@@ -138,15 +138,15 @@ assert vault.verify_audit_chain() is True
 
 ## Benchmark results
 
-Measured on bare-metal Linux x86_64 (`rustc 1.85.0`, `opt-level = 3`, `lto = "fat"`):
+Measured with the [`telarch-benchmarks`](https://github.com/Perseus-Computing-LLC/telarch-benchmarks) suite on bare-metal Linux x86_64 (Intel Core i5-13500, runs pinned to the performance cores, `rustc 1.97.1`, default release profile). The figures come from that repository's committed reports.
 
 | Metric | Measurement | Test condition | Operational Guarantee |
 | :--- | :--- | :--- | :--- |
-| **Write Throughput** | **2,098,000+ writes/s** | Sustained sequential envelope commits | Local zero-contention vault ingestion |
-| **SWMR Contention (16 Workers)** | **1,696,000+ ops/s** | 16 concurrent worker threads (`adversarial_contention`) | 0.59 &micro;s latency; 0 split-brain conflicts |
-| **SWMR Contention (32 Workers)** | **1,776,000+ ops/s** | 32 concurrent worker threads (`adversarial_contention`) | 0.56 &micro;s latency; 0 fencing regressions |
-| **Swarm Partition Split-Brain** | **0 Errors** | 10-node simulated partition under 50% packet drop | 100% convergence across edge mesh (599k msgs/s) |
-| **Partition Reconciliation** | **0.42 ms** | Partition heal state convergence | Monotonic vector clock reconciliation |
+| **Write Throughput** | **271,222 writes/s** | Sequential in-memory writes, each hashed and chained into the audit journal | Local zero-contention vault ingestion |
+| **SWMR Contention (16 Workers)** | **1,466,471 ops/s** | 16 concurrent worker threads, 50 ms leases (`adversarial_contention`) | 0.68 &micro;s latency; 0 split-brain conflicts |
+| **SWMR Contention (32 Workers)** | **1,597,354 ops/s** | 32 concurrent worker threads, 50 ms leases (`adversarial_contention`) | 0.63 &micro;s latency; 0 fencing regressions |
+| **Swarm Partition Split-Brain** | **0 Errors** | 10-node simulated partition under 50% packet drop | 100% convergence across edge mesh (265k msgs/s) |
+| **Partition Reconciliation** | **127–191 ms** | 10-node mesh healing after the simulated partition, 0–50% packet loss | Monotonic vector clock reconciliation |
 
 Run benchmarks yourself:
 
