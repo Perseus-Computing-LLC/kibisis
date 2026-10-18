@@ -10,17 +10,21 @@ from pathlib import Path
 from kibisis.vault import SQLiteMemoryVault
 
 
+# The Hermes plugin is installed on the host, not shipped in this repository.
+PLUGIN_PATH = Path("/opt/data/plugins/kibisis-vault/__init__.py")
+
+
 def load_plugin_module():
-    plugin_path = Path("/opt/data/plugins/kibisis-vault/__init__.py")
-    spec = importlib.util.spec_from_file_location("kibisis_vault_plugin", str(plugin_path))
+    spec = importlib.util.spec_from_file_location("kibisis_vault_plugin", str(PLUGIN_PATH))
     if spec is None or spec.loader is None:
-        raise ImportError(f"Could not load spec for {plugin_path}")
+        raise ImportError(f"Could not load spec for {PLUGIN_PATH}")
     mod = importlib.util.module_from_spec(spec)
     sys.modules["kibisis_vault_plugin"] = mod
     spec.loader.exec_module(mod)
     return mod
 
 
+@unittest.skipUnless(PLUGIN_PATH.is_file(), f"kibisis-vault plugin not installed at {PLUGIN_PATH}")
 class TestKibisisVaultPlugin(unittest.TestCase):
     def setUp(self):
         self.plugin = load_plugin_module()

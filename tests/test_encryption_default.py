@@ -37,9 +37,11 @@ class TestEncryptionByDefault(unittest.TestCase):
         self._saved = {k: os.environ.pop(k, None) for k in ("KIBISIS_PASSPHRASE", "KIBISIS_PASSPHRASE_FILE")}
 
     def tearDown(self):
-        for k, v in self._saved.items():
-            if v is not None:
-                os.environ[k] = v
+        for k in ("KIBISIS_PASSPHRASE", "KIBISIS_PASSPHRASE_FILE"):
+            if self._saved.get(k) is not None:
+                os.environ[k] = self._saved[k]
+            else:
+                os.environ.pop(k, None)
 
     def test_on_disk_vault_refuses_to_open_without_passphrase(self):
         with self.assertRaises(EncryptionRequiredError):
