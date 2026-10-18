@@ -26,19 +26,19 @@ All metrics below are reproducible via `cargo run --release -p telarch-benchmark
 
 | System | Metric | Target / Claim | Verification Command | Status |
 | :--- | :--- | :--- | :--- | :--- |
-| **Harpe** | Small Context (10 items / 2k context) | p50: ~1.76 µs | `cargo run --release -p telarch-benchmarks` | **VERIFIED** |
-| **Harpe** | Large Context (200 items / 40k context) | p50: ~35.74 µs | `cargo run --release -p telarch-benchmarks` | **VERIFIED** |
+| **Harpe** | Small Context (10 items, 60-token budget) | p50: ~1.88 µs | `cargo run --release -p telarch-benchmarks` | **VERIFIED** |
+| **Harpe** | Large Context (200 items, 1,500-token budget) | p50: ~41.16 µs | `cargo run --release -p telarch-benchmarks` | **VERIFIED** |
 | **Harpe** | Multi-Turn Pruning Ceiling Reduction | ~69.51% reduction | `cargo run --release -p telarch-benchmarks` | **VERIFIED** |
-| **Harpe** | 100,000-Turn Production Cost Curve | 84.77% reduction, 0 overruns, 24.3 µs/turn | `cargo run --release -p telarch-benchmarks --bin knapsack_cost_curve` | **VERIFIED** |
-| **Kibisis** | Sequential In-Memory Write Ingestion | >2,098,000 writes/s | `cargo run --release -p telarch-benchmarks` | **VERIFIED** |
-| **Kibisis** | Audit Journal Chained Verification (10k events) | >2,000,000 events/s (<5 ms total) | `cargo run --release -p telarch-benchmarks` | **VERIFIED** |
-| **Kibisis** | Multi-Agent SWMR Lease Concurrency (16 workers) | 1,696,000+ ops/s (0.59 µs latency) | `cargo run --release -p telarch-benchmarks --bin adversarial_contention` | **VERIFIED** |
-| **Kibisis** | Multi-Agent SWMR Lease Concurrency (32 workers) | 1,776,000+ ops/s (0.56 µs latency) | `cargo run --release -p telarch-benchmarks --bin adversarial_contention` | **VERIFIED** |
-| **Argus** | SHA-256 Continuous Hash Chaining (1M events) | 632,170 events/s (1.58 µs/op) | `cargo run --release -p telarch-benchmarks --bin argus_1m_scale` | **VERIFIED** |
-| **Argus** | Full Chain Verification Traversal (1M events) | 770,758 events/s (1.30 µs/event) | `cargo run --release -p telarch-benchmarks --bin argus_1m_scale` | **VERIFIED** |
-| **Argus** | Tamper Fail-Closed Detection (Sequence #500,000) | 640.48 ms across 1M events | `cargo run --release -p telarch-benchmarks --bin argus_1m_scale` | **VERIFIED** |
-| **Swarm** | Network Partition Tolerance (50% drop) | 100% convergence, 0 split-brain (599,631 msgs/s) | `cargo run --release -p telarch-benchmarks --bin swarm_partition` | **VERIFIED** |
-| **Payload** | Tier 0 / Tier 1 Restricted Payloads | 93.6% / 88.7% reduction (<41 µs) | `cargo run --release -p telarch-benchmarks --bin restricted_payload_test` | **VERIFIED** |
+| **Harpe** | 100,000-Turn Production Cost Curve | 78.28% reduction, 0 overruns, 46.9 µs/turn | `cargo run --release -p telarch-benchmarks --bin knapsack_cost_curve` | **VERIFIED** |
+| **Kibisis** | Sequential In-Memory Write Ingestion (audit-journaled) | 271,222 writes/s | `cargo run --release -p telarch-benchmarks` | **VERIFIED** |
+| **Kibisis** | Audit Journal Chained Verification (10,000 events) | 694,829 events/s (14.39 ms total) | `cargo run --release -p telarch-benchmarks` | **VERIFIED** |
+| **Kibisis** | Multi-Agent SWMR Lease Concurrency (16 workers) | 1,466,471 ops/s (0.68 µs latency), 0 split-brain | `cargo run --release -p telarch-benchmarks --bin adversarial_contention` | **VERIFIED** |
+| **Kibisis** | Multi-Agent SWMR Lease Concurrency (32 workers) | 1,597,354 ops/s (0.63 µs latency), 0 split-brain | `cargo run --release -p telarch-benchmarks --bin adversarial_contention` | **VERIFIED** |
+| **Argus** | Append Through the Public API (1M events) | 809,698 events/s (1.24 µs/op) | `cargo run --release -p telarch-benchmarks --bin argus_1m_scale` | **VERIFIED** |
+| **Argus** | Full Chain Verification (1M events) | 2,433,053 events/s (0.41 µs/event) | `cargo run --release -p telarch-benchmarks --bin argus_1m_scale` | **VERIFIED** |
+| **Argus** | Tamper Fail-Closed Detection (Sequence #500,000) | 185.35 ms across 1M events | `cargo run --release -p telarch-benchmarks --bin argus_1m_scale` | **VERIFIED** |
+| **Swarm** | Network Partition Tolerance (50% drop) | 100% convergence, 0 split-brain (264,971 msgs/s) | `cargo run --release -p telarch-benchmarks --bin swarm_partition` | **VERIFIED** |
+| **Payload** | Tier 0 / Tier 1 Restricted Payloads | 93.6% / 88.7% reduction (<32 µs) | `cargo run --release -p telarch-benchmarks --bin restricted_payload_test` | **VERIFIED** |
 
 ---
 
