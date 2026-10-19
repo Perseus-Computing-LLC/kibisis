@@ -42,7 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Multi-process SQLiteLeaseCoordinator support with WAL mode and BEGIN IMMEDIATE atomic transactions.
 - Zeroizing passphrase memory security via `zeroize`.
 - SQLCipher full-page encryption with PBKDF2-HMAC-SHA256 (600,000 iterations).
-- Formal TLA+ specification for lease state machine and monotonic fencing tokens.
+- A TLA+ specification of the lease state machine and fencing tokens. Correction: it is in
+  telarch-benchmarks (`spec/kibisis_lease_fencing.tla`), not in this repository.
 - MSRV enforcement for `rust-version = "1.85"` in `Cargo.toml`.
 
 ### Changed
