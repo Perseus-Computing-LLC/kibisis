@@ -24,6 +24,11 @@ from .protocols import CryptoEnvelopeProvider, EncryptionRequiredError, LeaseCon
 logger = logging.getLogger(__name__)
 
 
+def _sqlcipher_available() -> bool:
+    """True when the real sqlcipher3 driver is loaded; the import above falls back to the standard sqlite3."""
+    return sqlcipher3 is not sqlite3
+
+
 def canonicalize_text(text: str) -> str:
     """Normalize text for evasion-resistant tombstone matching.
 
@@ -109,8 +114,21 @@ class SQLiteMemoryVault(MemoryVault):
         sig_seed = passphrase if passphrase else self.db_path
         self._signing_key = hashlib.sha256(f"kibisis-tenant-sig:{sig_seed}".encode("utf-8")).digest()
 
-        # Check for unencrypted database migration if passphrase is provided
-        if on_disk and passphrase and os.path.exists(self.db_path) and os.path.getsize(self.db_path) > 0:
+        # Convert an existing plain SQLite file to SQLCipher when a passphrase is given. Without sqlcipher3 there
+        # is nothing to convert with: the file stays plain SQLite and the first open that has sqlcipher3 converts it.
+        if on_disk and passphrase and not _sqlcipher_available():
+            logger.warning(
+                "sqlcipher3 is not installed, so %s is not encrypted as a whole file: entry content is still "
+                "sealed, but categories, keys and metadata are stored in plain text",
+                self.db_path,
+            )
+        if (
+            on_disk
+            and passphrase
+            and _sqlcipher_available()
+            and os.path.exists(self.db_path)
+            and os.path.getsize(self.db_path) > 0
+        ):
             with open(self.db_path, "rb") as f:
                 hdr = f.read(16)
             if hdr.startswith(b"SQLite format 3"):

@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its description says it is not a human review. The ledger tool's description now says what it
   checks: a linear SHA-256 hash chain.
 - `cargo fmt` formatting (CI failed `cargo fmt --check` at v0.1.0-alpha.3).
+- A vault opened with a passphrase on a system without `sqlcipher3` can be opened again. The second
+  open tried to convert the plain SQLite file with `sqlcipher_export()`, which only SQLCipher has, and
+  failed. Without `sqlcipher3`, entry content is still sealed but categories, keys and metadata are
+  stored in plain text, and a warning says so. The first open with `sqlcipher3` converts the file.
 
 ### Added
 - `TombstonedValueError`, a `ValueError` subclass raised when a write carries a tombstoned value.
