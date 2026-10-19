@@ -15,7 +15,7 @@ import string
 import time
 import unicodedata
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from .crypto import AESGCMCryptoEnvelopeProvider, sign_tenant_payload, verify_tenant_payload
 from .keys import MIN_PASSPHRASE_LENGTH, resolve_passphrase
 from .models import AuditEvent, EncryptedEnvelope, EpistemicState, MemoryEntity, SearchResult
@@ -51,6 +51,22 @@ def canonicalize_text(text: str) -> str:
         else:
             chars.append(ch)
     return " ".join("".join(chars).split())
+
+
+def value_digests(content: str) -> Tuple[str, str]:
+    """Return the (exact, canonical) SHA-256 digests a tombstone records for a value.
+
+    The canonical digest is empty when the value canonicalizes to nothing (for example
+    punctuation only); such values are matched by their exact digest alone.
+    """
+    exact = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    can_text = canonicalize_text(content)
+    canonical = hashlib.sha256(can_text.encode("utf-8")).hexdigest() if can_text else ""
+    return exact, canonical
+
+
+class TombstonedValueError(ValueError):
+    """Raised when a write carries a value that a tombstone in its scope has rejected."""
 
 
 class SQLiteMemoryVault(MemoryVault):
@@ -373,6 +389,15 @@ class SQLiteMemoryVault(MemoryVault):
                 ON rejected_value_tombstones(category, canonical_sha256, scope)
                 """
             )
+            # A tombstone stops a value under any category or key, so writes look tombstones up
+            # by digest alone.
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rejected_tombstones_value ON rejected_value_tombstones(value_sha256)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rejected_tombstones_canonical_value "
+                "ON rejected_value_tombstones(canonical_sha256)"
+            )
 
             # Append-only hash-chained mutation audit journal
             self._conn.execute(
@@ -486,7 +511,7 @@ class SQLiteMemoryVault(MemoryVault):
         if derived_from:
             meta["derived_from"] = derived_from
         meta_str = json.dumps(meta, sort_keys=True)
-        val_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        val_hash, can_hash = value_digests(content)
 
         # Validate epistemic_state enum string
         ep_state = EpistemicState(epistemic_state) if epistemic_state else EpistemicState.VERIFIED
@@ -497,19 +522,9 @@ class SQLiteMemoryVault(MemoryVault):
             # write: a flag cached at open misses tombstones that other processes add later.
             cursor.execute("SELECT EXISTS (SELECT 1 FROM rejected_value_tombstones)")
             if cursor.fetchone()[0]:
-                can_text = canonicalize_text(content)
-                can_hash = hashlib.sha256(can_text.encode("utf-8")).hexdigest() if can_text else ""
-                cursor.execute(
-                    """
-                    SELECT reason, author_id FROM rejected_value_tombstones
-                    WHERE category = ? AND (key = ? OR key = '*') AND (scope = ? OR scope = '*')
-                      AND (value_sha256 = ? OR (canonical_sha256 != '' AND canonical_sha256 = ?))
-                    """,
-                    (category, key, scope, val_hash, can_hash),
-                )
-                tomb = cursor.fetchone()
+                tomb = self._find_tombstone(cursor, scope, val_hash, can_hash)
                 if tomb is not None:
-                    raise ValueError(
+                    raise TombstonedValueError(
                         f"Write rejected by tombstone: entity '{category}:{key}' [scope={scope}] matches rejected tombstone "
                         f"(digest: {val_hash[:12]}..., reason: {tomb['reason']})"
                     )
@@ -1019,6 +1034,66 @@ class SQLiteMemoryVault(MemoryVault):
             )
         return items
 
+    @staticmethod
+    def _find_tombstone(cursor: Any, scope: str, val_hash: str, can_hash: str) -> Optional[Any]:
+        """Return the first tombstone in ``scope`` (or a ``'*'`` tombstone) that rejects this value.
+
+        Category and key play no part: a tombstone stops a value, not a key, so a rejected value
+        cannot come back under a new key or category. Scopes stay separate, so one tenant's
+        rejection neither blocks nor reveals another tenant's writes.
+        """
+        cursor.execute(
+            """
+            SELECT category, key, reason, author_id FROM rejected_value_tombstones
+            WHERE (scope = ? OR scope = '*')
+              AND (value_sha256 = ? OR (canonical_sha256 != '' AND canonical_sha256 = ?))
+            LIMIT 1
+            """,
+            (scope, val_hash, can_hash),
+        )
+        return cursor.fetchone()
+
+    def _purge_value_copies(
+        self,
+        cursor: Any,
+        scope: str,
+        val_hash: str,
+        can_hash: str,
+        author_id: Optional[str],
+        tombstoned: str,
+    ) -> int:
+        """Delete every stored copy of a tombstoned value in ``scope`` (every scope for ``'*'``).
+
+        Copies under other categories or keys, live or archived, would otherwise keep a rejected
+        value retrievable. Each deletion is journaled in the caller's transaction.
+        """
+        if scope == "*":
+            cursor.execute("SELECT id, category, key, scope, content, is_encrypted, encrypted_envelope_json FROM entities")
+        else:
+            cursor.execute(
+                "SELECT id, category, key, scope, content, is_encrypted, encrypted_envelope_json FROM entities WHERE scope = ?",
+                (scope,),
+            )
+        purged = 0
+        for row in cursor.fetchall():
+            content = self._decrypt_content(row["encrypted_envelope_json"]) if row["is_encrypted"] == 1 else row["content"]
+            exact, canonical = value_digests(content)
+            if exact != val_hash and not (can_hash and canonical == can_hash):
+                continue
+            cursor.execute("DELETE FROM entities WHERE id = ?", (row["id"],))
+            self._record_audit_event(
+                cursor=cursor,
+                action="purge",
+                category=row["category"],
+                key=row["key"],
+                scope=row["scope"],
+                value_sha256=exact,
+                author_id=author_id,
+                metadata={"reason": "copy of tombstoned value", "tombstone": tombstoned},
+            )
+            purged += 1
+        return purged
+
     def tombstone(
         self,
         category: str,
@@ -1028,7 +1103,12 @@ class SQLiteMemoryVault(MemoryVault):
         content: Optional[str] = None,
         scope: str = "default",
     ) -> str:
-        """Tombstone entity value by SHA-256 and canonical digests within scope, then purge from live tables."""
+        """Tombstone a value by its exact and canonical SHA-256 digests within ``scope``.
+
+        Purges the entity at ``category:key`` and every other copy of the value in the scope
+        (all scopes when ``scope`` is ``'*'``). Later writes of the value, or of a look-alike that
+        canonicalizes to it, are refused under any category or key in the scope.
+        """
         now = time.time()
         with self._conn:
             cursor = self._conn.cursor()
@@ -1046,9 +1126,7 @@ class SQLiteMemoryVault(MemoryVault):
                     content = row["content"]
 
             assert content is not None
-            val_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            can_text = canonicalize_text(content)
-            can_hash = hashlib.sha256(can_text.encode("utf-8")).hexdigest() if can_text else ""
+            val_hash, can_hash = value_digests(content)
 
             cursor.execute(
                 """
@@ -1059,7 +1137,7 @@ class SQLiteMemoryVault(MemoryVault):
                 """,
                 (category, key, val_hash, can_hash, reason, author_id, now, scope),
             )
-            # Physical purge of entity and FTS index within scope
+            # Physical purge of the entity (the FTS index follows through triggers)
             cursor.execute("DELETE FROM entities WHERE category = ? AND key = ? AND scope = ?", (category, key, scope))
 
             # Record hash-chained mutation audit event
@@ -1073,6 +1151,7 @@ class SQLiteMemoryVault(MemoryVault):
                 author_id=author_id,
                 metadata={"reason": reason, "canonical_sha256": can_hash},
             )
+            self._purge_value_copies(cursor, scope, val_hash, can_hash, author_id, f"{category}:{key}")
             return val_hash
 
     def is_tombstoned(
@@ -1082,20 +1161,13 @@ class SQLiteMemoryVault(MemoryVault):
         content: str,
         scope: str = "default",
     ) -> bool:
-        """Check if a specific content string is tombstoned under the given category, key, and scope (exact or canonical)."""
-        val_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        can_text = canonicalize_text(content)
-        can_hash = hashlib.sha256(can_text.encode("utf-8")).hexdigest() if can_text else ""
-        cursor = self._conn.cursor()
-        cursor.execute(
-            """
-            SELECT 1 FROM rejected_value_tombstones
-            WHERE category = ? AND (key = ? OR key = '*') AND (scope = ? OR scope = '*')
-              AND (value_sha256 = ? OR (canonical_sha256 != '' AND canonical_sha256 = ?))
-            """,
-            (category, key, scope, val_hash, can_hash),
-        )
-        return cursor.fetchone() is not None
+        """Check whether ``content`` is rejected in ``scope`` (exact or canonical digest).
+
+        ``category`` and ``key`` are accepted for compatibility but do not narrow the check: a
+        tombstoned value is rejected under every category and key in its scope.
+        """
+        val_hash, can_hash = value_digests(content)
+        return self._find_tombstone(self._conn.cursor(), scope, val_hash, can_hash) is not None
 
     def list_tombstones(
         self,
@@ -1431,7 +1503,12 @@ class SQLiteMemoryVault(MemoryVault):
     ) -> int:
         """Import a snapshot into the vault.
 
-        Validates manifest hash integrity.
+        Validates manifest hash integrity. Tombstones are imported first and existing tombstones
+        are never removed, so restoring a snapshot taken before a deletion cannot bring the
+        deleted value back: entities whose value is tombstoned in their scope are refused and not
+        counted. ``clear_existing`` purges current entities (journaled) but keeps tombstones and
+        the audit journal. Archived entities are restored archived.
+
         Returns the number of restored entities.
         """
         if isinstance(snapshot_or_path, (str, Path)):
@@ -1453,29 +1530,10 @@ class SQLiteMemoryVault(MemoryVault):
         imported_count = 0
         with self._conn:
             cursor = self._conn.cursor()
-            if clear_existing:
-                cursor.execute("DELETE FROM entities")
-                cursor.execute("DELETE FROM entities_fts")
-                cursor.execute("DELETE FROM rejected_value_tombstones")
-                cursor.execute("DELETE FROM audit_log")
-
-            for ent_data in data.get("entities", []):
-                self.put(
-                    category=ent_data["category"],
-                    key=ent_data["key"],
-                    content=ent_data["content"],
-                    metadata=ent_data.get("metadata"),
-                    epistemic_state=ent_data.get("epistemic_state", "verified"),
-                    valid_from=ent_data.get("valid_from"),
-                    valid_until=ent_data.get("valid_until"),
-                    scope=ent_data.get("scope", "default"),
-                )
-                imported_count += 1
-
             for ts in data.get("tombstones", []):
                 cursor.execute(
                     """
-                    INSERT OR REPLACE INTO rejected_value_tombstones (
+                    INSERT OR IGNORE INTO rejected_value_tombstones (
                         category, key, value_sha256, canonical_sha256, reason, author_id, created_at, scope
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -1491,6 +1549,41 @@ class SQLiteMemoryVault(MemoryVault):
                         ts.get("scope", "default"),
                     ),
                 )
+            if clear_existing:
+                cursor.execute("SELECT category, key, scope FROM entities")
+                for row in cursor.fetchall():
+                    self._record_audit_event(
+                        cursor=cursor,
+                        action="purge",
+                        category=row["category"],
+                        key=row["key"],
+                        scope=row["scope"],
+                        value_sha256="",
+                        metadata={"reason": "import_snapshot clear_existing"},
+                    )
+                cursor.execute("DELETE FROM entities")
+                # entities_fts is an external-content index kept in step by triggers; rebuild it
+                # from the (now empty) content table rather than deleting index rows directly.
+                cursor.execute("INSERT INTO entities_fts(entities_fts) VALUES('rebuild')")
+
+        for ent_data in data.get("entities", []):
+            scope = ent_data.get("scope", "default")
+            val_hash, can_hash = value_digests(ent_data["content"])
+            if self._find_tombstone(self._conn.cursor(), scope, val_hash, can_hash) is not None:
+                continue
+            self.put(
+                category=ent_data["category"],
+                key=ent_data["key"],
+                content=ent_data["content"],
+                metadata=ent_data.get("metadata"),
+                epistemic_state=ent_data.get("epistemic_state", "verified"),
+                valid_from=ent_data.get("valid_from"),
+                valid_until=ent_data.get("valid_until"),
+                scope=scope,
+            )
+            if ent_data.get("archived"):
+                self.archive(category=ent_data["category"], key=ent_data["key"], scope=scope)
+            imported_count += 1
 
         return imported_count
 

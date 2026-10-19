@@ -1,6 +1,6 @@
 """Model Context Protocol (MCP) server for Kibisis memory vault.
 
-Exposes Kibisis memory, bitemporal recall, and SHA-256 Merkle chain verification
+Exposes Kibisis memory, bitemporal recall, and SHA-256 hash-chain verification
 via standard JSON-RPC 2.0 over stdio for external agent environments (Cursor, Claude Desktop, VS Code, Codex).
 """
 
@@ -105,14 +105,16 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "kibisis_admit",
-        "description": "Admit a candidate memory to verified status via reviewer or gate.",
+        "description": (
+            "Promote a candidate memory to verified. The connected agent can call this tool, so it is "
+            "not a human review: the review is recorded with reviewer 'mcp-agent', whatever the caller says."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "category": {"type": "string", "description": "Category of memory."},
                 "key": {"type": "string", "description": "Key of memory."},
                 "scope": {"type": "string", "description": "Scope of memory.", "default": "default"},
-                "reviewer_id": {"type": "string", "description": "Identity of gate or reviewer.", "default": "mcp_gate"},
             },
             "required": ["category", "key"],
         },
@@ -132,7 +134,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "kibisis_verify_ledger",
-        "description": "Verify the cryptographic SHA-256 Merkle chain integrity of the Kibisis audit journal.",
+        "description": "Verify the SHA-256 hash chain of the Kibisis audit journal.",
         "inputSchema": {
             "type": "object",
             "properties": {},
@@ -314,7 +316,8 @@ class KibisisMCPServer:
             category = args["category"]
             key = args["key"]
             scope = args.get("scope", "default")
-            reviewer_id = args.get("reviewer_id", "mcp_gate")
+            # The caller cannot name its reviewer: anything arriving over MCP is the agent.
+            reviewer_id = "mcp-agent"
             entity = self.vault.review_entity(
                 category=category,
                 key=key,
