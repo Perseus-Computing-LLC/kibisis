@@ -16,9 +16,10 @@ import time
 import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from .admission import AdmissionDecision, FactDisposition, MemoryAdmissionGate
 from .crypto import AESGCMCryptoEnvelopeProvider, sign_tenant_payload, verify_tenant_payload
 from .keys import MIN_PASSPHRASE_LENGTH, resolve_passphrase
-from .models import AuditEvent, EncryptedEnvelope, EpistemicState, MemoryEntity, SearchResult
+from .models import AuditEvent, EncryptedEnvelope, EpistemicState, MemoryEntity, RelationType, SearchResult
 from .protocols import CryptoEnvelopeProvider, EncryptionRequiredError, LeaseConflictError, LeaseCoordinator, MemoryVault
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,7 @@ class SQLiteMemoryVault(MemoryVault):
         allow_plaintext: bool = False,
         coordinator: Optional[LeaseCoordinator] = None,
         enforce_fencing: bool = False,
+        auto_gate: bool = True,
     ) -> None:
         """Open a vault. Entry content is encrypted by default.
 
@@ -102,6 +104,7 @@ class SQLiteMemoryVault(MemoryVault):
         self.db_path = str(db_path)
         self.coordinator = coordinator
         self.enforce_fencing = enforce_fencing
+        self.auto_gate = auto_gate
         if enforce_fencing and coordinator is None:
             raise ValueError("enforce_fencing=True needs a lease coordinator: pass coordinator=")
         self._fallback_search_warned = False
@@ -323,6 +326,8 @@ class SQLiteMemoryVault(MemoryVault):
                     valid_from REAL DEFAULT NULL,
                     valid_until REAL DEFAULT NULL,
                     tenant_sig TEXT DEFAULT NULL,
+                    supersedes TEXT DEFAULT NULL,
+                    superseded_by TEXT DEFAULT NULL,
                     UNIQUE(category, key, scope)
                 )
                 """
@@ -346,12 +351,22 @@ class SQLiteMemoryVault(MemoryVault):
                 self._conn.execute("ALTER TABLE entities ADD COLUMN valid_until REAL DEFAULT NULL")
             if "tenant_sig" not in cols:
                 self._conn.execute("ALTER TABLE entities ADD COLUMN tenant_sig TEXT DEFAULT NULL")
+            if "supersedes" not in cols:
+                self._conn.execute("ALTER TABLE entities ADD COLUMN supersedes TEXT DEFAULT NULL")
+            if "superseded_by" not in cols:
+                self._conn.execute("ALTER TABLE entities ADD COLUMN superseded_by TEXT DEFAULT NULL")
 
             # Covering B-Tree index for bitemporal point-in-time and interval queries
             self._conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_entities_bitemporal
                 ON entities (scope, category, epistemic_state, valid_from, valid_until)
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_entities_supersedes
+                ON entities (scope, category, supersedes)
                 """
             )
 
@@ -548,6 +563,9 @@ class SQLiteMemoryVault(MemoryVault):
         fencing_token: Optional[int] = None,
         resource: Optional[str] = None,
         holder_id: Optional[str] = None,
+        supersedes_key: Optional[str] = None,
+        supersedes_category: Optional[str] = None,
+        auto_gate: Optional[bool] = None,
     ) -> MemoryEntity:
         """Insert or update an entity. See ``__init__`` for ``fencing_token``, ``resource`` and ``holder_id``."""
         now = time.time()
@@ -558,15 +576,76 @@ class SQLiteMemoryVault(MemoryVault):
             meta["principal_id"] = principal_id
         if derived_from:
             meta["derived_from"] = derived_from
+
+        # Evaluate write-time admission gate if enabled and epistemic_state not explicitly specified
+        gate_enabled = self.auto_gate if auto_gate is None else auto_gate
+        if gate_enabled and epistemic_state is None:
+            gate = MemoryAdmissionGate()
+            decision = gate.evaluate(content, category=category)
+            ep_state_str = gate.route_epistemic_state(decision)
+            ep_state = EpistemicState(ep_state_str)
+            meta["admission_disposition"] = decision.disposition.value
+            meta["admission_provenance"] = decision.provenance
+            if decision.metadata:
+                meta.update(decision.metadata)
+            if decision.disposition == FactDisposition.TRANSIENT and valid_until is None:
+                valid_until = now + 86400.0  # Default 24h validity for transient states
+        else:
+            ep_state = EpistemicState(epistemic_state) if epistemic_state else EpistemicState.VERIFIED
+
+        # Check explicit superseding target
+        supersedes_ref: Optional[str] = None
+        if supersedes_key:
+            target_cat = supersedes_category or category
+            supersedes_ref = f"{target_cat}:{supersedes_key}"
+            meta["supersedes"] = supersedes_ref
+            if valid_from is None:
+                valid_from = now
+
         meta_str = json.dumps(meta, sort_keys=True)
         val_hash, can_hash = value_digests(content)
-
-        # Validate epistemic_state enum string
-        ep_state = EpistemicState(epistemic_state) if epistemic_state else EpistemicState.VERIFIED
 
         with self._conn:
             cursor = self._conn.cursor()
             self._fence(cursor, fencing_token, resource, holder_id)
+
+            # Invalidate older entity if superseding is declared
+            if supersedes_key:
+                target_cat = supersedes_category or category
+                cursor.execute(
+                    "SELECT id, metadata_json, epistemic_state FROM entities WHERE category = ? AND key = ? AND scope = ? AND archived = 0",
+                    (target_cat, supersedes_key, scope),
+                )
+                target_row = cursor.fetchone()
+                if target_row is not None:
+                    target_meta = json.loads(target_row["metadata_json"] or "{}")
+                    target_meta["superseded_by"] = f"{category}:{key}"
+                    cursor.execute(
+                        """
+                        UPDATE entities
+                        SET valid_until = ?, epistemic_state = ?, metadata_json = ?, superseded_by = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            now,
+                            EpistemicState.REVOKED.value,
+                            json.dumps(target_meta, sort_keys=True),
+                            f"{category}:{key}",
+                            now,
+                            target_row["id"],
+                        ),
+                    )
+                    self._record_audit_event(
+                        cursor=cursor,
+                        action="supersede",
+                        category=target_cat,
+                        key=supersedes_key,
+                        scope=scope,
+                        value_sha256="",
+                        author_id=author_id,
+                        metadata={"superseded_by": f"{category}:{key}", "superseded_at": now},
+                    )
+
             # Skip canonicalization when the vault has no tombstones. Asked of the database on every
             # write: a flag cached at open misses tombstones that other processes add later.
             cursor.execute("SELECT EXISTS (SELECT 1 FROM rejected_value_tombstones)")
@@ -595,7 +674,7 @@ class SQLiteMemoryVault(MemoryVault):
             tenant_sig = sign_tenant_payload(self._signing_key, scope, f"{category}:{key}", content)
 
             cursor.execute(
-                "SELECT id, version, created_at FROM entities WHERE category = ? AND key = ? AND scope = ?",
+                "SELECT id, version, created_at, supersedes, superseded_by FROM entities WHERE category = ? AND key = ? AND scope = ?",
                 (category, key, scope),
             )
             row = cursor.fetchone()
@@ -607,34 +686,39 @@ class SQLiteMemoryVault(MemoryVault):
                     INSERT INTO entities (
                         category, key, content, metadata_json, version, archived,
                         created_at, updated_at, is_encrypted, encrypted_envelope_json,
-                        scope, epistemic_state, valid_from, valid_until, tenant_sig
+                        scope, epistemic_state, valid_from, valid_until, tenant_sig,
+                        supersedes, superseded_by
                     )
-                    VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                     """,
                     (
                         category, key, stored_content, meta_str, now, now,
-                        is_encrypted, envelope_json, scope, ep_state.value, valid_from, valid_until, tenant_sig
+                        is_encrypted, envelope_json, scope, ep_state.value, valid_from, valid_until, tenant_sig,
+                        supersedes_ref
                     ),
                 )
                 entity_id = cursor.lastrowid
                 version = 1
                 created_at = now
+                existing_superseded_by = None
             else:
                 action = "update"
                 entity_id = row["id"]
                 version = row["version"] + 1
                 created_at = row["created_at"]
+                existing_superseded_by = row["superseded_by"]
                 cursor.execute(
                     """
                     UPDATE entities
                     SET content = ?, metadata_json = ?, version = ?, archived = 0, updated_at = ?,
                         is_encrypted = ?, encrypted_envelope_json = ?, epistemic_state = ?,
-                        valid_from = ?, valid_until = ?, tenant_sig = ?
+                        valid_from = ?, valid_until = ?, tenant_sig = ?,
+                        supersedes = COALESCE(?, supersedes)
                     WHERE id = ?
                     """,
                     (
                         stored_content, meta_str, version, now, is_encrypted, envelope_json,
-                        ep_state.value, valid_from, valid_until, tenant_sig, entity_id
+                        ep_state.value, valid_from, valid_until, tenant_sig, supersedes_ref, entity_id
                     ),
                 )
 
@@ -665,6 +749,8 @@ class SQLiteMemoryVault(MemoryVault):
             valid_until=valid_until,
             scope=scope,
             tenant_sig=tenant_sig,
+            supersedes=supersedes_ref or meta.get("supersedes"),
+            superseded_by=existing_superseded_by or meta.get("superseded_by"),
         )
 
     def store(
@@ -684,6 +770,9 @@ class SQLiteMemoryVault(MemoryVault):
         fencing_token: Optional[int] = None,
         resource: Optional[str] = None,
         holder_id: Optional[str] = None,
+        supersedes_key: Optional[str] = None,
+        supersedes_category: Optional[str] = None,
+        auto_gate: Optional[bool] = None,
     ) -> MemoryEntity:
         """Alias for put() for ergonomic convenience."""
         return self.put(
@@ -702,6 +791,42 @@ class SQLiteMemoryVault(MemoryVault):
             fencing_token=fencing_token,
             resource=resource,
             holder_id=holder_id,
+            supersedes_key=supersedes_key,
+            supersedes_category=supersedes_category,
+            auto_gate=auto_gate,
+        )
+
+    def supersede(
+        self,
+        category: str,
+        old_key: str,
+        new_key: str,
+        new_content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        valid_from: Optional[float] = None,
+        valid_until: Optional[float] = None,
+        scope: str = "default",
+        author_id: Optional[str] = None,
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
+    ) -> MemoryEntity:
+        """Atomically revoke old_key and record new_key as its superseding replacement."""
+        return self.put(
+            category=category,
+            key=new_key,
+            content=new_content,
+            metadata=metadata,
+            valid_from=valid_from,
+            valid_until=valid_until,
+            scope=scope,
+            author_id=author_id,
+            fencing_token=fencing_token,
+            resource=resource,
+            holder_id=holder_id,
+            supersedes_key=old_key,
+            supersedes_category=category,
+            epistemic_state=EpistemicState.VERIFIED.value,
         )
 
     def put_batch(
@@ -749,7 +874,8 @@ class SQLiteMemoryVault(MemoryVault):
         cursor.execute(
             """
             SELECT id, category, key, content, metadata_json, version, archived, created_at, updated_at,
-                   is_encrypted, encrypted_envelope_json, scope, epistemic_state, valid_from, valid_until, tenant_sig
+                   is_encrypted, encrypted_envelope_json, scope, epistemic_state, valid_from, valid_until, tenant_sig,
+                   supersedes, superseded_by
             FROM entities
             WHERE category = ? AND key = ? AND scope = ?
             """,
@@ -785,6 +911,8 @@ class SQLiteMemoryVault(MemoryVault):
             valid_until=row["valid_until"] if "valid_until" in row_keys else None,
             scope=row["scope"] if "scope" in row_keys else "default",
             tenant_sig=sig,
+            supersedes=row["supersedes"] if "supersedes" in row_keys else None,
+            superseded_by=row["superseded_by"] if "superseded_by" in row_keys else None,
         )
 
     def archive(
@@ -861,6 +989,7 @@ class SQLiteMemoryVault(MemoryVault):
         epistemic_state: Optional[str] = None,
         as_of_valid_time: Optional[float] = None,
         include_unverified: bool = False,
+        active_only: bool = True,
         tenant_id: Optional[str] = None,
         principal_id: Optional[str] = None,
         authorized_lineage_roots: Optional[List[str]] = None,
@@ -902,6 +1031,11 @@ class SQLiteMemoryVault(MemoryVault):
             where_clauses.append("(e.valid_from IS NULL OR e.valid_from <= ?)")
             where_clauses.append("(e.valid_until IS NULL OR e.valid_until > ?)")
             params.extend([as_of_valid_time, as_of_valid_time])
+        elif active_only:
+            now_t = time.time()
+            where_clauses.append("(e.valid_from IS NULL OR e.valid_from <= ?)")
+            where_clauses.append("(e.valid_until IS NULL OR e.valid_until > ?)")
+            params.extend([now_t, now_t])
 
         where_sql = " AND ".join(where_clauses)
         params.append(limit)
@@ -911,6 +1045,7 @@ class SQLiteMemoryVault(MemoryVault):
                 SELECT e.id, e.category, e.key, e.content, e.metadata_json, e.version, e.archived,
                        e.created_at, e.updated_at, e.is_encrypted, e.encrypted_envelope_json,
                        e.scope, e.epistemic_state, e.valid_from, e.valid_until, e.tenant_sig,
+                       e.supersedes, e.superseded_by,
                        rank, snippet(entities_fts, 2, '<b>', '</b>', '...', 16) AS snip
                 FROM entities_fts
                 JOIN entities e ON e.id = entities_fts.rowid
@@ -940,6 +1075,11 @@ class SQLiteMemoryVault(MemoryVault):
                 fb_clauses.append("(valid_from IS NULL OR valid_from <= ?)")
                 fb_clauses.append("(valid_until IS NULL OR valid_until > ?)")
                 fb_params.extend([as_of_valid_time, as_of_valid_time])
+            elif active_only:
+                now_t = time.time()
+                fb_clauses.append("(valid_from IS NULL OR valid_from <= ?)")
+                fb_clauses.append("(valid_until IS NULL OR valid_until > ?)")
+                fb_params.extend([now_t, now_t])
             fb_sql = " AND ".join(fb_clauses)
             fb_params.append(limit)
             cursor.execute(
@@ -947,6 +1087,7 @@ class SQLiteMemoryVault(MemoryVault):
                 SELECT id, category, key, content, metadata_json, version, archived,
                        created_at, updated_at, is_encrypted, encrypted_envelope_json,
                        scope, epistemic_state, valid_from, valid_until, tenant_sig,
+                       supersedes, superseded_by,
                        0.0 as rank, '' as snip
                 FROM entities
                 WHERE {fb_sql}
@@ -988,6 +1129,8 @@ class SQLiteMemoryVault(MemoryVault):
                 valid_until=r["valid_until"] if "valid_until" in r.keys() else None,
                 scope=r["scope"] if "scope" in r.keys() else "default",
                 tenant_sig=sig,
+                supersedes=r["supersedes"] if "supersedes" in r.keys() else None,
+                superseded_by=r["superseded_by"] if "superseded_by" in r.keys() else None,
             )
             results.append(SearchResult(entity=entity, rank_score=float(r["rank"]), snippet=str(r["snip"])))
 
@@ -1003,6 +1146,7 @@ class SQLiteMemoryVault(MemoryVault):
                 epistemic_state=epistemic_state,
                 as_of_valid_time=as_of_valid_time,
                 include_unverified=include_unverified,
+                active_only=active_only,
             )
             for ent in all_entities:
                 if ent.id in matched_ids:
@@ -1041,12 +1185,14 @@ class SQLiteMemoryVault(MemoryVault):
         epistemic_state: Optional[str] = None,
         as_of_valid_time: Optional[float] = None,
         include_unverified: bool = False,
+        active_only: bool = False,
     ) -> List[MemoryEntity]:
         cursor = self._conn.cursor()
         query_sql = (
             "SELECT id, category, key, content, metadata_json, version, archived, "
             "created_at, updated_at, is_encrypted, encrypted_envelope_json, "
-            "scope, epistemic_state, valid_from, valid_until, tenant_sig FROM entities WHERE 1=1"
+            "scope, epistemic_state, valid_from, valid_until, tenant_sig, "
+            "supersedes, superseded_by FROM entities WHERE 1=1"
         )
         params: List[Any] = []
 
@@ -1066,6 +1212,10 @@ class SQLiteMemoryVault(MemoryVault):
         if as_of_valid_time is not None:
             query_sql += " AND (valid_from IS NULL OR valid_from <= ?) AND (valid_until IS NULL OR valid_until > ?)"
             params.extend([as_of_valid_time, as_of_valid_time])
+        elif active_only:
+            now_t = time.time()
+            query_sql += " AND (valid_from IS NULL OR valid_from <= ?) AND (valid_until IS NULL OR valid_until > ?)"
+            params.extend([now_t, now_t])
 
         query_sql += " ORDER BY category, key"
         cursor.execute(query_sql, params)
@@ -1102,6 +1252,8 @@ class SQLiteMemoryVault(MemoryVault):
                     valid_until=r["valid_until"] if "valid_until" in r.keys() else None,
                     scope=r["scope"] if "scope" in r.keys() else "default",
                     tenant_sig=sig,
+                    supersedes=r["supersedes"] if "supersedes" in r.keys() else None,
+                    superseded_by=r["superseded_by"] if "superseded_by" in r.keys() else None,
                 )
             )
         return items

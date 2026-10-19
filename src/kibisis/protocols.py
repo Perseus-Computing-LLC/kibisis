@@ -80,6 +80,9 @@ class MemoryVault(Protocol):
         fencing_token: Optional[int] = None,
         resource: Optional[str] = None,
         holder_id: Optional[str] = None,
+        supersedes_key: Optional[str] = None,
+        supersedes_category: Optional[str] = None,
+        auto_gate: Optional[bool] = None,
     ) -> MemoryEntity:
         """Insert or update a memory entity with epistemic status, bi-temporal bounds, scope, and fencing token validation."""
         ...
@@ -101,6 +104,9 @@ class MemoryVault(Protocol):
         fencing_token: Optional[int] = None,
         resource: Optional[str] = None,
         holder_id: Optional[str] = None,
+        supersedes_key: Optional[str] = None,
+        supersedes_category: Optional[str] = None,
+        auto_gate: Optional[bool] = None,
     ) -> MemoryEntity:
         """Alias for put() for ergonomic convenience."""
         ...
@@ -133,6 +139,7 @@ class MemoryVault(Protocol):
         epistemic_state: Optional[str] = None,
         as_of_valid_time: Optional[float] = None,
         include_unverified: bool = False,
+        active_only: bool = True,
         tenant_id: Optional[str] = None,
         principal_id: Optional[str] = None,
         authorized_lineage_roots: Optional[List[str]] = None,

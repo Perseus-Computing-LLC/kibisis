@@ -16,6 +16,15 @@ class EpistemicState(str, Enum):
     REVOKED = "revoked"              # Deprecated, superseded, or rejected assertion
 
 
+class RelationType(str, Enum):
+    """Directional typed relationship between cognitive memory entities."""
+    SUPERSEDES = "supersedes"        # Replacement fact invalidating target entity
+    DEPENDS_ON = "depends_on"        # Upstream dependency (e.g. policy doc version)
+    DERIVED_FROM = "derived_from"    # Lineage / synthesized insight
+    CONTRADICTS = "contradicts"      # Incompatible assertion requiring adjudication
+    RELATES_TO = "relates_to"        # Explicit semantic association (not loose co-occurrence)
+
+
 class MemoryEntity(BaseModel):
     """An individual memory item stored in the vault."""
     category: str = Field(description="Category namespace (e.g. general, convention, insight).")
@@ -56,6 +65,16 @@ class MemoryEntity(BaseModel):
         description="HMAC-SHA256 signature for post-retrieval tenant ownership validation."
     )
 
+    # Directional Supersession Linkage
+    supersedes: Optional[str] = Field(
+        default=None,
+        description="Target entity identifier (category:key or key) superseded and invalidated by this assertion."
+    )
+    superseded_by: Optional[str] = Field(
+        default=None,
+        description="Successor entity identifier that supersedes and replaces this assertion."
+    )
+
     def to_context_item(
         self,
         pinned: bool = False,
@@ -69,6 +88,16 @@ class MemoryEntity(BaseModel):
         meta.setdefault("scope", self.scope)
         state_val = self.epistemic_state.value if isinstance(self.epistemic_state, EpistemicState) else str(self.epistemic_state)
         meta.setdefault("epistemic_state", state_val)
+        if self.valid_from is not None:
+            meta["valid_from"] = self.valid_from
+        if self.valid_until is not None:
+            meta["valid_until"] = self.valid_until
+        if self.supersedes:
+            meta["supersedes"] = self.supersedes
+        if self.superseded_by:
+            meta["superseded_by"] = self.superseded_by
+        meta["created_at"] = self.created_at
+        meta["updated_at"] = self.updated_at
         return {
             "id": f"kibisis_{self.category}_{self.key}",
             "item_id": f"kibisis_{self.category}_{self.key}",

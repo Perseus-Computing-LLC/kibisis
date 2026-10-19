@@ -58,12 +58,14 @@ class MemoryAdmissionGate:
     TRANSIENT_PATTERNS = [
         re.compile(r"\b(right now|at the moment|currently feeling|tired today|busy today)\b", re.IGNORECASE),
         re.compile(r"\b(just woke up|having lunch|heading out shortly)\b", re.IGNORECASE),
+        re.compile(r"\b(visiting [a-z0-9_\-\s]+ for|in town for|staying until|temporarily in)\b", re.IGNORECASE),
     ]
 
-    # Explicit factual correction patterns
+    # Explicit factual correction and state superseding patterns
     CORRECTION_PATTERNS = [
         re.compile(r"\b(actually|correction|no longer|updated to|instead of|mistake|corrected to)\b", re.IGNORECASE),
         re.compile(r"\b(supersedes|revised|changed from|replace prior|was incorrect)\b", re.IGNORECASE),
+        re.compile(r"\b(moved to|relocated to|switched to|transferred to)\b", re.IGNORECASE),
     ]
 
     def __init__(self, strict_mode: bool = False) -> None:
@@ -141,5 +143,7 @@ class MemoryAdmissionGate:
             return "candidate"
         elif decision.disposition == FactDisposition.CORRECTION:
             return "verified"
+        elif decision.disposition == FactDisposition.TRANSIENT:
+            return "candidate"
         else:
             return "revoked"

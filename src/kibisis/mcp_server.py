@@ -63,6 +63,19 @@ TOOL_DEFINITIONS = [
                     "type": "object",
                     "description": "Optional JSON metadata dictionary.",
                 },
+                "supersedes_key": {
+                    "type": "string",
+                    "description": "Optional key of earlier entity revoked/superseded by this assertion.",
+                },
+                "supersedes_category": {
+                    "type": "string",
+                    "description": "Optional category of superseded entity if different from category.",
+                },
+                "auto_gate": {
+                    "type": "boolean",
+                    "description": "Enable write-time admission gating (default: true).",
+                    "default": True,
+                },
             },
             "required": ["key", "content"],
         },
@@ -98,6 +111,11 @@ TOOL_DEFINITIONS = [
                 "as_of_valid_time": {
                     "type": "number",
                     "description": "Bi-temporal point-in-time timestamp evaluation.",
+                },
+                "active_only": {
+                    "type": "boolean",
+                    "description": "Filter out expired assertions (default: true).",
+                    "default": True,
                 },
             },
             "required": ["query"],
@@ -251,10 +269,15 @@ class KibisisMCPServer:
             category = args.get("category", "general")
             key = args["key"]
             content = args["content"]
-            epistemic_state = args.get("epistemic_state", "verified")
+            epistemic_state = args.get("epistemic_state")
+            if epistemic_state == "auto":
+                epistemic_state = None
             scope = args.get("scope", "default")
             valid_from = args.get("valid_from")
             valid_until = args.get("valid_until")
+            supersedes_key = args.get("supersedes_key")
+            supersedes_category = args.get("supersedes_category")
+            auto_gate = args.get("auto_gate", True)
             meta = args.get("metadata", {})
             if isinstance(meta, str):
                 try:
@@ -271,6 +294,9 @@ class KibisisMCPServer:
                 valid_from=valid_from,
                 valid_until=valid_until,
                 scope=scope,
+                supersedes_key=supersedes_key,
+                supersedes_category=supersedes_category,
+                auto_gate=auto_gate,
             )
             return {
                 "status": "stored",
@@ -280,6 +306,8 @@ class KibisisMCPServer:
                 "version": entity.version,
                 "epistemic_state": entity.epistemic_state.value if isinstance(entity.epistemic_state, EpistemicState) else str(entity.epistemic_state),
                 "scope": entity.scope,
+                "supersedes": entity.supersedes,
+                "superseded_by": entity.superseded_by,
             }
 
         elif name == "kibisis_recall":
@@ -289,6 +317,7 @@ class KibisisMCPServer:
             epistemic_state = args.get("epistemic_state")
             limit = int(args.get("limit", 10))
             as_of_valid_time = args.get("as_of_valid_time")
+            active_only = args.get("active_only", True)
 
             results = self.vault.search(
                 query=query,
@@ -297,6 +326,7 @@ class KibisisMCPServer:
                 epistemic_state=epistemic_state,
                 limit=limit,
                 as_of_valid_time=as_of_valid_time,
+                active_only=active_only,
             )
             return [
                 {
