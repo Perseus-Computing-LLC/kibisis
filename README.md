@@ -25,17 +25,17 @@ An agent that runs for hours learns things worth keeping: decisions, preferences
 
 ## Install
 
-This README describes 0.1.0-alpha.4 (0.1.0a4 on PyPI). It is a pre-release, so name the version.
+This README describes 0.1.0-alpha.4, tagged with a [GitHub release](https://github.com/Perseus-Computing-LLC/kibisis/releases/tag/v0.1.0-alpha.4). crates.io and PyPI still have 0.1.0-alpha.2 (0.1.0a2 on PyPI), so install 0.1.0-alpha.4 from GitHub.
 
 ```toml
 # Rust: Cargo.toml
 [dependencies]
-kibisis = "0.1.0-alpha.4"
+kibisis = { git = "https://github.com/Perseus-Computing-LLC/kibisis", tag = "v0.1.0-alpha.4" }
 ```
 
 ```bash
 # Python
-pip install kibisis==0.1.0a4
+pip install "kibisis @ git+https://github.com/Perseus-Computing-LLC/kibisis@v0.1.0-alpha.4"
 ```
 
 ## Quickstart
