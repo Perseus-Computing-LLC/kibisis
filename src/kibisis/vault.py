@@ -93,10 +93,17 @@ class SQLiteMemoryVault(MemoryVault):
         The passphrase comes from the argument, then KIBISIS_PASSPHRASE_FILE, then KIBISIS_PASSPHRASE.
         With no passphrase the vault refuses to open (EncryptionRequiredError) unless ``allow_plaintext=True``.
         An in-memory vault never touches disk, so it may run without a passphrase.
+
+        With ``enforce_fencing=True`` (which needs ``coordinator``), every call that adds, changes or
+        removes entries must pass the caller's current ``fencing_token`` and ``resource``, and may
+        pass ``holder_id``; a missing, stale or expired token raises ``LeaseConflictError`` and
+        changes nothing. Without it, a token is checked only when one is passed.
         """
         self.db_path = str(db_path)
         self.coordinator = coordinator
         self.enforce_fencing = enforce_fencing
+        if enforce_fencing and coordinator is None:
+            raise ValueError("enforce_fencing=True needs a lease coordinator: pass coordinator=")
         self._fallback_search_warned = False
         on_disk = self.db_path != ":memory:"
         passphrase = resolve_passphrase(passphrase)
@@ -195,6 +202,25 @@ class SQLiteMemoryVault(MemoryVault):
                 )
             if lease.expires_at <= time.time():
                 raise LeaseConflictError(f"Expired lease with fencing token {fencing_token} for resource '{resource}'")
+
+    def _fence(
+        self,
+        cursor: Any,
+        fencing_token: Optional[int],
+        resource: Optional[str],
+        holder_id: Optional[str],
+    ) -> None:
+        """Check the caller's fencing token inside the write transaction, holding the write lock.
+
+        Skipped when no token or resource is passed and ``enforce_fencing`` is off. Otherwise the
+        vault takes its write lock first (``BEGIN IMMEDIATE``), so a write whose token passes is
+        ordered before any write by a later lease holder, never after it.
+        """
+        if fencing_token is None and resource is None and not self.enforce_fencing:
+            return
+        if not self._conn.in_transaction:
+            cursor.execute("BEGIN IMMEDIATE")
+        self._validate_fencing(fencing_token, resource, holder_id)
 
     @staticmethod
     def _migrate_file_to_sqlcipher(path: str, passphrase: str) -> None:
@@ -519,7 +545,11 @@ class SQLiteMemoryVault(MemoryVault):
         tenant_id: Optional[str] = None,
         principal_id: Optional[str] = None,
         derived_from: Optional[List[str]] = None,
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
     ) -> MemoryEntity:
+        """Insert or update an entity. See ``__init__`` for ``fencing_token``, ``resource`` and ``holder_id``."""
         now = time.time()
         meta = dict(metadata or {})
         if tenant_id:
@@ -536,6 +566,7 @@ class SQLiteMemoryVault(MemoryVault):
 
         with self._conn:
             cursor = self._conn.cursor()
+            self._fence(cursor, fencing_token, resource, holder_id)
             # Skip canonicalization when the vault has no tombstones. Asked of the database on every
             # write: a flag cached at open misses tombstones that other processes add later.
             cursor.execute("SELECT EXISTS (SELECT 1 FROM rejected_value_tombstones)")
@@ -650,6 +681,9 @@ class SQLiteMemoryVault(MemoryVault):
         tenant_id: Optional[str] = None,
         principal_id: Optional[str] = None,
         derived_from: Optional[List[str]] = None,
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
     ) -> MemoryEntity:
         """Alias for put() for ergonomic convenience."""
         return self.put(
@@ -665,13 +699,24 @@ class SQLiteMemoryVault(MemoryVault):
             tenant_id=tenant_id,
             principal_id=principal_id,
             derived_from=derived_from,
+            fencing_token=fencing_token,
+            resource=resource,
+            holder_id=holder_id,
         )
 
     def put_batch(
         self,
         items: Sequence[Union[Dict[str, Any], MemoryEntity]],
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
     ) -> List[MemoryEntity]:
-        """Insert or update multiple entities in a single database transaction."""
+        """Insert or update several entities, in order, each in its own transaction.
+
+        The batch stops at the first item that fails, and the items before it stay written.
+        ``fencing_token``, ``resource`` and ``holder_id`` apply to every item; a dict item may set its own.
+        """
+        fence = {"fencing_token": fencing_token, "resource": resource, "holder_id": holder_id}
         results: List[MemoryEntity] = []
         with self._conn:
             for item in items:
@@ -685,9 +730,10 @@ class SQLiteMemoryVault(MemoryVault):
                         valid_from=item.valid_from,
                         valid_until=item.valid_until,
                         scope=item.scope,
+                        **fence,
                     )
                 elif isinstance(item, dict):
-                    res = self.put(**item)
+                    res = self.put(**{**fence, **item})
                 else:
                     raise TypeError(f"Expected dict or MemoryEntity, got {type(item)}")
                 results.append(res)
@@ -747,10 +793,14 @@ class SQLiteMemoryVault(MemoryVault):
         key: str,
         scope: str = "default",
         author_id: Optional[str] = None,
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
     ) -> bool:
         now = time.time()
         with self._conn:
             cursor = self._conn.cursor()
+            self._fence(cursor, fencing_token, resource, holder_id)
             cursor.execute(
                 """
                 UPDATE entities
@@ -778,9 +828,13 @@ class SQLiteMemoryVault(MemoryVault):
         key: str,
         scope: str = "default",
         author_id: Optional[str] = None,
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
     ) -> bool:
         with self._conn:
             cursor = self._conn.cursor()
+            self._fence(cursor, fencing_token, resource, holder_id)
             cursor.execute(
                 "DELETE FROM entities WHERE category = ? AND key = ? AND scope = ?",
                 (category, key, scope),
@@ -1120,6 +1174,9 @@ class SQLiteMemoryVault(MemoryVault):
         author_id: Optional[str] = None,
         content: Optional[str] = None,
         scope: str = "default",
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
     ) -> str:
         """Tombstone a value by its exact and canonical SHA-256 digests within ``scope``.
 
@@ -1130,6 +1187,7 @@ class SQLiteMemoryVault(MemoryVault):
         now = time.time()
         with self._conn:
             cursor = self._conn.cursor()
+            self._fence(cursor, fencing_token, resource, holder_id)
             if content is None:
                 cursor.execute(
                     "SELECT content, is_encrypted, encrypted_envelope_json FROM entities WHERE category = ? AND key = ? AND scope = ?",
@@ -1219,6 +1277,9 @@ class SQLiteMemoryVault(MemoryVault):
         tenant_id: Optional[str] = None,
         principal_id: Optional[str] = None,
         derived_from: Optional[List[str]] = None,
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
     ) -> MemoryEntity:
         """Stage an unverified memory candidate into the vault awaiting verification/human review."""
         return self.put(
@@ -1234,6 +1295,9 @@ class SQLiteMemoryVault(MemoryVault):
             tenant_id=tenant_id,
             principal_id=principal_id,
             derived_from=derived_from,
+            fencing_token=fencing_token,
+            resource=resource,
+            holder_id=holder_id,
         )
 
     def review_entity(
@@ -1244,6 +1308,9 @@ class SQLiteMemoryVault(MemoryVault):
         scope: str = "default",
         reviewer_id: Optional[str] = None,
         notes: Optional[str] = None,
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
     ) -> MemoryEntity:
         """Human review gate: update epistemic state based on review decision (verified, disputed, revoked)."""
         valid_verdicts = {EpistemicState.VERIFIED.value, EpistemicState.DISPUTED.value, EpistemicState.REVOKED.value}
@@ -1273,6 +1340,9 @@ class SQLiteMemoryVault(MemoryVault):
                 reason=f"Human review rejected: {notes or 'revoked'}",
                 author_id=reviewer_id,
                 scope=scope,
+                fencing_token=fencing_token,
+                resource=resource,
+                holder_id=holder_id,
             )
             entity.archived = True
             entity.epistemic_state = EpistemicState.REVOKED
@@ -1290,6 +1360,9 @@ class SQLiteMemoryVault(MemoryVault):
             valid_until=entity.valid_until,
             scope=scope,
             author_id=reviewer_id,
+            fencing_token=fencing_token,
+            resource=resource,
+            holder_id=holder_id,
         )
 
     def list_audit_events(
@@ -1360,6 +1433,9 @@ class SQLiteMemoryVault(MemoryVault):
         scope: str = "default",
         metadata: Optional[Dict[str, Any]] = None,
         author_id: Optional[str] = None,
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
     ) -> MemoryEntity:
         """Store or update the dedicated user persona / preference slot."""
         meta = metadata.copy() if metadata else {}
@@ -1372,6 +1448,9 @@ class SQLiteMemoryVault(MemoryVault):
             scope=scope,
             author_id=author_id,
             epistemic_state=EpistemicState.VERIFIED.value,
+            fencing_token=fencing_token,
+            resource=resource,
+            holder_id=holder_id,
         )
 
     def get_persona_slot(
@@ -1518,6 +1597,9 @@ class SQLiteMemoryVault(MemoryVault):
         snapshot_or_path: Union[str, Path, Dict[str, Any]],
         *,
         clear_existing: bool = False,
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
     ) -> int:
         """Import a snapshot into the vault.
 
@@ -1548,6 +1630,7 @@ class SQLiteMemoryVault(MemoryVault):
         imported_count = 0
         with self._conn:
             cursor = self._conn.cursor()
+            self._fence(cursor, fencing_token, resource, holder_id)
             for ts in data.get("tombstones", []):
                 cursor.execute(
                     """
@@ -1598,9 +1681,19 @@ class SQLiteMemoryVault(MemoryVault):
                 valid_from=ent_data.get("valid_from"),
                 valid_until=ent_data.get("valid_until"),
                 scope=scope,
+                fencing_token=fencing_token,
+                resource=resource,
+                holder_id=holder_id,
             )
             if ent_data.get("archived"):
-                self.archive(category=ent_data["category"], key=ent_data["key"], scope=scope)
+                self.archive(
+                    category=ent_data["category"],
+                    key=ent_data["key"],
+                    scope=scope,
+                    fencing_token=fencing_token,
+                    resource=resource,
+                    holder_id=holder_id,
+                )
             imported_count += 1
 
         return imported_count

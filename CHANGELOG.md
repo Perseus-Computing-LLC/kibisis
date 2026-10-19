@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0-alpha.4] - Unreleased
 
 ### Fixed
+- `enforce_fencing=True` now takes effect. Before, the vault stored the flag and never checked a
+  token. With it (it needs `coordinator=`), `put`, `store`, `put_batch`, `archive`, `purge`,
+  `tombstone`, `admit_candidate`, `review_entity`, `set_persona_slot` and `import_snapshot` take
+  `fencing_token`, `resource` and an optional `holder_id`. A missing, stale or expired token raises
+  `LeaseConflictError` and changes nothing: no entry, tombstone or audit event. The vault checks the
+  token after taking its write lock (`BEGIN IMMEDIATE`), so a write that passes is ordered before
+  any write by a later lease holder. Without the flag, a token is checked only when a call passes
+  one. `enforce_fencing=True` without a coordinator raises `ValueError`.
+- `put_batch`'s docstring said it used one transaction. Each item is written in its own
+  transaction; the batch stops at the first failure and keeps the items before it.
 - Tombstones match a value by its exact and canonical SHA-256 digests under every category and key
   in the scope (or every scope for a `"*"` tombstone). Before, a forgotten value was refused only
   under the category and key it was rejected at, so it came back under a new key. Python and Rust.

@@ -108,8 +108,11 @@ class MemoryVault(Protocol):
     def put_batch(
         self,
         items: Sequence[Union[Dict[str, Any], MemoryEntity]],
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
     ) -> List[MemoryEntity]:
-        """Insert or update multiple entities in a single database transaction."""
+        """Insert or update several entities, in order, each in its own transaction."""
         ...
 
     def get(
@@ -217,6 +220,9 @@ class MemoryVault(Protocol):
         scope: str = "default",
         reviewer_id: Optional[str] = None,
         notes: Optional[str] = None,
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
     ) -> MemoryEntity:
         """Human review gate: update epistemic state based on review decision (verified, disputed, revoked)."""
         ...
@@ -248,6 +254,9 @@ class MemoryVault(Protocol):
         scope: str = "default",
         metadata: Optional[Dict[str, Any]] = None,
         author_id: Optional[str] = None,
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
     ) -> MemoryEntity:
         """Store or update the dedicated user persona / preference slot."""
         ...

@@ -19,7 +19,7 @@ An agent that runs for hours learns things worth keeping: decisions, preferences
 - **Forgetting that sticks.** A tombstoned value is deleted everywhere in its scope. Writing it again is refused, even under another key or with different case, spacing or punctuation.
 - **Scopes that hold.** Each memory is signed over its scope, category, key and content, and a row that fails the check is never returned.
 - **A journal of every change.** Every write, archive, tombstone and purge is recorded in a hash chain, in the same transaction as the change.
-- **One writer at a time.** Leases carry fencing tokens that only go up. They work across threads in Rust, and across processes that share one SQLite file in Python.
+- **One writer at a time.** Leases carry fencing tokens that only go up. They work across threads in Rust, and across processes that share one SQLite file in Python. A Python vault opened with `enforce_fencing=True` refuses writes that do not carry the current token.
 - **Ready for agents.** An MCP server over stdio offers remember, recall, admit, forget, verify-ledger and health tools.
 - **Local only.** Kibisis contains no network code.
 
@@ -98,7 +98,7 @@ Medians of five runs of [telarch-benchmarks](https://github.com/Perseus-Computin
 - **Trust states and validity windows.** Each memory is a candidate, verified, disputed or revoked, and can carry valid-from and valid-until times. Search leaves out candidates and revoked memories unless asked, and can return what was valid at a given time (`src/kibisis/models.py`, `search` in `src/kibisis/vault.py`). `review_entity` records a reviewer's verdict; a revocation tombstones the value. `MemoryAdmissionGate` (`src/kibisis/admission.py`) is a heuristic classifier a caller can use to choose a memory's state; the vault does not run it on its own.
 - **Tombstones.** `tombstone` records a value's SHA-256 digest and the digest of its canonical form (Unicode compatibility folding, case folding, invisible characters and punctuation removed, whitespace collapsed), then deletes every copy of the value in the scope. Afterwards the value is refused under any category or key in that scope, and `import_snapshot` will not restore it (`src/kibisis/vault.py`; the Rust vault in `src/lib.rs` matches values the same way).
 - **Audit journal.** Every put, archive, tombstone and purge appends a SHA-256 hash-chained event in the same database transaction as the change, so a change cannot land without its event. `verify_audit_chain` re-checks the chain (`_record_audit_event` in `src/kibisis/vault.py`).
-- **Leases.** `SQLiteLeaseCoordinator` (`src/kibisis/lease.py`) and the Rust `InMemoryLeaseCoordinator` (`src/lib.rs`) grant time-limited leases with increasing fencing tokens, and `SQLiteLeaseCoordinator.validate_fencing_token` checks a token.
+- **Leases.** `SQLiteLeaseCoordinator` (`src/kibisis/lease.py`) and the Rust `InMemoryLeaseCoordinator` (`src/lib.rs`) grant time-limited leases with increasing fencing tokens, and `SQLiteLeaseCoordinator.validate_fencing_token` checks a token. A Python vault opened with `coordinator=` and `enforce_fencing=True` checks the caller's token on every write while it holds its write lock, and refuses a missing, stale or expired token with `LeaseConflictError` before anything changes (`_fence` in `src/kibisis/vault.py`).
 - **MCP server.** `python -m kibisis.mcp_server` serves the tools over stdio (`src/kibisis/mcp_server.py`).
 
 ## Limits
@@ -108,7 +108,7 @@ Medians of five runs of [telarch-benchmarks](https://github.com/Perseus-Computin
 - **Encryption scope:** In the Python package, entry content is always encrypted unless the vault is opened with `allow_plaintext=True`; whole-file encryption needs SQLCipher (see above). The Rust crate keeps memories in RAM and neither encrypts nor persists them.
 - **Tombstones:** They stop exact and look-alike repeats of a value, not paraphrases. A tombstone covers one scope; tombstone with `scope="*"` to forget a value in every scope.
 - **Scopes:** The caller names the scope. Kibisis keeps scopes apart but does not decide which caller may use which scope.
-- **Fencing:** The vault does not check fencing tokens on write; callers check them with `SQLiteLeaseCoordinator.validate_fencing_token`.
+- **Fencing:** The Python vault checks fencing tokens only when it is opened with `enforce_fencing=True` or a call passes a token. `migrate_plaintext`, which re-encrypts stored rows without changing them, takes no token. The MCP server opens its vault without a coordinator, and the Rust vault does not check tokens. Storage outside Kibisis must compare tokens itself.
 - **Lease coordination scope:** Leases coordinate threads in one process, or processes sharing a local filesystem through SQLite transactions. They are not a distributed consensus service.
 - **TTL resolution:** The in-process Rust coordinator tracks deadlines in whole seconds and rounds up, so a lease is held for at least its TTL and at most one second longer. The Python SQLite coordinator uses floating-point second timestamps.
 - **Not independently assessed:** No security review or certification has been completed. Designed for local and disconnected use.
