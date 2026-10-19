@@ -25,17 +25,19 @@ Kibisis keeps an agent's memories on the local machine and controls what comes b
 
 ## Installation
 
+crates.io and PyPI have 0.1.0-alpha.2 (0.1.0a2 on PyPI). This README describes 0.1.0-alpha.4, which is not published yet. Until it is, install from this repository.
+
 ### Rust
 
 ```toml
 [dependencies]
-kibisis = "0.1.0-alpha.4"
+kibisis = { git = "https://github.com/Perseus-Computing-LLC/kibisis", branch = "main" }
 ```
 
 ### Python
 
 ```bash
-pip install kibisis
+pip install "kibisis @ git+https://github.com/Perseus-Computing-LLC/kibisis@main"
 ```
 
 ## Quickstart
