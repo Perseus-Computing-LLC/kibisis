@@ -15,7 +15,8 @@ Subject: `[SECURITY] Kibisis Vulnerability Report`
 - **Triage & Status**: Within 5 business days.
 - **Fix & Advisory**: Within 14 calendar days for verified high/critical vulnerabilities.
 
-## Scope & Cryptographic Boundaries
-- **Python Package**: Employs SQLCipher full-page encryption and AES-256-GCM envelope encryption with keys derived via PBKDF2-HMAC-SHA256 (600,000 iterations). Raw disk scans reveal zero plaintext.
-- **Rust Crate**: Provides high-throughput in-memory memory vault and concurrency lease coordination. It does not encrypt at rest.
-- **Local Boundary**: Leases coordinate local threads and processes sharing access to an atomic SQLite transaction store. They are not a distributed consensus lock service.
+## Scope
+- **Python package:** each entry's content is sealed with AES-256-GCM under a key derived with PBKDF2-HMAC-SHA256 (600,000 iterations). An on-disk vault will not open without a passphrase unless you pass `allow_plaintext=True`. With `sqlcipher3` installed, SQLCipher also encrypts the whole database file, including categories, keys and metadata. Without it, those fields are stored in plain text and Kibisis logs a warning.
+- **Rust crate:** holds memory in RAM and does not encrypt it.
+- **Leases:** Rust leases coordinate threads in one process. Python leases coordinate processes that share one SQLite file on one machine. Neither is a distributed lock. The vault does not check fencing tokens on write; check them with `SQLiteLeaseCoordinator.validate_fencing_token`.
+- **Not covered:** a running process that already holds the key, or a weak passphrase.

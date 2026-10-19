@@ -1,17 +1,18 @@
 //! # kibisis
 //!
-//! Local-first encrypted cognitive memory vault with atomic concurrency leases.
+//! Local memory for AI agents, with leases so one writer works on shared state at a time.
 //!
-//! Autonomous AI agents running parallel execution loops frequently corrupt shared state
-//! when attempting concurrent read-modify-write cycles against flat files or SQLite databases.
-//! Kibisis solves this by providing:
+//! Agents that run in parallel can overwrite each other's changes when they read, modify and
+//! write the same state. This crate provides:
 //!
-//! 1. **Structured Memory Entities**: Key-value memory storage partitioned by category,
-//!    with monotonic version tracking and soft-archival capabilities.
-//! 2. **Single-Writer Multi-Reader (SWMR) Leases**: Atomic distributed leasing with
-//!    strictly increasing fencing tokens to eliminate stale-worker race conditions.
-//! 3. **Cryptographic Envelopes**: Envelope schema definitions for local AES-256-GCM
-//!    authenticated encryption at rest with PBKDF2-HMAC-SHA256 key derivation.
+//! 1. **Memory entries**: values stored by category and key, with a version number that only
+//!    goes up, and soft archiving.
+//! 2. **Leases**: time-limited and held by one worker at a time, across threads in one
+//!    process. Each lease carries a fencing token that only goes up, so storage that compares
+//!    tokens can reject a worker whose lease expired. The vault does not compare them for you.
+//! 3. **Envelope types**: the record layout for AES-256-GCM encryption with PBKDF2-HMAC-SHA256
+//!    key derivation. The Python package encrypts at rest; this crate holds memory in RAM and
+//!    does not encrypt it.
 //!
 //! ## Architecture Overview
 //!
