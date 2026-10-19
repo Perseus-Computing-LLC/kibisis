@@ -1,19 +1,29 @@
 name: Release
 
+# A tag builds and tests the crate and the Python package, attests them, checks that the wheel
+# installs with its dependencies on Ubuntu and macOS arm64, and creates a GitHub release that names
+# the commit. Publishing to PyPI and crates.io runs in the protected `pypi` and `crates-io`
+# environments, so nothing is published until a required reviewer approves the deployment.
+# Pull requests run the same build and install jobs; attestation, release and publishing are tag-only.
+
 on:
   push:
     tags:
       - "v*"
+  pull_request:
+    branches: [main]
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 jobs:
-  release-crates:
-    name: Build & Package Release
+  build:
+    name: Build, test and attest
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -23,25 +33,191 @@ jobs:
         with:
           toolchain: 1.97.1
 
-      - name: Run verification tests
+      - name: Set up Python
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.12"
+
+      - name: Check the tag matches every version string
+        shell: python
+        run: |
+          import os, pathlib, re, tomllib
+          ref = os.environ["GITHUB_REF"]
+          tag = os.environ["GITHUB_REF_NAME"] if ref.startswith("refs/tags/") else None
+          cargo = tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]["version"]
+          python = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
+          pep440 = re.sub(r"-(alpha|beta|rc)\.", lambda m: {"alpha": "a", "beta": "b", "rc": "rc"}[m.group(1)], cargo)
+          problems = []
+          if tag is not None and tag != f"v{cargo}":
+              problems.append(f"tag {tag} != Cargo.toml v{cargo}")
+          if python != pep440:
+              problems.append(f"pyproject.toml {python} != {pep440}")
+          for init in pathlib.Path("src").glob("*/__init__.py"):
+              found = re.search(r'^__version__ = "([^"]+)"', init.read_text(), re.M)
+              if found and found.group(1) != python:
+                  problems.append(f"{init} __version__ {found.group(1)} != {python}")
+          if problems:
+              raise SystemExit("; ".join(problems))
+          print(f"{tag or ref}: crate {cargo}, Python {python}, commit {os.environ['GITHUB_SHA']}")
+
+      - name: Run Rust tests
         run: cargo test --release
 
       - name: Package crate
         run: cargo package
 
-      - name: Generate CycloneDX SBOM
+      - name: Run Python tests
         run: |
-          cargo install cargo-cyclonedx --locked || true
-          cargo cyclonedx --format json --output-pattern "sbom" || true
+          python -m pip install --upgrade pip
+          python -m pip install build pytest .
+          python -m pytest tests -q
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Collect release files and checksums
+        run: |
+          mkdir release
+          cp dist/*.whl dist/*.tar.gz target/package/*.crate release/
+          cd release && sha256sum * > SHA256SUMS && cat SHA256SUMS
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@c074443f1a5fb4a48204b02c2738144058d66047 # v2.2.3
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: "target/package/*.crate"
-        continue-on-error: true
+          subject-path: |
+            release/*.whl
+            release/*.tar.gz
+            release/*.crate
 
-      - name: Upload release artifact
+      - name: Upload release files
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
         with:
-          name: crate-package
-          path: target/package/*.crate
+          name: release-files
+          path: release/
+          if-no-files-found: error
+
+  install-check:
+    name: Install the wheel (${{ matrix.os }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.12"
+
+      - name: Download release files
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-files
+          path: release
+
+      # No --no-deps: dependencies resolve from PyPI exactly as `pip install kibisis` would.
+      - name: Install the wheel and open an encrypted vault
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          PY="$RUNNER_TEMP/venv/bin/python"
+          "$PY" -m pip install --upgrade pip
+          "$PY" -m pip install release/*.whl
+          "$PY" - <<'EOF'
+          import pathlib, platform, tempfile
+          import sqlcipher3
+          import kibisis
+          from kibisis import SQLiteMemoryVault
+          with tempfile.TemporaryDirectory() as tmp:
+              vault = SQLiteMemoryVault(pathlib.Path(tmp) / "smoke.db", passphrase="release install smoke test")
+              vault.put("smoke", "check", "installed from the release wheel")
+              assert vault.get("smoke", "check").content == "installed from the release wheel"
+              vault.close()
+          print(platform.system(), platform.machine(), "kibisis", kibisis.__version__, "with", sqlcipher3.__name__)
+          EOF
+
+  github-release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, install-check]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release files
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-files
+          path: release
+
+      - name: Create the release, naming its commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "Built and tested by CI from commit ${GITHUB_SHA}."
+            echo
+            echo "Build provenance: https://github.com/${GITHUB_REPOSITORY}/attestations"
+            echo
+            echo '```'
+            cat release/SHA256SUMS
+            echo '```'
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag --prerelease
+
+  publish-pypi:
+    name: Publish to PyPI
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: github-release
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/kibisis/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download release files
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-files
+          path: release
+
+      - name: Keep only the Python distributions
+        run: mkdir dist && cp release/*.whl release/*.tar.gz dist/
+
+      # Trusted publishing: no stored token. PyPI records the repository, workflow and commit.
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+
+  publish-crates:
+    name: Publish to crates.io
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: github-release
+    runs-on: ubuntu-latest
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/kibisis
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+
+      # Trusted publishing: exchanges this job's OIDC token for a short-lived crates.io token.
+      - name: Authenticate to crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
