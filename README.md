@@ -81,6 +81,8 @@ export KIBISIS_SCOPE=project-a                            # optional; the defaul
 python -m kibisis.mcp_server                              # remember, recall, forget, verify-ledger and health over stdio
 ```
 
+The package also installs these as `kibisis-keygen`, `kibisis-mcp` and `kibisis-review`.
+
 The server keeps its vault in your user data directory (`~/.local/share/kibisis/vault.sqlite` on Linux, `~/Library/Application Support/kibisis/` on macOS, `%LOCALAPPDATA%\kibisis\` on Windows) unless `KIBISIS_DB_PATH` names another file. It refuses to start without a key unless `KIBISIS_ALLOW_PLAINTEXT=1` is set. What an agent stores is a candidate written by `mcp-agent`; a person reviews candidates:
 
 ```bash

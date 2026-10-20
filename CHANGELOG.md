@@ -44,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `python -m kibisis.review` lists candidates and approves, disputes or rejects them, recording the
   operating-system user (or `--reviewer`) as the reviewer.
 - `python -m kibisis.keys PATH` creates a key file with mode 0600.
+- Console scripts `kibisis-mcp`, `kibisis-review` and `kibisis-keygen` for the three commands above.
 - `put(trust_ceiling="candidate")`, `record_refusal()`, `scrub()` and `ReviewedEntryError` in the
   Python vault; `kibisis.config` holds the settings the MCP server and review command share.
 - A write refused because its value is tombstoned is journaled as a `refuse` event, from `put`,

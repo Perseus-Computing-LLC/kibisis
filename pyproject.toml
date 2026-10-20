@@ -33,6 +33,11 @@ Homepage = "https://telarch.ai/kibisis"
 Documentation = "https://docs.rs/kibisis"
 Repository = "https://github.com/Perseus-Computing-LLC/kibisis"
 
+[project.scripts]
+kibisis-mcp = "kibisis.mcp_server:run_stdio_server"
+kibisis-review = "kibisis.review:main"
+kibisis-keygen = "kibisis.keys:main"
+
 [tool.pytest.ini_options]
 addopts = ["--import-mode=importlib"]
 pythonpath = ["src"]

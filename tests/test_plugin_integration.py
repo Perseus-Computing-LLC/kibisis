@@ -1,8 +1,12 @@
-import os
-"""Tests for kibisis-vault plugin integration and prefetch/recall behavior."""
+"""Tests for kibisis-vault plugin integration and prefetch/recall behavior.
+
+The Hermes plugin is not shipped in this repository. These tests run only when
+KIBISIS_TEST_PLUGIN_PATH names the plugin's __init__.py; otherwise they are skipped.
+"""
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -11,8 +15,8 @@ from pathlib import Path
 from kibisis.vault import SQLiteMemoryVault
 
 
-# The Hermes plugin is installed on the host, not shipped in this repository.
-PLUGIN_PATH = Path("/opt/data/plugins/kibisis-vault/__init__.py")
+_PLUGIN_ENV = os.environ.get("KIBISIS_TEST_PLUGIN_PATH", "")
+PLUGIN_PATH = Path(_PLUGIN_ENV) if _PLUGIN_ENV else None
 
 
 def load_plugin_module():
@@ -25,7 +29,10 @@ def load_plugin_module():
     return mod
 
 
-@unittest.skipUnless(PLUGIN_PATH.is_file(), f"kibisis-vault plugin not installed at {PLUGIN_PATH}")
+@unittest.skipUnless(
+    PLUGIN_PATH is not None and PLUGIN_PATH.is_file(),
+    "set KIBISIS_TEST_PLUGIN_PATH to the kibisis-vault plugin's __init__.py to run these tests",
+)
 class TestKibisisVaultPlugin(unittest.TestCase):
     def setUp(self):
         self.plugin = load_plugin_module()
