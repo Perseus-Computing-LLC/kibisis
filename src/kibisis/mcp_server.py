@@ -73,6 +73,13 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             "required": ["key", "content"],
             "additionalProperties": False,
         },
+        "annotations": {
+            "title": "Remember",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": False,
+            "openWorldHint": False,
+        },
     },
     {
         "name": "kibisis_recall",
@@ -99,6 +106,13 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             "required": ["query"],
             "additionalProperties": False,
         },
+        "annotations": {
+            "title": "Recall",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
     },
     {
         "name": "kibisis_forget",
@@ -116,16 +130,37 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             "required": ["category", "key"],
             "additionalProperties": False,
         },
+        "annotations": {
+            "title": "Forget",
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
     },
     {
         "name": "kibisis_verify_ledger",
         "description": "Check the SHA-256 hash chain of the Kibisis audit journal.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "annotations": {
+            "title": "Verify Ledger",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
     },
     {
         "name": "kibisis_health",
         "description": "Report the vault's scope, entry counts and encryption state.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "annotations": {
+            "title": "Health",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
     },
 ]
 

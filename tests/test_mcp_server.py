@@ -80,6 +80,11 @@ class TestProtocol(unittest.TestCase):
                 schema = tool["inputSchema"]
                 self.assertFalse(schema["additionalProperties"])
                 self.assertFalse({"scope", "epistemic_state", "auto_gate", "reviewer_id"} & set(schema["properties"]))
+                annotations = tool.get("annotations")
+                self.assertIsInstance(annotations, dict)
+                for hint in ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"):
+                    self.assertIn(hint, annotations)
+                    self.assertIsInstance(annotations[hint], bool)
 
     def test_tool_errors_are_short_and_carry_no_traceback(self):
         is_error, text = _call(self.server, "kibisis_remember", {"key": "only-key"})
