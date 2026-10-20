@@ -7,9 +7,11 @@
 //!
 //! 1. **Memory entries**: values stored by category and key, with a version number that only
 //!    goes up, and soft archiving.
-//! 2. **Leases**: time-limited and held by one worker at a time, across threads in one
-//!    process. Each lease carries a fencing token that only goes up, so storage that compares
-//!    tokens can reject a worker whose lease expired. The vault does not compare them for you.
+//! 2. **Leases**: time-limited and held by one worker at a time. Each lease carries a fencing
+//!    token that only goes up, so storage that compares tokens can reject a worker whose lease
+//!    expired. The vault does not compare them for you. [`InMemoryLeaseCoordinator`] works
+//!    across threads in one process; [`FileLeaseCoordinator`] works across processes that
+//!    share one local filesystem (one machine) through per-resource file locks.
 //! 3. **No encryption here**: this crate keeps memory in RAM and does not encrypt it. The
 //!    Python package is the encrypted, on-disk vault (AES-256-GCM entries, optional SQLCipher
 //!    whole-file encryption).
@@ -21,6 +23,8 @@
 //! - [`InMemoryMemoryVault`]: Thread-safe reference implementation protected by mutex locks.
 //! - [`LeaseCoordinator`]: Trait defining atomic lease acquisition, renewal, and release.
 //! - [`InMemoryLeaseCoordinator`]: Reference lease coordinator using monotonic fencing tokens.
+//! - [`FileLeaseCoordinator`]: Lease coordinator for processes on one machine, kept in files
+//!   in one directory on a local filesystem (network filesystems are not supported).
 //!
 //! ## Quick Start
 //!
@@ -55,6 +59,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+mod file_lease;
+
+pub use file_lease::FileLeaseCoordinator;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

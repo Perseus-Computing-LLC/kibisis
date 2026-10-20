@@ -2,9 +2,9 @@
 name = "kibisis"
 version = "0.1.0-alpha.5"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 authors = ["Perseus Computing LLC <contact@perseuscomputing.com>"]
-description = "In-memory reference implementation of the Kibisis agent memory vault and fencing-token leases. The encrypted, on-disk vault is the kibisis Python package."
+description = "Reference implementation of the Kibisis agent memory vault (in memory, unencrypted) and fencing-token leases for threads or for processes on one machine. The encrypted, on-disk vault is the kibisis Python package."
 license = "MIT"
 homepage = "https://telarch.ai/kibisis"
 documentation = "https://docs.rs/kibisis"
