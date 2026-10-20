@@ -5,6 +5,52 @@ All notable changes to `kibisis` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-alpha.5] - 2026-10-20
+
+### Changed
+- The MCP server serves one scope, fixed when it starts (`KIBISIS_SCOPE`, default `default`). Tools
+  no longer take `scope`; a call that names another scope, `"*"` or an empty scope is refused, and the
+  refusal is journaled.
+- Writes through MCP are stored as `candidate` at most and recorded with author `mcp-agent`, whatever
+  their content claims. `kibisis_remember` no longer takes `epistemic_state` or `auto_gate`; a call
+  that sends them, or `author_id` or `reviewer_id`, is refused and journaled. Metadata from the model
+  is stored under `agent_metadata`. An MCP write cannot replace an entry a person verified or
+  reviewed, and a supersession of one is kept as a proposal that `review_entity` applies when a
+  person approves the new entry.
+- `kibisis_recall` returns entries inside a `<kibisis-recall>` envelope with their text escaped,
+  instead of bare JSON. Each entry is labeled with its state and author. Candidates are included, so
+  an agent's own writes still come back before review; `include_candidates=false` returns only
+  reviewed entries.
+- `kibisis_forget` deletes the entry and tombstones its value, then rebuilds the search index,
+  truncates the write-ahead log and vacuums the file. Before, it only archived the entry, so the text
+  stayed in the file and could be restated.
+- The MCP server refuses to start without a key unless `KIBISIS_ALLOW_PLAINTEXT=1` is set. Before, it
+  opened its vault unencrypted. Its default database moved from a fixed `/opt/data/...` path to the
+  user data directory (`~/.local/share/kibisis/` on Linux, `~/Library/Application Support/kibisis/`
+  on macOS, `%LOCALAPPDATA%\kibisis\` on Windows); `KIBISIS_DB_PATH` still overrides it.
+- Tool errors no longer include a Python traceback.
+
+### Added
+- `python -m kibisis.review` lists candidates and approves, disputes or rejects them, recording the
+  operating-system user (or `--reviewer`) as the reviewer.
+- `python -m kibisis.keys PATH` creates a key file with mode 0600.
+- `put(trust_ceiling="candidate")`, `record_refusal()`, `scrub()` and `ReviewedEntryError` in the
+  Python vault; `kibisis.config` holds the settings the MCP server and review command share.
+- A write refused because its value is tombstoned is journaled as a `refuse` event, from `put`,
+  `store` and `import_snapshot`. Before, the refusal rolled back with the write and left no record.
+
+### Removed
+- The `kibisis_admit` MCP tool. It let an agent mark its own writes verified.
+- The Rust crate's `CryptoEnvelope`, `EncryptedEnvelope`, `CryptoError` and `ZeroizingPassphrase`,
+  and with them the `zeroize` dependency. The crate never implemented encryption; it keeps memory in
+  RAM. Its description no longer says it is encrypted.
+
+### Fixed
+- The README said the vault does not run the admission gate on its own; it does, on writes that name
+  no state, unless opened with `auto_gate=False`. Its measured table now matches telarch.ai/evidence:
+  the kill test kills the lease holder with SIGKILL while it holds the lease (not mid-write), and the
+  16-thread throughput is the v0.1.0-alpha.4 median.
+
 ## [0.1.0-alpha.4] - 2026-10-19
 
 ### Fixed

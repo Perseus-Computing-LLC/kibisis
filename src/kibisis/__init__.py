@@ -13,10 +13,10 @@ from .admission import AdmissionDecision, FactDisposition, MemoryAdmissionGate
 from .crypto import AESGCMCryptoEnvelopeProvider
 from .lease import SQLiteLeaseCoordinator
 from .keys import generate_keyfile, resolve_passphrase
-from .vault import SQLiteMemoryVault, TombstonedValueError
+from .vault import ReviewedEntryError, SQLiteMemoryVault, TombstonedValueError
 from .mcp_server import KibisisMCPServer
 
-__version__ = "0.1.0a4"
+__version__ = "0.1.0a5"
 
 __all__ = [
     "AuditEvent",
@@ -38,6 +38,7 @@ __all__ = [
     "AESGCMCryptoEnvelopeProvider",
     "SQLiteLeaseCoordinator",
     "SQLiteMemoryVault",
+    "ReviewedEntryError",
     "TombstonedValueError",
     "KibisisMCPServer",
     "generate_keyfile",

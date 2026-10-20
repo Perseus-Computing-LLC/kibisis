@@ -74,6 +74,38 @@ def value_digests(content: str) -> Tuple[str, str]:
 class TombstonedValueError(ValueError):
     """Raised when a write carries a value that a tombstone in its scope has rejected."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str = "",
+        key: str = "",
+        scope: str = "",
+        digest: str = "",
+        author_id: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+        self.key = key
+        self.scope = scope
+        self.digest = digest
+        self.author_id = author_id
+
+
+class ReviewedEntryError(PermissionError):
+    """Raised when a capped (model-originated) write targets an entry a person verified or reviewed."""
+
+
+def _is_reviewed(row: Any) -> bool:
+    """True for an entry in the verified state or one that carries a person's review."""
+    if row["epistemic_state"] == EpistemicState.VERIFIED.value:
+        return True
+    try:
+        meta = json.loads(row["metadata_json"] or "{}")
+    except (TypeError, ValueError):
+        return False
+    return bool(meta.get("human_reviews"))
+
 
 class SQLiteMemoryVault(MemoryVault):
     """Local SQLite memory vault featuring FTS5 full-text search, WAL mode, entity versioning,
@@ -288,15 +320,7 @@ class SQLiteMemoryVault(MemoryVault):
                     "UPDATE entities SET content = '', is_encrypted = 1, encrypted_envelope_json = ?, tenant_sig = ? WHERE id = ?",
                     (env.model_dump_json(), new_sig, r["id"]),
                 )
-        # FTS5 'delete' leaves old terms in index segments until rebuilt; WAL and free pages keep old bytes too.
-        self._conn.execute("INSERT INTO entities_fts(entities_fts) VALUES ('rebuild')")
-        self._conn.execute("INSERT INTO entities_fts(entities_fts) VALUES ('optimize')")
-        self._conn.commit()
-        if self.db_path != ":memory:":
-            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            self._conn.execute("VACUUM")
-            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            self._restrict_permissions()
+        self.scrub()
         return {"migrated": len(rows), "remaining_plaintext": self.encryption_status()["plaintext"]}
 
     def _configure_db(self) -> None:
@@ -546,7 +570,7 @@ class SQLiteMemoryVault(MemoryVault):
         decrypted_bytes = self.crypto_provider.decrypt(envelope, self.passphrase)
         return decrypted_bytes.decode("utf-8")
 
-    def put(
+    def _put(
         self,
         category: str,
         key: str,
@@ -566,10 +590,16 @@ class SQLiteMemoryVault(MemoryVault):
         supersedes_key: Optional[str] = None,
         supersedes_category: Optional[str] = None,
         auto_gate: Optional[bool] = None,
+        trust_ceiling: Optional[str] = None,
     ) -> MemoryEntity:
-        """Insert or update an entity. See ``__init__`` for ``fencing_token``, ``resource`` and ``holder_id``."""
+        """Write path behind :meth:`put`, which journals the tombstone refusals this raises."""
+        if trust_ceiling is not None and trust_ceiling != EpistemicState.CANDIDATE.value:
+            raise ValueError("trust_ceiling supports only 'candidate'")
         now = time.time()
         meta = dict(metadata or {})
+        if author_id:
+            # Keep the original author when a reviewer re-writes an entry; the review is in human_reviews.
+            meta.setdefault("author_id", author_id)
         if tenant_id:
             meta["tenant_id"] = tenant_id
         if principal_id:
@@ -593,6 +623,11 @@ class SQLiteMemoryVault(MemoryVault):
         else:
             ep_state = EpistemicState(epistemic_state) if epistemic_state else EpistemicState.VERIFIED
 
+        if trust_ceiling is not None and ep_state in (EpistemicState.VERIFIED, EpistemicState.DISPUTED):
+            # Default recall returns verified and disputed entries; a capped write is neither.
+            meta["trust_capped_from"] = ep_state.value
+            ep_state = EpistemicState.CANDIDATE
+
         # Check explicit superseding target
         supersedes_ref: Optional[str] = None
         if supersedes_key:
@@ -608,6 +643,18 @@ class SQLiteMemoryVault(MemoryVault):
         with self._conn:
             cursor = self._conn.cursor()
             self._fence(cursor, fencing_token, resource, holder_id)
+            if trust_ceiling is not None:
+                # A capped write cannot replace an entry a person verified or reviewed.
+                cursor.execute(
+                    "SELECT epistemic_state, metadata_json FROM entities WHERE category = ? AND key = ? AND scope = ?",
+                    (category, key, scope),
+                )
+                existing = cursor.fetchone()
+                if existing is not None and _is_reviewed(existing):
+                    raise ReviewedEntryError(
+                        f"'{category}:{key}' [scope={scope}] is verified or reviewed by a person; a capped write "
+                        "cannot replace it. Write a new key with supersedes_key to propose a replacement."
+                    )
 
             # Invalidate older entity if superseding is declared
             if supersedes_key:
@@ -617,6 +664,14 @@ class SQLiteMemoryVault(MemoryVault):
                     (target_cat, supersedes_key, scope),
                 )
                 target_row = cursor.fetchone()
+                if target_row is not None and trust_ceiling is not None and _is_reviewed(target_row):
+                    # A capped write cannot retire a reviewed entry. Record the proposal instead;
+                    # review_entity applies it when a person approves this entry.
+                    meta.pop("supersedes", None)
+                    meta["proposed_supersedes"] = {"category": target_cat, "key": supersedes_key}
+                    meta_str = json.dumps(meta, sort_keys=True)
+                    supersedes_ref = None
+                    target_row = None
                 if target_row is not None:
                     target_meta = json.loads(target_row["metadata_json"] or "{}")
                     target_meta["superseded_by"] = f"{category}:{key}"
@@ -654,7 +709,12 @@ class SQLiteMemoryVault(MemoryVault):
                 if tomb is not None:
                     raise TombstonedValueError(
                         f"Write rejected by tombstone: entity '{category}:{key}' [scope={scope}] matches rejected tombstone "
-                        f"(digest: {val_hash[:12]}..., reason: {tomb['reason']})"
+                        f"(digest: {val_hash[:12]}..., reason: {tomb['reason']})",
+                        category=category,
+                        key=key,
+                        scope=scope,
+                        digest=val_hash,
+                        author_id=author_id,
                     )
 
             is_encrypted = 0
@@ -753,6 +813,75 @@ class SQLiteMemoryVault(MemoryVault):
             superseded_by=existing_superseded_by or meta.get("superseded_by"),
         )
 
+    def put(
+        self,
+        category: str,
+        key: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        epistemic_state: Optional[str] = None,
+        valid_from: Optional[float] = None,
+        valid_until: Optional[float] = None,
+        scope: str = "default",
+        author_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        principal_id: Optional[str] = None,
+        derived_from: Optional[List[str]] = None,
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
+        supersedes_key: Optional[str] = None,
+        supersedes_category: Optional[str] = None,
+        auto_gate: Optional[bool] = None,
+        trust_ceiling: Optional[str] = None,
+    ) -> MemoryEntity:
+        """Insert or update an entity. See ``__init__`` for ``fencing_token``, ``resource`` and ``holder_id``.
+
+        ``trust_ceiling="candidate"`` caps the stored state: a write that the admission gate or the
+        ``epistemic_state`` argument would store as ``verified`` or ``disputed`` is stored as
+        ``candidate``, and the write cannot replace or supersede an entry a person verified or
+        reviewed (it raises :class:`ReviewedEntryError`, or records the supersession as a proposal
+        that :meth:`review_entity` applies on approval). Write paths that carry model output (the
+        MCP server) set it, so trust comes from the path, not from the payload.
+
+        ``author_id`` is recorded in the entity's metadata and in the audit journal. A write whose
+        value a tombstone rejects raises :class:`TombstonedValueError`, and the refusal is journaled.
+        """
+        try:
+            return self._put(
+                category=category,
+                key=key,
+                content=content,
+                metadata=metadata,
+                epistemic_state=epistemic_state,
+                valid_from=valid_from,
+                valid_until=valid_until,
+                scope=scope,
+                author_id=author_id,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                derived_from=derived_from,
+                fencing_token=fencing_token,
+                resource=resource,
+                holder_id=holder_id,
+                supersedes_key=supersedes_key,
+                supersedes_category=supersedes_category,
+                auto_gate=auto_gate,
+                trust_ceiling=trust_ceiling,
+            )
+        except TombstonedValueError as exc:
+            # The write's transaction rolled back; journal the refusal in its own transaction.
+            self.record_refusal(
+                path="put",
+                reason="tombstoned value",
+                scope=exc.scope or scope,
+                category=exc.category,
+                key=exc.key,
+                author_id=exc.author_id,
+                detail={"value_digest_prefix": exc.digest[:12]},
+            )
+            raise
+
     def store(
         self,
         category: str,
@@ -773,6 +902,7 @@ class SQLiteMemoryVault(MemoryVault):
         supersedes_key: Optional[str] = None,
         supersedes_category: Optional[str] = None,
         auto_gate: Optional[bool] = None,
+        trust_ceiling: Optional[str] = None,
     ) -> MemoryEntity:
         """Alias for put() for ergonomic convenience."""
         return self.put(
@@ -794,7 +924,39 @@ class SQLiteMemoryVault(MemoryVault):
             supersedes_key=supersedes_key,
             supersedes_category=supersedes_category,
             auto_gate=auto_gate,
+            trust_ceiling=trust_ceiling,
         )
+
+    def record_refusal(
+        self,
+        *,
+        path: str,
+        reason: str,
+        scope: str,
+        category: str = "",
+        key: str = "",
+        author_id: Optional[str] = None,
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> AuditEvent:
+        """Journal a refused request (action ``refuse``) so refusals are auditable like writes.
+
+        Records the path (for example ``mcp``), the reason, and caller-supplied detail. Never records content.
+        """
+        meta: Dict[str, Any] = {"path": path, "reason": reason}
+        if detail:
+            meta["detail"] = detail
+        with self._conn:
+            cursor = self._conn.cursor()
+            return self._record_audit_event(
+                cursor=cursor,
+                action="refuse",
+                category=category or "",
+                key=key or "",
+                scope=scope,
+                value_sha256="",
+                author_id=author_id,
+                metadata=meta,
+            )
 
     def supersede(
         self,
@@ -1501,7 +1663,11 @@ class SQLiteMemoryVault(MemoryVault):
             entity.metadata = meta
             return entity
 
-        # Update entity with new epistemic status and review metadata
+        # Update entity with new epistemic status and review metadata. Approving an entry that proposed
+        # to supersede a reviewed entry applies the supersession now, under the reviewer's authority.
+        proposal = meta.pop("proposed_supersedes", None) if verdict == EpistemicState.VERIFIED.value else None
+        if proposal:
+            meta["supersession_approved_by"] = reviewer_id
         return self.put(
             category=category,
             key=key,
@@ -1515,7 +1681,25 @@ class SQLiteMemoryVault(MemoryVault):
             fencing_token=fencing_token,
             resource=resource,
             holder_id=holder_id,
+            supersedes_key=proposal["key"] if proposal else None,
+            supersedes_category=proposal["category"] if proposal else None,
         )
+
+    def scrub(self) -> None:
+        """Remove deleted or replaced content from the search index, the write-ahead log and free pages.
+
+        FTS5 'delete' leaves old terms in index segments until the index is rebuilt, and the
+        write-ahead log and free pages keep old bytes until a checkpoint and VACUUM. Run after a
+        delete (the MCP server's forget does) or after migrating plaintext.
+        """
+        self._conn.execute("INSERT INTO entities_fts(entities_fts) VALUES ('rebuild')")
+        self._conn.execute("INSERT INTO entities_fts(entities_fts) VALUES ('optimize')")
+        self._conn.commit()
+        if self.db_path != ":memory:":
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self._conn.execute("VACUUM")
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self._restrict_permissions()
 
     def list_audit_events(
         self,
@@ -1823,6 +2007,14 @@ class SQLiteMemoryVault(MemoryVault):
             scope = ent_data.get("scope", "default")
             val_hash, can_hash = value_digests(ent_data["content"])
             if self._find_tombstone(self._conn.cursor(), scope, val_hash, can_hash) is not None:
+                self.record_refusal(
+                    path="import_snapshot",
+                    reason="tombstoned value",
+                    scope=scope,
+                    category=ent_data.get("category", ""),
+                    key=ent_data.get("key", ""),
+                    detail={"value_digest_prefix": val_hash[:12]},
+                )
                 continue
             self.put(
                 category=ent_data["category"],

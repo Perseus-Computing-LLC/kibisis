@@ -10,9 +10,9 @@
 //! 2. **Leases**: time-limited and held by one worker at a time, across threads in one
 //!    process. Each lease carries a fencing token that only goes up, so storage that compares
 //!    tokens can reject a worker whose lease expired. The vault does not compare them for you.
-//! 3. **Envelope types**: the record layout for AES-256-GCM encryption with PBKDF2-HMAC-SHA256
-//!    key derivation. The Python package encrypts at rest; this crate holds memory in RAM and
-//!    does not encrypt it.
+//! 3. **No encryption here**: this crate keeps memory in RAM and does not encrypt it. The
+//!    Python package is the encrypted, on-disk vault (AES-256-GCM entries, optional SQLCipher
+//!    whole-file encryption).
 //!
 //! ## Architecture Overview
 //!
@@ -55,32 +55,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use zeroize::Zeroize;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Zeroizable secure passphrase wrapper for in-memory key hygiene.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ZeroizingPassphrase(pub String);
-
-impl ZeroizingPassphrase {
-    pub fn new(pass: impl Into<String>) -> Self {
-        Self(pass.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Drop for ZeroizingPassphrase {
-    fn drop(&mut self) {
-        unsafe {
-            let vec = self.0.as_mut_vec();
-            vec.zeroize();
-        }
-    }
-}
 
 /// Compute SHA-256 hex digest using pure Rust (FIPS 180-4 compliant).
 pub fn sha256_hex(input: &[u8]) -> String {
@@ -368,23 +344,6 @@ pub struct AuditEvent {
     pub author_id: Option<String>,
 }
 
-/// Cryptographic envelope schema for encrypted records at rest.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EncryptedEnvelope {
-    /// Cipher algorithm identifier (for example: aes-256-gcm).
-    pub cipher: String,
-    /// Key derivation function identifier (for example: pbkdf2-sha256).
-    pub kdf: String,
-    /// Base64-encoded salt used during key derivation.
-    pub salt_b64: String,
-    /// Base64-encoded 96-bit initialization nonce.
-    pub nonce_b64: String,
-    /// Base64-encoded ciphertext.
-    pub ciphertext_b64: String,
-    /// Base64-encoded 128-bit authentication tag.
-    pub tag_b64: String,
-}
-
 /// Distributed concurrency lease granting single-writer privileges.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lease {
@@ -462,26 +421,6 @@ impl std::fmt::Display for LeaseError {
 }
 
 impl std::error::Error for LeaseError {}
-
-/// Errors returned during encryption or decryption operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CryptoError {
-    /// Authentication tag verification failed or ciphertext is corrupted.
-    DecryptionFailed(String),
-    /// Supplied cryptographic key is malformed or invalid.
-    InvalidKey(String),
-}
-
-impl std::fmt::Display for CryptoError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DecryptionFailed(msg) => write!(f, "Decryption failed: {}", msg),
-            Self::InvalidKey(msg) => write!(f, "Invalid key: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for CryptoError {}
 
 /// Core trait defining persistent cognitive memory storage.
 pub trait MemoryVault: Send + Sync {
@@ -588,15 +527,6 @@ pub trait LeaseCoordinator: Send + Sync {
 
     /// Voluntarily relinquish an actively held lease before expiration.
     fn release(&mut self, lease: &Lease) -> Result<bool, LeaseError>;
-}
-
-/// Trait defining symmetric encryption and decryption of payload slices.
-pub trait CryptoEnvelope: Send + Sync {
-    /// Encrypt a byte slice using the specified passphrase, returning an envelope.
-    fn encrypt(&self, plaintext: &[u8], key: &str) -> Result<EncryptedEnvelope, CryptoError>;
-
-    /// Decrypt an envelope using the specified passphrase, verifying the authentication tag.
-    fn decrypt(&self, envelope: &EncryptedEnvelope, key: &str) -> Result<Vec<u8>, CryptoError>;
 }
 
 /// In-memory reference implementation of [`MemoryVault`].
@@ -1316,13 +1246,6 @@ mod tests {
                 "{ttl:?}: renewal"
             );
         }
-    }
-
-    #[test]
-    fn test_zeroizing_passphrase_drops_cleanly() {
-        let pass = ZeroizingPassphrase::new("super_secret_passphrase");
-        assert_eq!(pass.as_str(), "super_secret_passphrase");
-        drop(pass);
     }
 
     #[test]

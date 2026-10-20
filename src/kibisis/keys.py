@@ -36,3 +36,26 @@ def generate_keyfile(path: str) -> None:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(secrets.token_urlsafe(32) + "\n")
+
+
+def main(argv: Optional[list] = None) -> int:
+    """``python -m kibisis.keys PATH`` creates a new key file (mode 0600) and never prints the key."""
+    import sys
+
+    args = sys.argv[1:] if argv is None else argv
+    if len(args) != 1 or args[0] in ("-h", "--help"):
+        print("usage: python -m kibisis.keys PATH   (creates a new key file; refuses to overwrite)", file=sys.stderr)
+        return 2
+    path = os.path.abspath(os.path.expanduser(args[0]))
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    try:
+        generate_keyfile(path)
+    except FileExistsError:
+        print(f"{path} already exists; not overwriting it.", file=sys.stderr)
+        return 1
+    print(f"Created {path}. Set KIBISIS_PASSPHRASE_FILE={path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
