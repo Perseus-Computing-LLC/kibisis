@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Python: `SQLiteMemoryVault.integrity_status()` counts stored entries that reads refuse, `adopt_unsigned_entries()`
+  signs entries that carry no signature after a person has checked them, `stored_digest()` gives the form in
+  which the vault stores a value's digest, `integrity_upgrade` reports what an upgrade did, and
+  `EntryIntegrityError` (a `PermissionError`) is raised for an entry that fails its integrity check.
 - Rust: `FileLeaseCoordinator`, a lease coordinator for processes on one machine. Each resource's
   lease lives in a small state file in a shared directory, and every acquire, renew and release holds
   an operating-system lock on a companion lock file from reading the lease to writing its successor.
@@ -19,6 +23,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Rust: the minimum supported Rust version is now 1.89 (was 1.85), for the standard library's file
   locks (`File::lock`). The crate still has no dependencies.
+- Python: `CryptoEnvelopeProvider.encrypt` and `decrypt` take an `aad` keyword (associated data); a
+  custom provider without it is refused when the vault opens. `EncryptedEnvelope` has a `binding` field.
+- Python: snapshots are format 1.1. They record `digest_scheme`, `digest_key_id` and
+  `unreadable_entity_count`, and each tombstone's `sealed_digests`.
+- Python: the MCP forget response's `value_digest_prefix` is taken from the stored, keyed digest.
+- Python: `migrate_plaintext` no longer seals an entry that fails its signature check.
+
+### Security
+- Python, when the `sqlcipher3` driver does not load (the file is plain SQLite; content stays sealed):
+  - Sealed content is bound to its entry (AES-GCM associated data: scope, category and key), and a
+    vault with a passphrase refuses an entry without a signature. Before, an entry whose signature was
+    removed skipped the check, so sealed content copied under another entry's name was returned.
+  - The journal and tombstones store value digests keyed with a key derived from the passphrase.
+    Before, they stored plain SHA-256, so short values such as codes, PINs and yes/no answers could be
+    recovered by hashing every candidate.
+  - Entry signatures use a key derived from the passphrase by PBKDF2 (600,000 iterations) and HKDF.
+    Before, the key was one SHA-256 of the passphrase, so a known value and its signature let anyone
+    test passphrase guesses about 51,000 times faster than PBKDF2 allows (measured on one core).
+  - A wrong passphrase is refused when the vault opens; before, only SQLCipher refused it.
+- Python: a vault written by 0.1.0a5 or earlier is upgraded on its first open with the passphrase, in
+  one transaction: entries are re-sealed and re-signed, digests keyed, journal hashes recomputed, and a
+  `migrate` event records the old chain head; then the file is vacuumed so the old digests are gone. It
+  refuses to run under a wrong passphrase. Older versions cannot read an upgraded vault.
 
 ## [0.1.0-alpha.5] - 2026-10-20
 

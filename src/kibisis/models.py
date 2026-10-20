@@ -109,6 +109,13 @@ class EncryptedEnvelope(BaseModel):
     nonce_b64: str = Field(description="Base64-encoded cipher initialization nonce/IV.")
     ciphertext_b64: str = Field(description="Base64-encoded ciphertext.")
     tag_b64: str = Field(default="", description="Base64-encoded authentication tag if separated.")
+    binding: Optional[str] = Field(
+        default=None,
+        description=(
+            "Associated data the ciphertext is bound to. 'entry-v2': the entry's scope, category and key, so the "
+            "envelope cannot be moved to another entry. None: not bound (written by Kibisis 0.1.0a5 or earlier)."
+        ),
+    )
 
 
 class Lease(BaseModel):
