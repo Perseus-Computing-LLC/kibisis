@@ -1,6 +1,6 @@
 """kibisis: Local-first encrypted cognitive memory vault with atomic concurrency leases."""
 
-from .models import AuditEvent, EncryptedEnvelope, EpistemicState, Lease, MemoryEntity, RelationType, SearchResult
+from .models import AuditEvent, EncryptedEnvelope, EpistemicState, Lease, MemoryEntity, SearchResult
 from .protocols import (
     CryptoEnvelopeProvider,
     EncryptionRequiredError,
@@ -22,7 +22,6 @@ __all__ = [
     "AuditEvent",
     "EncryptedEnvelope",
     "EpistemicState",
-    "RelationType",
     "Lease",
     "MemoryEntity",
     "SearchResult",

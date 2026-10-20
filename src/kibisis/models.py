@@ -16,15 +16,6 @@ class EpistemicState(str, Enum):
     REVOKED = "revoked"              # Deprecated, superseded, or rejected assertion
 
 
-class RelationType(str, Enum):
-    """Directional typed relationship between cognitive memory entities."""
-    SUPERSEDES = "supersedes"        # Replacement fact invalidating target entity
-    DEPENDS_ON = "depends_on"        # Upstream dependency (e.g. policy doc version)
-    DERIVED_FROM = "derived_from"    # Lineage / synthesized insight
-    CONTRADICTS = "contradicts"      # Incompatible assertion requiring adjudication
-    RELATES_TO = "relates_to"        # Explicit semantic association (not loose co-occurrence)
-
-
 class MemoryEntity(BaseModel):
     """An individual memory item stored in the vault."""
     category: str = Field(description="Category namespace (e.g. general, convention, insight).")

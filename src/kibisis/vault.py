@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from .admission import AdmissionDecision, FactDisposition, MemoryAdmissionGate
 from .crypto import AESGCMCryptoEnvelopeProvider, sign_tenant_payload, verify_tenant_payload
 from .keys import MIN_PASSPHRASE_LENGTH, resolve_passphrase
-from .models import AuditEvent, EncryptedEnvelope, EpistemicState, MemoryEntity, RelationType, SearchResult
+from .models import AuditEvent, EncryptedEnvelope, EpistemicState, MemoryEntity, SearchResult
 from .protocols import CryptoEnvelopeProvider, EncryptionRequiredError, LeaseConflictError, LeaseCoordinator, MemoryVault
 
 logger = logging.getLogger(__name__)

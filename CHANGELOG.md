@@ -29,8 +29,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   user data directory (`~/.local/share/kibisis/` on Linux, `~/Library/Application Support/kibisis/`
   on macOS, `%LOCALAPPDATA%\kibisis\` on Windows); `KIBISIS_DB_PATH` still overrides it.
 - Tool errors no longer include a Python traceback.
+- Writes that name no state go through `MemoryAdmissionGate` in the Python vault: speculation and
+  transient remarks are stored as candidates (transient ones valid for 24 hours), and other text is
+  stored verified, as before. `SQLiteMemoryVault(auto_gate=False)` or `put(auto_gate=False)` turns
+  the gate off.
 
 ### Added
+- Supersession: `put` and `store` take `supersedes_key` (and `supersedes_category`), and
+  `supersede()` writes a replacement in one call. The replaced entry is marked revoked, its validity
+  ends, and the two are linked through `MemoryEntity.supersedes` and `superseded_by` (new columns,
+  added when a vault is opened; 0.1.0a4 can still read and write such a file but does not keep the
+  links). Each supersession is journaled.
+- `search(active_only=True)`, the default, leaves out entries outside their validity window.
 - `python -m kibisis.review` lists candidates and approves, disputes or rejects them, recording the
   operating-system user (or `--reviewer`) as the reviewer.
 - `python -m kibisis.keys PATH` creates a key file with mode 0600.

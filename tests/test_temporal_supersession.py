@@ -10,7 +10,7 @@ Incorporates proven patterns from the r/AIMemory analysis:
 import time
 import pytest
 from kibisis.vault import SQLiteMemoryVault
-from kibisis.models import EpistemicState, RelationType
+from kibisis.models import EpistemicState
 from kibisis.admission import FactDisposition, MemoryAdmissionGate
 
 
@@ -171,13 +171,8 @@ def test_active_search_filters_superseded_and_expired_facts():
     assert "residence_austin" not in hist_keys
 
 
-def test_relation_types_and_context_item_temporal_metadata():
-    """Verify RelationType enum and context item export formatting."""
-    assert RelationType.SUPERSEDES == "supersedes"
-    assert RelationType.DEPENDS_ON == "depends_on"
-    assert RelationType.CONTRADICTS == "contradicts"
-    assert RelationType.DERIVED_FROM == "derived_from"
-
+def test_context_item_carries_supersession_and_temporal_metadata():
+    """A context item exported from an entity carries its supersession link and temporal metadata."""
     vault = SQLiteMemoryVault(":memory:", auto_gate=False)
     ent = vault.put(
         category="policy",
