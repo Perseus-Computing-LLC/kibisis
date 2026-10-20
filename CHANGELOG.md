@@ -5,6 +5,21 @@ All notable changes to `kibisis` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Rust: `FileLeaseCoordinator`, a lease coordinator for processes on one machine. Each resource's
+  lease lives in a small state file in a shared directory, and every acquire, renew and release holds
+  an operating-system lock on a companion lock file from reading the lease to writing its successor.
+  New state is written to a temporary file and renamed into place. Fencing tokens never go backwards:
+  a damaged state file, or one naming another resource, is an error rather than a fresh start. It
+  follows the same rules as `InMemoryLeaseCoordinator` and adds `get_lease` and
+  `validate_fencing_token`. Network filesystems are not supported.
+
+### Changed
+- Rust: the minimum supported Rust version is now 1.89 (was 1.85), for the standard library's file
+  locks (`File::lock`). The crate still has no dependencies.
+
 ## [0.1.0-alpha.5] - 2026-10-20
 
 ### Changed
