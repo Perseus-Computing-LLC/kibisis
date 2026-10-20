@@ -5,6 +5,7 @@
 [![CI](https://github.com/Perseus-Computing-LLC/kibisis/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Perseus-Computing-LLC/kibisis/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![MSRV: 1.85](https://img.shields.io/badge/MSRV-1.85-informational.svg)](Cargo.toml)
+[![M8ven Score](https://m8ven.ai/badge/mcp/perseus-computing-llc-kibisis-13szsu?v=c14fb7f48a3bfb2a15213c5988349ed2)](https://m8ven.ai/mcp/perseus-computing-llc-kibisis-13szsu?s=readme)
 
 Kibisis is one of the three [Telarch](https://telarch.ai) libraries from [Perseus Computing LLC](https://perseuscomputing.com). [Harpe](https://github.com/Perseus-Computing-LLC/harpe) decides what goes into each model call, and [Argus](https://github.com/Perseus-Computing-LLC/argus) keeps a tamper-evident record of what the agent did. Each one works on its own.
 
