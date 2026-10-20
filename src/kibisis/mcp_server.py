@@ -511,7 +511,7 @@ class KibisisMCPServer:
             "category": category,
             "key": key,
             "scope": self.scope,
-            "value_digest_prefix": digest[:12],
+            "value_digest_prefix": self.vault.stored_digest(digest)[:12],
             "note": (
                 "The text was removed from the vault, its search index and write-ahead log. A digest of the "
                 "value is kept, so writing, restoring or importing the same value again is refused."

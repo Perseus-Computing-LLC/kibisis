@@ -30,8 +30,10 @@ def tearDownModule():
 
 def _stored_values(vault):
     """Every value the vault holds, in every scope, live or archived, at any trust state."""
-    rows = vault._conn.execute("SELECT content, is_encrypted, encrypted_envelope_json FROM entities").fetchall()
-    return [vault._decrypt_content(r["encrypted_envelope_json"]) if r["is_encrypted"] else r["content"] for r in rows]
+    rows = vault._conn.execute(
+        "SELECT category, key, scope, content, is_encrypted, encrypted_envelope_json, tenant_sig FROM entities"
+    ).fetchall()
+    return [vault._open_entry(r) for r in rows]
 
 
 def _row_count(vault):

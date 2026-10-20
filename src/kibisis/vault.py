@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
+import inspect
 import json
 import logging
 import os
@@ -17,12 +19,31 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from .admission import AdmissionDecision, FactDisposition, MemoryAdmissionGate
-from .crypto import AESGCMCryptoEnvelopeProvider, sign_tenant_payload, verify_tenant_payload
+from .crypto import (
+    ENTRY_BINDING,
+    ENTRY_SIGNATURE_PREFIX,
+    TOMBSTONE_BINDING,
+    AESGCMCryptoEnvelopeProvider,
+    derive_integrity_keys,
+    entry_aad,
+    keyed_value_digest,
+    sign_entry,
+    sign_tenant_payload,
+    tombstone_aad,
+    verify_entry,
+    verify_tenant_payload,
+)
 from .keys import MIN_PASSPHRASE_LENGTH, resolve_passphrase
 from .models import AuditEvent, EncryptedEnvelope, EpistemicState, MemoryEntity, SearchResult
 from .protocols import CryptoEnvelopeProvider, EncryptionRequiredError, LeaseConflictError, LeaseCoordinator, MemoryVault
 
 logger = logging.getLogger(__name__)
+
+#: Integrity format this version writes (vault_meta 'integrity_format'). Format 2 binds sealed content
+#: to its entry, signs entries with a key derived by PBKDF2, keys the value digests kept in the journal
+#: and in tombstones, and refuses entries without a signature. A vault without the marker is upgraded
+#: the first time it is opened with its passphrase.
+INTEGRITY_FORMAT = 2
 
 
 def _sqlcipher_available() -> bool:
@@ -96,6 +117,55 @@ class ReviewedEntryError(PermissionError):
     """Raised when a capped (model-originated) write targets an entry a person verified or reviewed."""
 
 
+class EntryIntegrityError(PermissionError):
+    """Raised when a stored entry fails its integrity check: it has no signature, its signature does
+    not verify, or its sealed content does not belong to it. ``get`` raises it; ``search`` and
+    ``list_entities`` leave such an entry out."""
+
+
+def _require_aad_support(provider: Any) -> None:
+    """Fail at open, not at the first write, when a custom provider cannot bind content to its entry."""
+    for name in ("encrypt", "decrypt"):
+        try:
+            params = inspect.signature(getattr(provider, name)).parameters
+        except (TypeError, ValueError):
+            continue  # not introspectable; rely on the protocol
+        if "aad" not in params and not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            raise TypeError(
+                f"crypto_provider.{name} must accept an 'aad' keyword argument: Kibisis binds sealed content "
+                "to its entry as associated data"
+            )
+
+
+def _event_hash(
+    sequence: int,
+    timestamp: float,
+    action: str,
+    category: str,
+    key: str,
+    scope: str,
+    value_sha256: str,
+    prev_hash: str,
+    author_id: Optional[str],
+) -> str:
+    """The journal's hash of one event, as _record_audit_event and verify_audit_chain compute it."""
+    payload = f"{sequence}:{timestamp:.6f}:{action}:{category}:{key}:{scope}:{value_sha256}:{prev_hash}:{author_id or ''}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _rekey_metadata(metadata: Dict[str, Any], digest_key: bytes) -> bool:
+    """Key the plain digest a format 1 journal event keeps in its metadata, and drop digest prefixes."""
+    changed = False
+    if metadata.get("canonical_sha256"):
+        metadata["canonical_sha256"] = keyed_value_digest(digest_key, str(metadata["canonical_sha256"]))
+        changed = True
+    detail = metadata.get("detail")
+    if isinstance(detail, dict) and "value_digest_prefix" in detail:
+        del detail["value_digest_prefix"]  # a prefix of a plain digest cannot be keyed, and still leaks
+        changed = True
+    return changed
+
+
 def _is_reviewed(row: Any) -> bool:
     """True for an entry in the verified state or one that carries a person's review."""
     if row["epistemic_state"] == EpistemicState.VERIFIED.value:
@@ -134,6 +204,8 @@ class SQLiteMemoryVault(MemoryVault):
         changes nothing. Without it, a token is checked only when one is passed.
         """
         self.db_path = str(db_path)
+        if crypto_provider is not None:
+            _require_aad_support(crypto_provider)  # before anything touches the file
         self.coordinator = coordinator
         self.enforce_fencing = enforce_fencing
         self.auto_gate = auto_gate
@@ -152,9 +224,20 @@ class SQLiteMemoryVault(MemoryVault):
         self.passphrase = passphrase
         self.crypto_provider = crypto_provider
 
-        # Master key for post-retrieval HMAC tenant ownership checks (MemLeak defense)
+        # Integrity keys. With a passphrase, the signing and digest keys are derived from a PBKDF2 stretch
+        # of it once the vault's salt is known (below); _legacy_signing_key checks format 1 signatures
+        # during the upgrade. Without a passphrase nothing is secret: signatures catch only accidental
+        # damage, and value digests stay plain SHA-256.
         sig_seed = passphrase if passphrase else self.db_path
-        self._signing_key = hashlib.sha256(f"kibisis-tenant-sig:{sig_seed}".encode("utf-8")).digest()
+        self._legacy_signing_key = hashlib.sha256(f"kibisis-tenant-sig:{sig_seed}".encode("utf-8")).digest()
+        self._signing_key = self._legacy_signing_key
+        self._digest_key: Optional[bytes] = None
+        self._keyed = False
+        self._integrity_format = 1
+        self._converted_to_sqlcipher = False
+        self._was_keyed = False
+        #: Counts from the integrity upgrade this open performed, or None when none was needed.
+        self.integrity_upgrade: Optional[Dict[str, Any]] = None
 
         # Convert an existing plain SQLite file to SQLCipher when a passphrase is given. Without sqlcipher3 there
         # is nothing to convert with: the file stays plain SQLite and the first open that has sqlcipher3 converts it.
@@ -176,6 +259,7 @@ class SQLiteMemoryVault(MemoryVault):
             if hdr.startswith(b"SQLite format 3"):
                 # Migrate existing plaintext SQLite database to encrypted SQLCipher database
                 self._migrate_file_to_sqlcipher(self.db_path, passphrase)
+                self._converted_to_sqlcipher = True
 
         self._conn = sqlcipher3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         self._conn.row_factory = sqlcipher3.Row
@@ -196,8 +280,18 @@ class SQLiteMemoryVault(MemoryVault):
             self._conn.execute("PRAGMA secure_delete = ON;")
         self._configure_db()
         self._init_schema()
-        if passphrase and crypto_provider is None:
-            self.crypto_provider = AESGCMCryptoEnvelopeProvider(salt=self._vault_salt())
+        if passphrase:
+            self._was_keyed = self._has_meta_key("kdf_salt")  # written by an earlier open with a passphrase
+            salt = self._vault_salt()
+            if crypto_provider is None:
+                self.crypto_provider = AESGCMCryptoEnvelopeProvider(salt=salt)
+            self._signing_key, self._digest_key = derive_integrity_keys(passphrase, salt)
+            self._keyed = True
+            try:
+                self._upgrade_integrity()
+            except BaseException:
+                self._conn.close()
+                raise
         if on_disk:
             self._restrict_permissions()
 
@@ -311,17 +405,21 @@ class SQLiteMemoryVault(MemoryVault):
         the write-ahead log and free pages. Returns {"migrated": n, "remaining_plaintext": m}."""
         if self.crypto_provider is None or not self.passphrase:
             raise EncryptionRequiredError("migrate_plaintext needs a passphrase.")
-        rows = self._conn.execute("SELECT id, category, key, scope, content FROM entities WHERE is_encrypted = 0").fetchall()
+        rows = self._conn.execute(
+            "SELECT id, category, key, scope, content, is_encrypted, encrypted_envelope_json, tenant_sig "
+            "FROM entities WHERE is_encrypted = 0"
+        ).fetchall()
+        refused = 0
         with self._conn:
             for r in rows:
-                env = self.crypto_provider.encrypt(r["content"].encode("utf-8"), self.passphrase)
-                new_sig = sign_tenant_payload(self._signing_key, r["scope"], f"{r['category']}:{r['key']}", r["content"])
-                self._conn.execute(
-                    "UPDATE entities SET content = '', is_encrypted = 1, encrypted_envelope_json = ?, tenant_sig = ? WHERE id = ?",
-                    (env.model_dump_json(), new_sig, r["id"]),
-                )
+                try:
+                    content = self._open_entry(r)  # never seal content that fails its signature check
+                except EntryIntegrityError:
+                    refused += 1
+                    continue
+                self._write_sealed(self._conn, r, content, encrypt=True)
         self.scrub()
-        return {"migrated": len(rows), "remaining_plaintext": self.encryption_status()["plaintext"]}
+        return {"migrated": len(rows) - refused, "remaining_plaintext": self.encryption_status()["plaintext"]}
 
     def _configure_db(self) -> None:
         if self.db_path != ":memory:":
@@ -459,6 +557,10 @@ class SQLiteMemoryVault(MemoryVault):
                 self._conn.execute("ALTER TABLE rejected_value_tombstones ADD COLUMN canonical_sha256 TEXT NOT NULL DEFAULT ''")
             if "scope" not in tomb_cols:
                 self._conn.execute("ALTER TABLE rejected_value_tombstones ADD COLUMN scope TEXT NOT NULL DEFAULT 'default'")
+            if "sealed_digests" not in tomb_cols:
+                # A vault with a passphrase keeps a tombstone's plain digests sealed here, so a snapshot can
+                # carry the tombstone to another vault that has the same passphrase.
+                self._conn.execute("ALTER TABLE rejected_value_tombstones ADD COLUMN sealed_digests TEXT DEFAULT NULL")
 
             self._conn.execute(
                 """
@@ -561,14 +663,398 @@ class SQLiteMemoryVault(MemoryVault):
             metadata=meta_dict,
         )
 
-    def _decrypt_content(self, envelope_json: Optional[str]) -> str:
-        if not envelope_json:
-            return ""
+    # Integrity: sealing, signing and checking entries, keyed digests, and the format 2 upgrade.
+
+    def _sign(self, scope: str, category: str, key: str, content: str) -> str:
+        if self._keyed:
+            return sign_entry(self._signing_key, scope, category, key, content)
+        return sign_tenant_payload(self._signing_key, scope, f"{category}:{key}", content)
+
+    def _seal(
+        self, scope: str, category: str, key: str, content: str, *, encrypt: bool
+    ) -> Tuple[str, int, Optional[str], str]:
+        """(stored content, is_encrypted, envelope JSON, signature) for an entry. Sealed content is bound
+        to the entry's scope, category and key, and its plaintext column is left empty."""
+        signature = self._sign(scope, category, key, content)
+        if not encrypt:
+            return content, 0, None, signature
         if self.crypto_provider is None or not self.passphrase:
-            raise PermissionError("Entity is encrypted, but vault has no crypto provider or passphrase configured.")
-        envelope = EncryptedEnvelope.model_validate_json(envelope_json)
-        decrypted_bytes = self.crypto_provider.decrypt(envelope, self.passphrase)
-        return decrypted_bytes.decode("utf-8")
+            raise EncryptionRequiredError("Sealing an entry needs a crypto provider and a passphrase.")
+        envelope = self.crypto_provider.encrypt(
+            content.encode("utf-8"), self.passphrase, aad=entry_aad(scope, category, key)
+        )
+        return "", 1, envelope.model_copy(update={"binding": ENTRY_BINDING}).model_dump_json(), signature
+
+    def _write_sealed(self, cursor: Any, r: Any, content: str, *, encrypt: bool) -> None:
+        """Re-seal and re-sign stored row ``r`` (with id, scope, category and key) to hold ``content``."""
+        stored, is_encrypted, envelope_json, signature = self._seal(
+            r["scope"], r["category"], r["key"], content, encrypt=encrypt
+        )
+        cursor.execute(
+            "UPDATE entities SET content = ?, is_encrypted = ?, encrypted_envelope_json = ?, tenant_sig = ? WHERE id = ?",
+            (stored, is_encrypted, envelope_json, signature, r["id"]),
+        )
+
+    def _open_entry(self, r: Any) -> str:
+        """Content of a stored row, after its integrity checks.
+
+        Raises :class:`EntryIntegrityError` when the row lacks a valid signature (a vault with a
+        passphrase refuses unsigned rows) or its sealed content was not sealed for this entry, and a
+        plain ``PermissionError`` when the row is sealed and this vault has no key.
+        """
+        scope, category, key = r["scope"], r["category"], r["key"]
+        where = f"'{category}:{key}' [scope={scope}]"
+        if r["is_encrypted"] == 1:
+            if self.crypto_provider is None or not self.passphrase:
+                raise PermissionError("Entity is encrypted, but vault has no crypto provider or passphrase configured.")
+            try:
+                envelope = EncryptedEnvelope.model_validate_json(r["encrypted_envelope_json"] or "")
+            except ValueError as exc:
+                raise EntryIntegrityError(f"Integrity check failed: {where} has no readable sealed content") from exc
+            if envelope.binding != ENTRY_BINDING:
+                raise EntryIntegrityError(f"Integrity check failed: the sealed content of {where} is not bound to it")
+            try:
+                content = self.crypto_provider.decrypt(
+                    envelope, self.passphrase, aad=entry_aad(scope, category, key)
+                ).decode("utf-8")
+            except Exception as exc:
+                raise EntryIntegrityError(
+                    f"Integrity check failed: the sealed content of {where} was not sealed for it, or is damaged"
+                ) from exc
+        else:
+            content = r["content"]
+        signature = r["tenant_sig"]
+        if self._keyed:
+            if not verify_entry(self._signing_key, scope, category, key, content, signature):
+                problem = "has no signature" if not signature else "has an invalid signature"
+                raise EntryIntegrityError(f"Integrity check failed: {where} {problem}")
+        elif signature and not verify_tenant_payload(self._signing_key, scope, f"{category}:{key}", content, signature):
+            raise EntryIntegrityError(f"Integrity check failed: {where} has an invalid signature")
+        return content
+
+    def _readable_content(self, r: Any) -> Optional[str]:
+        """Content for search and listing: None when the row fails its integrity check (leave it out),
+        "[ENCRYPTED]" when it is sealed and this vault has no key to open it."""
+        try:
+            return self._open_entry(r)
+        except EntryIntegrityError:
+            return None
+        except PermissionError:
+            return "[ENCRYPTED]"
+
+    def _open_legacy(self, r: Any) -> str:
+        """Content of a row as integrity format 1 stored it (sealed without binding). Upgrade use only."""
+        if r["is_encrypted"] != 1:
+            return r["content"]
+        envelope = EncryptedEnvelope.model_validate_json(r["encrypted_envelope_json"] or "")
+        aad = entry_aad(r["scope"], r["category"], r["key"]) if envelope.binding == ENTRY_BINDING else None
+        assert self.crypto_provider is not None and self.passphrase
+        return self.crypto_provider.decrypt(envelope, self.passphrase, aad=aad).decode("utf-8")
+
+    def _digests(self, value: str) -> Tuple[str, str]:
+        """(exact, canonical) digests of a value as this vault stores them: keyed when it has a passphrase."""
+        exact, canonical = value_digests(value)
+        if self._digest_key is None:
+            return exact, canonical
+        return keyed_value_digest(self._digest_key, exact), keyed_value_digest(self._digest_key, canonical)
+
+    def _digest_key_id(self) -> Optional[str]:
+        """Short public identifier of the digest key, so snapshot digests can be matched to their vault."""
+        if self._digest_key is None:
+            return None
+        return hmac.new(self._digest_key, b"kibisis digest key id", hashlib.sha256).hexdigest()[:16]
+
+    def stored_digest(self, sha256_hex: str) -> str:
+        """The form in which this vault stores a value's SHA-256 hex digest in its journal and tombstones:
+        keyed when the vault has a passphrase, unchanged otherwise."""
+        return keyed_value_digest(self._digest_key, sha256_hex) if self._digest_key is not None else sha256_hex
+
+    def _stored_digests(self, exact: str, canonical: str) -> Tuple[str, str]:
+        return self.stored_digest(exact), self.stored_digest(canonical)
+
+    def _seal_digests(self, scope: str, category: str, key: str, exact: str, canonical: str) -> Optional[str]:
+        """A tombstone's plain digests, sealed and bound to the tombstone, so a snapshot can carry them to
+        another vault with the same passphrase. None in a vault without a passphrase."""
+        if not self._keyed or self.crypto_provider is None or not self.passphrase:
+            return None
+        envelope = self.crypto_provider.encrypt(
+            json.dumps([exact, canonical]).encode("utf-8"), self.passphrase, aad=tombstone_aad(scope, category, key)
+        )
+        return envelope.model_copy(update={"binding": TOMBSTONE_BINDING}).model_dump_json()
+
+    def _unseal_digests(self, scope: str, category: str, key: str, sealed: str) -> Optional[Tuple[str, str]]:
+        """Plain digests of a sealed tombstone (this vault's, or another's with the same passphrase), or None."""
+        if self.crypto_provider is None or not self.passphrase:
+            return None
+        try:
+            envelope = EncryptedEnvelope.model_validate_json(sealed)
+            plain = self.crypto_provider.decrypt(envelope, self.passphrase, aad=tombstone_aad(scope, category, key))
+            exact, canonical = json.loads(plain)
+            return str(exact), str(canonical)
+        except Exception:
+            return None
+
+    def _has_meta_key(self, key: str) -> bool:
+        try:
+            return self._meta(key) is not None
+        except sqlcipher3.OperationalError:
+            return False  # no vault_meta table: the vault was never opened with a passphrase
+
+    def _key_check_value(self) -> str:
+        return hmac.new(self._signing_key, b"kibisis key check v2", hashlib.sha256).hexdigest()
+
+    def _meta(self, key: str) -> Any:
+        row = self._conn.execute("SELECT value FROM vault_meta WHERE key = ?", (key,)).fetchone()
+        return None if row is None else row[0]
+
+    @staticmethod
+    def _set_meta(cursor: Any, key: str, value: Any) -> None:
+        cursor.execute("INSERT OR REPLACE INTO vault_meta (key, value) VALUES (?, ?)", (key, value))
+
+    def _upgrade_integrity(self) -> None:
+        """Bring an older vault up to INTEGRITY_FORMAT, then check the passphrase against the key check."""
+        if int(self._meta("integrity_format") or 0) < INTEGRITY_FORMAT:
+            self.integrity_upgrade = self._migrate_integrity()
+        stored = self._meta("key_check")
+        if stored is not None and not hmac.compare_digest(str(stored), self._key_check_value()):
+            raise ValueError("Failed to authenticate or decrypt vault database with provided passphrase")
+        self._integrity_format = INTEGRITY_FORMAT
+
+    def _migrate_integrity(self) -> Optional[Dict[str, Any]]:
+        """Upgrade a vault written by Kibisis 0.1.0a5 or earlier to integrity format 2, in one transaction.
+
+        Entries: each entry whose format 1 signature verifies is re-sealed with its scope, category and
+        key bound to the ciphertext and signed with the PBKDF2-derived key. An entry without a signature
+        is adopted only when the file was SQLCipher-encrypted before this open, because then nothing
+        without the passphrase could have removed a signature; otherwise it stays as it is and reads
+        refuse it until :meth:`adopt_unsigned_entries`. Entries whose signature fails, or whose content
+        does not decrypt, are left untouched and refused. Journal and tombstones: every plain SHA-256
+        value digest becomes its keyed form, the journal's hashes are recomputed in order, and digest
+        prefixes in refusal records are dropped. A ``migrate`` event records the counts, the old chain
+        head and whether the old chain verified. Returns the counts, or None for an empty vault.
+        """
+        counts: Dict[str, Any] = {
+            "entries_resealed": 0,
+            "entries_adopted_unsigned": 0,
+            "entries_left_unsigned": 0,
+            "entries_failed_signature": 0,
+            "entries_undecryptable": 0,
+            "tombstones_rekeyed": 0,
+            "journal_events_rekeyed": 0,
+        }
+        digest_key = self._digest_key
+        assert digest_key is not None
+        trust_unsigned = self._sqlcipher_active and not self._converted_to_sqlcipher
+        with self._conn:
+            cursor = self._conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            if int(self._meta("integrity_format") or 0) >= INTEGRITY_FORMAT:
+                return None  # another process upgraded it first
+            rows = cursor.execute(
+                "SELECT id, category, key, scope, content, is_encrypted, encrypted_envelope_json, tenant_sig FROM entities"
+            ).fetchall()
+            tombstones = cursor.execute(
+                "SELECT id, category, key, scope, value_sha256, canonical_sha256 FROM rejected_value_tombstones"
+            ).fetchall()
+            events = cursor.execute(
+                "SELECT sequence, timestamp, action, category, key, scope, value_sha256, prev_hash, event_hash, "
+                "author_id, metadata_json FROM audit_journal ORDER BY sequence ASC"
+            ).fetchall()
+            if not (rows or tombstones or events):
+                self._set_meta(cursor, "integrity_format", INTEGRITY_FORMAT)
+                self._set_meta(cursor, "key_check", self._key_check_value())
+                return None
+
+            # A vault that never had a passphrase holds only plaintext entries, signed (if at all) with a key
+            # anyone can compute, so its first open with a passphrase is where trust starts: adopt them.
+            # Otherwise decide every entry before changing anything, and stop under a wrong passphrase: an
+            # upgrade under the wrong key would re-key the tombstones and the journal beyond repair.
+            was_keyed = self._was_keyed or any(r["is_encrypted"] == 1 for r in rows)
+            if not was_keyed:
+                counts["entries_adopted_from_keyless_vault"] = 0
+            reseal: List[Tuple[Any, str]] = []
+            opened = verified = 0
+            for r in rows:
+                try:
+                    content = self._open_legacy(r)
+                except Exception:
+                    counts["entries_undecryptable"] += 1
+                    continue
+                if not was_keyed:
+                    counts["entries_adopted_from_keyless_vault"] += 1
+                    reseal.append((r, content))
+                    continue
+                opened += int(r["is_encrypted"] == 1)
+                signature = r["tenant_sig"]
+                if signature:
+                    entity_id = f"{r['category']}:{r['key']}"
+                    if not verify_tenant_payload(self._legacy_signing_key, r["scope"], entity_id, content, signature):
+                        counts["entries_failed_signature"] += 1
+                        continue
+                    verified += 1
+                elif trust_unsigned:
+                    counts["entries_adopted_unsigned"] += 1
+                else:
+                    counts["entries_left_unsigned"] += 1
+                    continue
+                reseal.append((r, content))
+            sealed_rows = sum(1 for r in rows if r["is_encrypted"] == 1)
+            signed_rows = sum(1 for r in rows if r["tenant_sig"])
+            if was_keyed and ((sealed_rows and not opened) or (signed_rows and not verified)):
+                raise ValueError("Failed to authenticate or decrypt vault database with provided passphrase")
+
+            for r, content in reseal:
+                self._write_sealed(cursor, r, content, encrypt=r["is_encrypted"] == 1)
+                counts["entries_resealed"] += 1
+
+            for t in tombstones:
+                exact, canonical = t["value_sha256"], t["canonical_sha256"] or ""
+                cursor.execute(
+                    "UPDATE rejected_value_tombstones SET value_sha256 = ?, canonical_sha256 = ?, sealed_digests = ? "
+                    "WHERE id = ?",
+                    (
+                        keyed_value_digest(digest_key, exact),
+                        keyed_value_digest(digest_key, canonical),
+                        self._seal_digests(t["scope"], t["category"], t["key"], exact, canonical),
+                        t["id"],
+                    ),
+                )
+                counts["tombstones_rekeyed"] += 1
+
+            old_head = events[-1]["event_hash"] if events else "0" * 64
+            chain_was_valid, expected_prev = True, "0" * 64
+            for ev in events:
+                recomputed = _event_hash(
+                    ev["sequence"], ev["timestamp"], ev["action"], ev["category"], ev["key"], ev["scope"],
+                    ev["value_sha256"], ev["prev_hash"], ev["author_id"],
+                )
+                if ev["prev_hash"] != expected_prev or recomputed != ev["event_hash"]:
+                    chain_was_valid = False
+                    break
+                expected_prev = ev["event_hash"]
+            prev_hash = "0" * 64
+            for ev in events:
+                value = keyed_value_digest(digest_key, ev["value_sha256"])
+                metadata = json.loads(ev["metadata_json"] or "{}")
+                if _rekey_metadata(metadata, digest_key) or value != ev["value_sha256"]:
+                    counts["journal_events_rekeyed"] += 1
+                event_hash = _event_hash(
+                    ev["sequence"], ev["timestamp"], ev["action"], ev["category"], ev["key"], ev["scope"],
+                    value, prev_hash, ev["author_id"],
+                )
+                cursor.execute(
+                    "UPDATE audit_journal SET value_sha256 = ?, prev_hash = ?, event_hash = ?, metadata_json = ? "
+                    "WHERE sequence = ?",
+                    (value, prev_hash, event_hash, json.dumps(metadata, sort_keys=True), ev["sequence"]),
+                )
+                prev_hash = event_hash
+            if not chain_was_valid:
+                logger.warning(
+                    "%s: the audit journal did not verify before the integrity upgrade; the upgrade's "
+                    "migrate event records this and the old chain head",
+                    self.db_path,
+                )
+            self._record_audit_event(
+                cursor=cursor,
+                action="migrate",
+                category="",
+                key="",
+                scope="*",
+                value_sha256="",
+                metadata={
+                    "integrity_format": INTEGRITY_FORMAT,
+                    "previous_head": old_head,
+                    "previous_chain_valid": chain_was_valid,
+                    **counts,
+                },
+            )
+            self._set_meta(cursor, "integrity_format", INTEGRITY_FORMAT)
+            if opened or verified or self._sqlcipher_active or not was_keyed:
+                self._set_meta(cursor, "key_check", self._key_check_value())
+        if counts["entries_left_unsigned"]:
+            logger.warning(
+                "%s: %d entries have no signature and the file had no whole-file encryption, so they cannot "
+                "be told apart from tampered entries; reads refuse them until adopt_unsigned_entries() "
+                "accepts them",
+                self.db_path,
+                counts["entries_left_unsigned"],
+            )
+        if self.db_path != ":memory:":
+            self.scrub()  # drop the replaced digests and envelopes from free pages and the write-ahead log
+        return counts
+
+    def integrity_status(self) -> Dict[str, int]:
+        """Counts of stored entries that reads refuse, found without decrypting anything (for a vault
+        opened with its passphrase): ``unsigned`` (no signature), ``legacy_signature`` (a format 1
+        signature) and ``unbound`` (sealed before format 2)."""
+        rows = self._conn.execute("SELECT tenant_sig, is_encrypted, encrypted_envelope_json FROM entities").fetchall()
+
+        def unbound(r: Any) -> bool:
+            try:
+                return json.loads(r["encrypted_envelope_json"] or "{}").get("binding") != ENTRY_BINDING
+            except ValueError:
+                return True
+
+        return {
+            "integrity_format": self._integrity_format,
+            "entries": len(rows),
+            "unsigned": sum(1 for r in rows if not r["tenant_sig"]),
+            "legacy_signature": sum(
+                1 for r in rows if r["tenant_sig"] and not str(r["tenant_sig"]).startswith(ENTRY_SIGNATURE_PREFIX)
+            ),
+            "unbound": sum(1 for r in rows if r["is_encrypted"] == 1 and unbound(r)),
+        }
+
+    def adopt_unsigned_entries(self, scope: Optional[str] = None, author_id: Optional[str] = None) -> int:
+        """Sign, and bind to their entries, stored entries that carry no signature, after a person has
+        checked them. Returns how many were adopted; each is journaled as an ``adopt`` event.
+
+        Needed only for a vault upgraded from Kibisis 0.1.0a5 or earlier that ran without SQLCipher and
+        holds entries written before signatures existed, or plaintext entries written while it had no
+        passphrase. Kibisis cannot tell such an entry from one whose signature was removed or forged, so
+        reads refuse it until it is adopted. Entries whose format 1 signature verifies under no key are
+        damaged or tampered and are never adopted. ``scope`` limits adoption to one scope (``None`` or
+        ``"*"``: every scope).
+        """
+        if not self._keyed:
+            raise EncryptionRequiredError("adopt_unsigned_entries needs a vault opened with its passphrase.")
+        keyless_key = hashlib.sha256(f"kibisis-tenant-sig:{self.db_path}".encode("utf-8")).digest()
+        sql = (
+            "SELECT id, category, key, scope, content, is_encrypted, encrypted_envelope_json, tenant_sig "
+            "FROM entities WHERE (tenant_sig IS NULL OR tenant_sig = '' OR tenant_sig NOT LIKE 'v2:%')"
+        )
+        params: List[Any] = []
+        if scope not in (None, "*"):
+            sql += " AND scope = ?"
+            params.append(scope)
+        adopted = 0
+        with self._conn:
+            cursor = self._conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            for r in cursor.execute(sql, params).fetchall():
+                try:
+                    content = self._open_legacy(r)
+                except Exception:
+                    continue  # does not decrypt under this passphrase: nothing to adopt
+                signature, entity_id = r["tenant_sig"], f"{r['category']}:{r['key']}"
+                if signature and not any(
+                    verify_tenant_payload(k, r["scope"], entity_id, content, signature)
+                    for k in (keyless_key, self._legacy_signing_key)
+                ):
+                    continue
+                self._write_sealed(cursor, r, content, encrypt=r["is_encrypted"] == 1)
+                self._record_audit_event(
+                    cursor=cursor,
+                    action="adopt",
+                    category=r["category"],
+                    key=r["key"],
+                    scope=r["scope"],
+                    value_sha256=self._digests(content)[0],
+                    author_id=author_id,
+                    metadata={"reason": "unsigned entry accepted by a person"},
+                )
+                adopted += 1
+        return adopted
 
     def _put(
         self,
@@ -638,7 +1124,7 @@ class SQLiteMemoryVault(MemoryVault):
                 valid_from = now
 
         meta_str = json.dumps(meta, sort_keys=True)
-        val_hash, can_hash = value_digests(content)
+        val_hash, can_hash = self._digests(content)
 
         with self._conn:
             cursor = self._conn.cursor()
@@ -717,21 +1203,13 @@ class SQLiteMemoryVault(MemoryVault):
                         author_id=author_id,
                     )
 
-            is_encrypted = 0
-            stored_content = content
-            envelope_json: Optional[str] = None
-
-            if self.crypto_provider is not None:
-                if not self.passphrase:
-                    raise ValueError("Crypto provider configured but no passphrase supplied to SQLiteMemoryVault.")
-                envelope = self.crypto_provider.encrypt(content.encode("utf-8"), self.passphrase)
-                envelope_json = envelope.model_dump_json()
-                is_encrypted = 1
-                # Plaintext is zeroed out to prevent leaking into entities or FTS index
-                stored_content = ""
-
-            # Cryptographic tenant signature for MemLeak isolation
-            tenant_sig = sign_tenant_payload(self._signing_key, scope, f"{category}:{key}", content)
+            if self.crypto_provider is not None and not self.passphrase:
+                raise ValueError("Crypto provider configured but no passphrase supplied to SQLiteMemoryVault.")
+            # Sealed content is bound to this entry, and its plaintext column stays empty so nothing leaks
+            # into the entities table or the FTS index. The signature covers the entry either way.
+            stored_content, is_encrypted, envelope_json, tenant_sig = self._seal(
+                scope, category, key, content, encrypt=self.crypto_provider is not None
+            )
 
             cursor.execute(
                 "SELECT id, version, created_at, supersedes, superseded_by FROM entities WHERE category = ? AND key = ? AND scope = ?",
@@ -1047,16 +1525,9 @@ class SQLiteMemoryVault(MemoryVault):
         if row is None:
             return None
 
-        if row["is_encrypted"] == 1:
-            content = self._decrypt_content(row["encrypted_envelope_json"])
-        else:
-            content = row["content"]
-
+        content = self._open_entry(row)  # raises EntryIntegrityError for a tampered or unsigned entry
         row_keys = row.keys()
-        sig = row["tenant_sig"] if "tenant_sig" in row_keys else None
-        if sig:
-            if not verify_tenant_payload(self._signing_key, row["scope"], f"{row['category']}:{row['key']}", content, sig):
-                raise PermissionError(f"MemLeak validation failure: invalid tenant signature for key '{key}' in scope '{scope}'.")
+        sig = row["tenant_sig"]
 
         return MemoryEntity(
             id=row["id"],
@@ -1262,19 +1733,10 @@ class SQLiteMemoryVault(MemoryVault):
         matched_ids = set()
         for r in rows:
             matched_ids.add(r["id"])
-            if r["is_encrypted"] == 1:
-                try:
-                    content = self._decrypt_content(r["encrypted_envelope_json"])
-                except Exception:
-                    content = "[ENCRYPTED]"
-            else:
-                content = r["content"]
-
-            sig = r["tenant_sig"] if "tenant_sig" in r.keys() else None
-            if sig and content != "[ENCRYPTED]":
-                if not verify_tenant_payload(self._signing_key, r["scope"], f"{r['category']}:{r['key']}", content, sig):
-                    # Cross-tenant corruption or tamper detected; skip tainted entity
-                    continue
+            content = self._readable_content(r)
+            if content is None:
+                continue  # failed its integrity check: tampered, damaged, or moved from another entry
+            sig = r["tenant_sig"]
 
             entity = MemoryEntity(
                 id=r["id"],
@@ -1384,19 +1846,10 @@ class SQLiteMemoryVault(MemoryVault):
 
         items = []
         for r in cursor.fetchall():
-            if r["is_encrypted"] == 1:
-                try:
-                    content = self._decrypt_content(r["encrypted_envelope_json"])
-                except Exception:
-                    content = "[ENCRYPTED]"
-            else:
-                content = r["content"]
-
-            sig = r["tenant_sig"] if "tenant_sig" in r.keys() else None
-            if sig and content != "[ENCRYPTED]":
-                if not verify_tenant_payload(self._signing_key, r["scope"], f"{r['category']}:{r['key']}", content, sig):
-                    # Cross-tenant corruption or tamper detected; skip tainted entity
-                    continue
+            content = self._readable_content(r)
+            if content is None:
+                continue  # failed its integrity check: tampered, damaged, or moved from another entry
+            sig = r["tenant_sig"]
 
             items.append(
                 MemoryEntity(
@@ -1454,16 +1907,19 @@ class SQLiteMemoryVault(MemoryVault):
         value retrievable. Each deletion is journaled in the caller's transaction.
         """
         if scope == "*":
-            cursor.execute("SELECT id, category, key, scope, content, is_encrypted, encrypted_envelope_json FROM entities")
+            cursor.execute("SELECT id, category, key, scope, content, is_encrypted, encrypted_envelope_json, tenant_sig FROM entities")
         else:
             cursor.execute(
-                "SELECT id, category, key, scope, content, is_encrypted, encrypted_envelope_json FROM entities WHERE scope = ?",
+                "SELECT id, category, key, scope, content, is_encrypted, encrypted_envelope_json, tenant_sig FROM entities WHERE scope = ?",
                 (scope,),
             )
         purged = 0
         for row in cursor.fetchall():
-            content = self._decrypt_content(row["encrypted_envelope_json"]) if row["is_encrypted"] == 1 else row["content"]
-            exact, canonical = value_digests(content)
+            try:
+                content = self._open_entry(row)
+            except PermissionError:
+                continue  # an entry that cannot be opened cannot be compared, and is never returned
+            exact, canonical = self._digests(content)
             if exact != val_hash and not (can_hash and canonical == can_hash):
                 continue
             cursor.execute("DELETE FROM entities WHERE id = ?", (row["id"],))
@@ -1496,7 +1952,8 @@ class SQLiteMemoryVault(MemoryVault):
 
         Purges the entity at ``category:key`` and every other copy of the value in the scope
         (all scopes when ``scope`` is ``'*'``). Later writes of the value, or of a look-alike that
-        canonicalizes to it, are refused under any category or key in the scope.
+        canonicalizes to it, are refused under any category or key in the scope. Returns the value's
+        SHA-256 hex digest; a vault with a passphrase stores it keyed (see :meth:`stored_digest`).
         """
         now = time.time()
         with self._conn:
@@ -1504,28 +1961,31 @@ class SQLiteMemoryVault(MemoryVault):
             self._fence(cursor, fencing_token, resource, holder_id)
             if content is None:
                 cursor.execute(
-                    "SELECT content, is_encrypted, encrypted_envelope_json FROM entities WHERE category = ? AND key = ? AND scope = ?",
+                    "SELECT category, key, scope, content, is_encrypted, encrypted_envelope_json, tenant_sig FROM entities "
+                    "WHERE category = ? AND key = ? AND scope = ?",
                     (category, key, scope),
                 )
                 row = cursor.fetchone()
                 if row is None:
                     raise KeyError(f"Entity not found: {category}:{key} [scope={scope}]")
-                if row["is_encrypted"] == 1:
-                    content = self._decrypt_content(row["encrypted_envelope_json"])
-                else:
-                    content = row["content"]
+                content = self._open_entry(row)
 
             assert content is not None
-            val_hash, can_hash = value_digests(content)
+            plain_exact, plain_canonical = value_digests(content)
+            val_hash, can_hash = self._stored_digests(plain_exact, plain_canonical)
 
             cursor.execute(
                 """
                 INSERT OR REPLACE INTO rejected_value_tombstones (
-                    category, key, value_sha256, canonical_sha256, reason, author_id, created_at, scope
+                    category, key, value_sha256, canonical_sha256, reason, author_id, created_at, scope,
+                    sealed_digests
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (category, key, val_hash, can_hash, reason, author_id, now, scope),
+                (
+                    category, key, val_hash, can_hash, reason, author_id, now, scope,
+                    self._seal_digests(scope, category, key, plain_exact, plain_canonical),
+                ),
             )
             # Physical purge of the entity (the FTS index follows through triggers)
             cursor.execute("DELETE FROM entities WHERE category = ? AND key = ? AND scope = ?", (category, key, scope))
@@ -1542,7 +2002,7 @@ class SQLiteMemoryVault(MemoryVault):
                 metadata={"reason": reason, "canonical_sha256": can_hash},
             )
             self._purge_value_copies(cursor, scope, val_hash, can_hash, author_id, f"{category}:{key}")
-            return val_hash
+            return plain_exact
 
     def is_tombstoned(
         self,
@@ -1556,7 +2016,7 @@ class SQLiteMemoryVault(MemoryVault):
         ``category`` and ``key`` are accepted for compatibility but do not narrow the check: a
         tombstoned value is rejected under every category and key in its scope.
         """
-        val_hash, can_hash = value_digests(content)
+        val_hash, can_hash = self._digests(content)
         return self._find_tombstone(self._conn.cursor(), scope, val_hash, can_hash) is not None
 
     def list_tombstones(
@@ -1811,8 +2271,12 @@ class SQLiteMemoryVault(MemoryVault):
         """Validate cryptographic HMAC ownership of an entity against expected scope (MemLeak defense)."""
         if entity.scope != expected_scope:
             return False
+        if self._keyed:
+            return verify_entry(
+                self._signing_key, entity.scope, entity.category, entity.key, entity.content, entity.tenant_sig
+            )
         if not entity.tenant_sig:
-            return True
+            return True  # a vault without a passphrase has no secret to sign with
         return verify_tenant_payload(
             self._signing_key,
             entity.scope,
@@ -1858,11 +2322,13 @@ class SQLiteMemoryVault(MemoryVault):
 
         raw_entities = cursor.fetchall()
         entities_data = []
+        unreadable = 0
         for r in raw_entities:
-            if r["is_encrypted"] == 1:
-                content = self._decrypt_content(r["encrypted_envelope_json"])
-            else:
-                content = r["content"]
+            try:
+                content = self._open_entry(r)
+            except EntryIntegrityError:
+                unreadable += 1  # failed its integrity check; never exported
+                continue
             entities_data.append({
                 "category": r["category"],
                 "key": r["key"],
@@ -1880,7 +2346,8 @@ class SQLiteMemoryVault(MemoryVault):
 
         cursor.execute(
             """
-            SELECT category, key, value_sha256, canonical_sha256, reason, author_id, created_at, scope
+            SELECT category, key, value_sha256, canonical_sha256, reason, author_id, created_at, scope,
+                   sealed_digests
             FROM rejected_value_tombstones
             ORDER BY category, key, scope
             """
@@ -1895,6 +2362,7 @@ class SQLiteMemoryVault(MemoryVault):
                 "author_id": r["author_id"],
                 "created_at": r["created_at"],
                 "scope": r["scope"],
+                "sealed_digests": r["sealed_digests"],
             }
             for r in cursor.fetchall()
         ]
@@ -1903,9 +2371,15 @@ class SQLiteMemoryVault(MemoryVault):
         events_data = [ev.model_dump() for ev in audit_events]
 
         snapshot: Dict[str, Any] = {
-            "format_version": "1.0",
+            "format_version": "1.1",
             "exported_at": time.time(),
             "scope": scope or "*",
+            # Tombstone and journal digests: plain SHA-256 in a vault without a passphrase, otherwise keyed
+            # to this vault (digest_key_id). A tombstone's sealed_digests let a vault with the same
+            # passphrase re-key it on import.
+            "digest_scheme": "hmac-sha256" if self._digest_key is not None else "sha256",
+            "digest_key_id": self._digest_key_id(),
+            "unreadable_entity_count": unreadable,
             "entity_count": len(entities_data),
             "tombstone_count": len(tombstones_data),
             "audit_event_count": len(events_data),
@@ -1964,26 +2438,47 @@ class SQLiteMemoryVault(MemoryVault):
                 raise ValueError(f"Snapshot integrity violation: manifest mismatch {recomputed} != {manifest_sha}")
 
         imported_count = 0
+        foreign_tombstones = 0
+        scheme = data.get("digest_scheme", "sha256")
+        same_key = (
+            scheme == "hmac-sha256" and self._digest_key is not None and data.get("digest_key_id") == self._digest_key_id()
+        )
         with self._conn:
             cursor = self._conn.cursor()
             self._fence(cursor, fencing_token, resource, holder_id)
             for ts in data.get("tombstones", []):
+                t_scope, t_category, t_key = ts.get("scope", "default"), ts["category"], ts["key"]
+                exact, canonical = ts["value_sha256"], ts.get("canonical_sha256", "")
+                sealed = ts.get("sealed_digests")
+                if not same_key:
+                    plain: Optional[Tuple[str, str]] = None
+                    if scheme == "sha256":
+                        plain = (exact, canonical)
+                    elif sealed and self._keyed:
+                        plain = self._unseal_digests(t_scope, t_category, t_key, sealed)
+                    if plain is None:
+                        foreign_tombstones += 1  # from a vault with another passphrase: it cannot match here
+                        continue
+                    exact, canonical = self._stored_digests(*plain)
+                    sealed = self._seal_digests(t_scope, t_category, t_key, *plain)
                 cursor.execute(
                     """
                     INSERT OR IGNORE INTO rejected_value_tombstones (
-                        category, key, value_sha256, canonical_sha256, reason, author_id, created_at, scope
+                        category, key, value_sha256, canonical_sha256, reason, author_id, created_at, scope,
+                        sealed_digests
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        ts["category"],
-                        ts["key"],
-                        ts["value_sha256"],
-                        ts.get("canonical_sha256", ""),
+                        t_category,
+                        t_key,
+                        exact,
+                        canonical,
                         ts.get("reason", "imported"),
                         ts.get("author_id"),
                         ts.get("created_at", time.time()),
-                        ts.get("scope", "default"),
+                        t_scope,
+                        sealed,
                     ),
                 )
             if clear_existing:
@@ -2003,9 +2498,21 @@ class SQLiteMemoryVault(MemoryVault):
                 # from the (now empty) content table rather than deleting index rows directly.
                 cursor.execute("INSERT INTO entities_fts(entities_fts) VALUES('rebuild')")
 
+        if foreign_tombstones:
+            logger.warning(
+                "import_snapshot: %d tombstones come from a vault with another passphrase and cannot apply here",
+                foreign_tombstones,
+            )
+            self.record_refusal(
+                path="import_snapshot",
+                reason="tombstones from a vault with another passphrase",
+                scope="*",
+                detail={"tombstones": foreign_tombstones},
+            )
+
         for ent_data in data.get("entities", []):
             scope = ent_data.get("scope", "default")
-            val_hash, can_hash = value_digests(ent_data["content"])
+            val_hash, can_hash = self._digests(ent_data["content"])
             if self._find_tombstone(self._conn.cursor(), scope, val_hash, can_hash) is not None:
                 self.record_refusal(
                     path="import_snapshot",

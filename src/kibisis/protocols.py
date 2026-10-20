@@ -25,12 +25,16 @@ class LeaseConflictError(LeaseError):
 class CryptoEnvelopeProvider(Protocol):
     """Cryptographic provider for encrypting and decrypting envelopes."""
 
-    def encrypt(self, plaintext: bytes, passphrase: str) -> EncryptedEnvelope:
-        """Encrypt plaintext bytes into an authenticated envelope using the passphrase."""
+    def encrypt(self, plaintext: bytes, passphrase: str, aad: Optional[bytes] = None) -> EncryptedEnvelope:
+        """Encrypt plaintext bytes into an authenticated envelope using the passphrase.
+
+        ``aad`` (associated data) is authenticated but not encrypted or stored; the vault passes the
+        entry's identity so sealed content cannot be moved to another entry.
+        """
         ...
 
-    def decrypt(self, envelope: EncryptedEnvelope, passphrase: str) -> bytes:
-        """Decrypt an authenticated envelope into plaintext bytes using the passphrase."""
+    def decrypt(self, envelope: EncryptedEnvelope, passphrase: str, aad: Optional[bytes] = None) -> bytes:
+        """Decrypt an authenticated envelope into plaintext bytes; must fail if ``aad`` differs from encryption."""
         ...
 
 
