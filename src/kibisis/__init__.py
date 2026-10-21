@@ -16,7 +16,7 @@ from .keys import generate_keyfile, resolve_passphrase
 from .vault import EntryIntegrityError, ReviewedEntryError, SQLiteMemoryVault, TombstonedValueError
 from .mcp_server import KibisisMCPServer
 
-__version__ = "0.1.0a7"
+__version__ = "0.1.0a8"
 
 __all__ = [
     "AuditEvent",
