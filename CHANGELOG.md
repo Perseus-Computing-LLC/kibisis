@@ -5,6 +5,24 @@ All notable changes to `kibisis` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Python: `search_keys()` returns the keys and BM25 scores of the entries that `search()` returns for the same
+  arguments, filters and tenant, principal and lineage bounds, as `SearchHit` items, without opening any
+  entry: nothing is decrypted and no snippet is built. Because it opens no entry, it checks no entry's
+  integrity; `get()` still refuses an entry that fails its check. In a synthetic test (20,000 entries of 60
+  words, one-word queries, 400 results each) it took 19.8 ms a query where `search()` took 35.3 ms under
+  SQLCipher, and 2.7 ms against 7.4 ms in a plaintext vault.
+- Python: `SQLiteMemoryVault(..., memory_security=False)` does not turn on SQLCipher's
+  `cipher_memory_security`, which wipes the memory SQLite frees. The default stays `True`. The setting is
+  process-wide in SQLCipher and slows ranked search over sealed entries: in the same test `search_keys()`
+  took 9.2 ms a query with it off and `search()` 21.0 ms.
+
+### Changed
+- Python: `search()` checks the tenant, principal and lineage bounds on each entry's stored metadata before
+  it opens the entry, so entries outside them are no longer decrypted. Results are unchanged.
+
 ## [0.1.0-alpha.7] - 2026-10-21
 
 ### Added

@@ -152,3 +152,12 @@ class SearchResult(BaseModel):
     entity: MemoryEntity
     rank_score: float = Field(default=0.0, description="Relevance score (e.g. BM25 rank).")
     snippet: str = Field(default="", description="Highlighted contextual match snippet.")
+
+
+class SearchHit(BaseModel):
+    """An entry that matched a search, without its content: what ``search_keys`` returns."""
+    id: int = Field(description="Row id of the entry.")
+    category: str = Field(description="Category of the entry.")
+    key: str = Field(description="Key of the entry.")
+    scope: str = Field(default="default", description="Scope of the entry.")
+    rank_score: float = Field(default=0.0, description="Relevance score (BM25 rank, as in SearchResult: lower is better).")

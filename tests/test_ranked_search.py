@@ -332,3 +332,128 @@ def test_mcp_recall_matches_any_word_by_default(tmp_path):
     tools = json.dumps(server.handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
     assert '"match"' in tools
     vault.close()
+
+
+# Keys-only search (0.1.0a8): search_keys() finds what search() finds without opening any entry.
+
+
+def _key_ranking(vault, query, **kwargs):
+    return [(h.key, round(h.rank_score, 9)) for h in vault.search_keys(query, limit=10, **kwargs)]
+
+
+@pytest.mark.parametrize("kind", ["plain", "sqlcipher", "fallback"])
+def test_search_keys_returns_the_entries_and_scores_of_search(tmp_path, monkeypatch, kind):
+    vault = _open(kind, tmp_path / "keys.db", monkeypatch)
+    _fill(vault)
+    for query in ALL_QUERIES:
+        assert _key_ranking(vault, query) == _ranking(vault, query), query
+    for query in ANY_QUERIES:
+        assert _key_ranking(vault, query, match="any") == _ranking(vault, query, match="any"), query
+    hit, result = vault.search_keys("budget review", limit=1)[0], vault.search("budget review", limit=1)[0]
+    assert (hit.id, hit.category, hit.key, hit.scope) == (
+        result.entity.id, result.entity.category, result.entity.key, result.entity.scope
+    )
+    assert vault.search_keys("?!", limit=10) == []
+    with pytest.raises(ValueError):
+        vault.search_keys("paris", match="some")
+    vault.close()
+
+
+@pytest.mark.parametrize("kind", ["plain", "sqlcipher", "fallback"])
+def test_search_keys_opens_no_entries(tmp_path, monkeypatch, kind):
+    vault = _open(kind, tmp_path / "keys.db", monkeypatch)
+    _fill(vault)
+    vault.search("paris")  # indexes the new entries (SQLCipher) or builds the in-memory index (fallback)
+    opened = []
+    open_entry = vault._open_entry
+
+    def counting(row):
+        opened.append(row["key"])
+        return open_entry(row)
+
+    monkeypatch.setattr(vault, "_open_entry", counting)
+    for query in ALL_QUERIES:
+        vault.search_keys(query, limit=10)
+    for query in ANY_QUERIES:
+        vault.search_keys(query, limit=10, match="any", tenant_id="acme", authorized_lineage_roots=[])
+    assert opened == []
+    assert len(vault.search("paris", limit=3)) == 3
+    assert len(opened) == 3  # search() opens each entry it returns, and no others
+    vault.close()
+
+
+@pytest.mark.parametrize("kind", ["plain", "sqlcipher", "fallback"])
+def test_search_keys_applies_the_filters_and_boundaries_of_search(tmp_path, monkeypatch, kind):
+    now = time.time()
+    rows = [
+        dict(category="f", key="v1", content="orchid alpha", epistemic_state="verified"),
+        dict(category="f", key="c1", content="orchid beta", epistemic_state="candidate"),
+        dict(category="g", key="v2", content="orchid delta", epistemic_state="verified", scope="team"),
+        dict(category="g", key="old", content="orchid epsilon", epistemic_state="verified", valid_from=now - 100, valid_until=now - 50),
+        dict(category="f", key="t1", content="orchid eta", epistemic_state="verified", tenant_id="acme", principal_id="ann"),
+        dict(category="f", key="t2", content="orchid theta", epistemic_state="verified", tenant_id="globex", principal_id="bo"),
+        dict(category="f", key="l1", content="orchid kappa", epistemic_state="verified", derived_from=["root-a"]),
+        dict(category="f", key="l2", content="orchid lambda", epistemic_state="verified", derived_from=["root-b"]),
+        dict(category="f", key="arch", content="orchid iota", epistemic_state="verified"),
+    ]
+    vault = _open(kind, tmp_path / "keys.db", monkeypatch)
+    for row in rows:
+        row = dict(row)
+        vault.put(row.pop("category"), row.pop("key"), row.pop("content"), **row)
+    vault.archive("f", "arch")
+    cases = [
+        {},
+        {"include_unverified": True},
+        {"scope": "team"},
+        {"scope": "*", "category": "g"},
+        {"epistemic_state": "candidate"},
+        {"scope": "*", "as_of_valid_time": now - 75},
+        {"tenant_id": "acme"},
+        {"principal_id": "bo"},
+        {"authorized_lineage_roots": ["root-a"]},
+        {"scope": "*", "limit": 2},
+        {"scope": "*", "match": "any", "tenant_id": "globex"},
+    ]
+    for case in cases:
+        case = dict(case)
+        limit = case.pop("limit", 10)
+        expected = [(r.entity.key, round(r.rank_score, 9)) for r in vault.search("orchid", limit=limit, **case)]
+        got = [(h.key, round(h.rank_score, 9)) for h in vault.search_keys("orchid", limit=limit, **case)]
+        assert got == expected, case
+    # the boundaries do leave entries out, so the comparison above is not vacuous
+    keys = {h.key for h in vault.search_keys("orchid", limit=10)}
+    assert {"t1", "t2", "l1", "l2", "v1"} <= keys and not {"c1", "v2", "old", "arch"}.intersection(keys)
+    assert {h.key for h in vault.search_keys("orchid", limit=10, tenant_id="acme")} == keys - {"t2"}
+    assert {h.key for h in vault.search_keys("orchid", limit=10, authorized_lineage_roots=["root-a"])} == keys - {"l2"}
+    vault.close()
+
+
+def test_memory_security_is_on_by_default_and_can_be_left_off(tmp_path):
+    """SQLCipher's cipher_memory_security is process-wide, so each setting is checked in a fresh process."""
+    if not vault_module._sqlcipher_available():
+        pytest.skip("sqlcipher3 is not installed")
+    import subprocess
+    import sys
+
+    src = str(Path(vault_module.__file__).resolve().parents[1])
+    probe = (
+        "import sys; sys.path.insert(0, {src!r}); from kibisis import SQLiteMemoryVault; "
+        "v = SQLiteMemoryVault({path!r}, passphrase={pw!r}{extra}); "
+        "print(v._conn.execute('PRAGMA cipher_memory_security').fetchone()[0])"
+    )
+    untouched = (
+        "import sqlcipher3; c = sqlcipher3.connect({path!r}); c.execute(\"PRAGMA key = 'x'\"); "
+        "print(c.execute('PRAGMA cipher_memory_security').fetchone()[0])"
+    )
+    env = {k: v for k, v in __import__("os").environ.items() if not k.startswith("KIBISIS_")}
+    seen = []
+    for code in (
+        untouched.format(path=str(tmp_path / "raw.db")),
+        probe.format(src=src, path=str(tmp_path / "on.db"), pw=PASS, extra=""),
+        probe.format(src=src, path=str(tmp_path / "off.db"), pw=PASS, extra=", memory_security=False"),
+    ):
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, check=True)
+        seen.append(out.stdout.strip())
+    sqlcipher_default, default, left_off = seen
+    assert default == "1"
+    assert left_off == sqlcipher_default  # kibisis leaves SQLCipher's own setting alone

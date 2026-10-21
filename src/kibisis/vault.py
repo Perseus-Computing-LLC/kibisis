@@ -35,7 +35,7 @@ from .crypto import (
     verify_tenant_payload,
 )
 from .keys import MIN_PASSPHRASE_LENGTH, resolve_passphrase
-from .models import AuditEvent, EncryptedEnvelope, EpistemicState, MemoryEntity, SearchResult
+from .models import AuditEvent, EncryptedEnvelope, EpistemicState, MemoryEntity, SearchHit, SearchResult
 from .protocols import CryptoEnvelopeProvider, EncryptionRequiredError, LeaseConflictError, LeaseCoordinator, MemoryVault
 
 logger = logging.getLogger(__name__)
@@ -57,6 +57,8 @@ _ENTITY_COLUMNS = (
     "e.is_encrypted, e.encrypted_envelope_json, e.scope, e.epistemic_state, e.valid_from, e.valid_until, "
     "e.tenant_sig, e.supersedes, e.superseded_by"
 )
+# What keys-only search reads: no content, no sealed content.
+_HIT_COLUMNS = "e.id, e.category, e.key, e.scope, e.metadata_json"
 # Words that match="any" leaves out of a query while the query has other words.
 _SEARCH_STOPWORDS = frozenset(
     "a an and are as at be been being but by can could did do does doing for from had has have having he her "
@@ -81,6 +83,33 @@ def _search_terms(query: str, match: str) -> List[str]:
             unique.append(w.lower())
     content = [w for w in unique if w not in _SEARCH_STOPWORDS] or unique
     return [w for w in content if len(w) > 1] or content
+
+
+def _bounded(
+    tenant_id: Optional[str], principal_id: Optional[str], authorized_lineage_roots: Optional[List[str]]
+) -> bool:
+    """Whether a search names a tenant, a principal or authorized lineage roots to hold its results to."""
+    return bool(tenant_id or principal_id or authorized_lineage_roots is not None)
+
+
+def _within_bounds(
+    r: Any, tenant_id: Optional[str], principal_id: Optional[str], authorized_lineage_roots: Optional[List[str]]
+) -> bool:
+    """Hard post-retrieval governance gating (MemLeak arXiv:2610.04195 & Lineage AMU arXiv:2610.07258), on a
+    stored row's metadata, which is not sealed: entries outside these bounds are never opened."""
+    meta = json.loads(r["metadata_json"]) if r["metadata_json"] else {}
+    meta = meta or {}
+    # 1. Hard tenant boundary check
+    if tenant_id and meta.get("tenant_id") and meta.get("tenant_id") != tenant_id:
+        return False
+    # 2. Hard principal/user boundary check if specified
+    if principal_id and meta.get("principal_id") and meta.get("principal_id") != principal_id:
+        return False
+    # 3. Derivation-gated lineage check (AMU)
+    if authorized_lineage_roots is not None:
+        if any(root not in authorized_lineage_roots for root in meta.get("derived_from", [])):
+            return False
+    return True
 
 
 def _snippet_patterns(terms: Sequence[str]) -> Optional[Tuple[Any, Any]]:
@@ -256,6 +285,7 @@ class SQLiteMemoryVault(MemoryVault):
         coordinator: Optional[LeaseCoordinator] = None,
         enforce_fencing: bool = False,
         auto_gate: bool = True,
+        memory_security: bool = True,
     ) -> None:
         """Open a vault. Entry content is encrypted by default.
 
@@ -267,6 +297,13 @@ class SQLiteMemoryVault(MemoryVault):
         removes entries must pass the caller's current ``fencing_token`` and ``resource``, and may
         pass ``holder_id``; a missing, stale or expired token raises ``LeaseConflictError`` and
         changes nothing. Without it, a token is checked only when one is passed.
+
+        With SQLCipher and a passphrase, ``memory_security=True`` (the default) turns on SQLCipher's
+        ``cipher_memory_security``, which wipes the memory SQLite frees, such as decrypted database pages.
+        SQLCipher applies it to every connection in the process, and it costs time: ranked search over
+        sealed entries runs several times slower with it. ``memory_security=False`` leaves the setting as
+        it is (off unless something in the process turned it on). Either way, text that kibisis returns to
+        Python stays in Python's memory until Python frees it, unwiped.
         """
         self.db_path = str(db_path)
         if crypto_provider is not None:
@@ -333,7 +370,8 @@ class SQLiteMemoryVault(MemoryVault):
         self._sqlcipher_active = False
         if passphrase:
             escaped_pass = passphrase.replace("'", "''")
-            self._conn.execute("PRAGMA cipher_memory_security = ON;")
+            if memory_security:
+                self._conn.execute("PRAGMA cipher_memory_security = ON;")
             self._conn.execute(f"PRAGMA key = '{escaped_pass}';")
             # Verify the key immediately by accessing sqlite_master
             try:
@@ -1697,11 +1735,80 @@ class SQLiteMemoryVault(MemoryVault):
         SQLCipher no entry terms are written to disk: it builds an index in memory by opening every entry,
         and builds it again after the vault changes.
         """
+        terms, rows = self._ranked_rows(
+            query, category, limit, scope, epistemic_state, as_of_valid_time, include_unverified, active_only,
+            match, _ENTITY_COLUMNS, snippets=True,
+        )
+        bounded = _bounded(tenant_id, principal_id, authorized_lineage_roots)
+        results: List[SearchResult] = []
+        patterns = _snippet_patterns(terms) if any(snip is None for _, _, snip in rows) else None
+        for r, score, snip in rows:
+            if bounded and not _within_bounds(r, tenant_id, principal_id, authorized_lineage_roots):
+                continue  # outside the caller's tenant, principal or lineage: never opened
+            content = self._readable_content(r)
+            if content is None:
+                continue  # failed its integrity check: tampered, damaged, or moved from another entry
+            if snip is None:
+                snip = _snippet(content, patterns)
+            results.append(SearchResult(entity=self._entity(r, content), rank_score=float(score), snippet=str(snip)))
+        return results
+
+    def search_keys(
+        self,
+        query: str,
+        category: Optional[str] = None,
+        limit: int = 10,
+        scope: Optional[str] = "default",
+        epistemic_state: Optional[str] = None,
+        as_of_valid_time: Optional[float] = None,
+        include_unverified: bool = False,
+        active_only: bool = True,
+        tenant_id: Optional[str] = None,
+        principal_id: Optional[str] = None,
+        authorized_lineage_roots: Optional[List[str]] = None,
+        match: str = "all",
+    ) -> List[SearchHit]:
+        """Keys and scores of the entries :meth:`search` returns, best first, without opening any entry.
+
+        Takes the arguments of :meth:`search` and applies its matching, filters, ranking and tenant,
+        principal and lineage boundaries, but reads no entry content: nothing is decrypted and no snippet
+        is built. Use it when the caller needs only which entries match, such as a retriever that holds
+        the text elsewhere or fetches a few entries with :meth:`get`.
+
+        Because it opens no entry, it checks no entry's integrity: an entry that fails its integrity check
+        is left out of :meth:`search` but listed here, and :meth:`get` refuses it.
+        """
+        _, rows = self._ranked_rows(
+            query, category, limit, scope, epistemic_state, as_of_valid_time, include_unverified, active_only,
+            match, _HIT_COLUMNS, snippets=False,
+        )
+        bounded = _bounded(tenant_id, principal_id, authorized_lineage_roots)
+        return [
+            SearchHit(id=r["id"], category=r["category"], key=r["key"], scope=r["scope"], rank_score=float(score))
+            for r, score, _ in rows
+            if not bounded or _within_bounds(r, tenant_id, principal_id, authorized_lineage_roots)
+        ]
+
+    def _ranked_rows(
+        self,
+        query: str,
+        category: Optional[str],
+        limit: int,
+        scope: Optional[str],
+        epistemic_state: Optional[str],
+        as_of_valid_time: Optional[float],
+        include_unverified: bool,
+        active_only: bool,
+        match: str,
+        columns: str,
+        snippets: bool,
+    ) -> Tuple[List[str], List[Tuple[Any, float, Optional[str]]]]:
+        """Query words and ranked ``(row, score, snippet)`` rows for search, reading ``columns`` of each row."""
         if match not in ("all", "any"):
             raise ValueError("match must be 'all' or 'any'")
         terms = _search_terms(query, match)
         if not terms:
-            return []
+            return terms, []
         fts_query = (" OR " if match == "any" else " ").join('"' + t.replace('"', '""') + '"*' for t in terms)
         # Normalize scope: None or empty string defaults to "default"
         target_scope = "default" if scope is None or scope == "" else scope
@@ -1709,40 +1816,12 @@ class SQLiteMemoryVault(MemoryVault):
             target_scope, category, epistemic_state, as_of_valid_time, include_unverified, active_only
         )
         if self._search_index:
-            rows = self._indexed_rows(fts_query, filter_sql, filter_params, limit)
+            rows = self._indexed_rows(fts_query, filter_sql, filter_params, limit, columns)
         elif self.crypto_provider is not None and self.passphrase:
-            rows = self._scanned_rows(fts_query, filter_sql, filter_params, limit)
+            rows = self._scanned_rows(fts_query, filter_sql, filter_params, limit, columns)
         else:
-            rows = self._plaintext_rows(query, fts_query, filter_sql, filter_params, limit)
-
-        results: List[SearchResult] = []
-        patterns = _snippet_patterns(terms) if any(snip is None for _, _, snip in rows) else None
-        for r, score, snip in rows:
-            content = self._readable_content(r)
-            if content is None:
-                continue  # failed its integrity check: tampered, damaged, or moved from another entry
-            if snip is None:
-                snip = _snippet(content, patterns)
-            results.append(SearchResult(entity=self._entity(r, content), rank_score=float(score), snippet=str(snip)))
-
-        # Hard post-retrieval governance gating (MemLeak arXiv:2610.04195 & Lineage AMU arXiv:2610.07258)
-        filtered_results: List[SearchResult] = []
-        for res in results:
-            meta = res.entity.metadata or {}
-            # 1. Hard tenant boundary check
-            if tenant_id and meta.get("tenant_id") and meta.get("tenant_id") != tenant_id:
-                continue
-            # 2. Hard principal/user boundary check if specified
-            if principal_id and meta.get("principal_id") and meta.get("principal_id") != principal_id:
-                continue
-            # 3. Derivation-gated lineage check (AMU)
-            if authorized_lineage_roots is not None:
-                ent_lineage = meta.get("derived_from", [])
-                if any(root not in authorized_lineage_roots for root in ent_lineage):
-                    continue
-            filtered_results.append(res)
-
-        return filtered_results
+            rows = self._plaintext_rows(query, fts_query, filter_sql, filter_params, limit, columns, snippets)
+        return terms, rows
 
     @staticmethod
     def _search_filters(
@@ -1781,14 +1860,22 @@ class SQLiteMemoryVault(MemoryVault):
         return " AND ".join(clauses), params
 
     def _plaintext_rows(
-        self, query: str, fts_query: str, filter_sql: str, params: List[Any], limit: int
+        self,
+        query: str,
+        fts_query: str,
+        filter_sql: str,
+        params: List[Any],
+        limit: int,
+        columns: str = _ENTITY_COLUMNS,
+        snippets: bool = True,
     ) -> List[Tuple[Any, float, Optional[str]]]:
         """Ranked rows from the FTS5 index of the entities table, for entries stored in plaintext."""
+        snip_sql = "snippet(entities_fts, 2, '<b>', '</b>', '...', 16)" if snippets else "''"
         try:
             rows = self._conn.execute(
                 f"""
-                SELECT {_ENTITY_COLUMNS},
-                       rank AS score, snippet(entities_fts, 2, '<b>', '</b>', '...', 16) AS snip
+                SELECT {columns},
+                       rank AS score, {snip_sql} AS snip
                 FROM entities_fts
                 CROSS JOIN entities e ON e.id = entities_fts.rowid
                 WHERE entities_fts MATCH ? AND {filter_sql}
@@ -1802,13 +1889,13 @@ class SQLiteMemoryVault(MemoryVault):
             # Fallback for environments where FTS query syntax or schema differs
             pattern = f"%{query}%"
             rows = self._conn.execute(
-                f"SELECT {_ENTITY_COLUMNS} FROM entities e WHERE (e.content LIKE ? OR e.key LIKE ?) AND {filter_sql} LIMIT ?",
+                f"SELECT {columns} FROM entities e WHERE (e.content LIKE ? OR e.key LIKE ?) AND {filter_sql} LIMIT ?",
                 [pattern, pattern, *params, limit],
             ).fetchall()
             return [(r, 0.0, "") for r in rows]
 
     def _indexed_rows(
-        self, fts_query: str, filter_sql: str, params: List[Any], limit: int
+        self, fts_query: str, filter_sql: str, params: List[Any], limit: int, columns: str = _ENTITY_COLUMNS
     ) -> List[Tuple[Any, float, Optional[str]]]:
         """Ranked rows from the entry index of a SQLCipher vault."""
         try:
@@ -1817,7 +1904,7 @@ class SQLiteMemoryVault(MemoryVault):
             logger.debug("kibisis: searching before queued entries were indexed: %s", exc)
         rows = self._conn.execute(
             f"""
-            SELECT {_ENTITY_COLUMNS}, entities_search.rank AS score
+            SELECT {columns}, entities_search.rank AS score
             FROM entities_search
             CROSS JOIN entities e ON e.id = entities_search.rowid
             WHERE entities_search MATCH ? AND {filter_sql}
@@ -1829,7 +1916,7 @@ class SQLiteMemoryVault(MemoryVault):
         return [(r, r["score"], None) for r in rows]
 
     def _scanned_rows(
-        self, fts_query: str, filter_sql: str, params: List[Any], limit: int
+        self, fts_query: str, filter_sql: str, params: List[Any], limit: int, columns: str = _ENTITY_COLUMNS
     ) -> List[Tuple[Any, float, Optional[str]]]:
         """Ranked rows from an in-memory index of the opened entries: a vault with a passphrase, without SQLCipher."""
         index = self._scan_index()
@@ -1848,7 +1935,7 @@ class SQLiteMemoryVault(MemoryVault):
         stored = {
             r["id"]: r
             for r in self._conn.execute(
-                f"SELECT {_ENTITY_COLUMNS} FROM entities e WHERE e.id IN ({marks})", [row[0] for row in ranked]
+                f"SELECT {columns} FROM entities e WHERE e.id IN ({marks})", [row[0] for row in ranked]
             ).fetchall()
         }
         return [(stored[i], score, None) for i, score in ranked if i in stored]
