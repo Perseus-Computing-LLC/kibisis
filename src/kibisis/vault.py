@@ -286,6 +286,7 @@ class SQLiteMemoryVault(MemoryVault):
         enforce_fencing: bool = False,
         auto_gate: bool = True,
         memory_security: bool = True,
+        cache_mb: Optional[int] = None,
     ) -> None:
         """Open a vault. Entry content is encrypted by default.
 
@@ -304,8 +305,15 @@ class SQLiteMemoryVault(MemoryVault):
         sealed entries runs several times slower with it. ``memory_security=False`` leaves the setting as
         it is (off unless something in the process turned it on). Either way, text that kibisis returns to
         Python stays in Python's memory until Python frees it, unwiped.
+
+        ``cache_mb`` sets SQLite's page cache for this connection, in MiB (default: SQLite's own, a few MiB).
+        Under SQLCipher a page read from outside the cache is decrypted again, so search over a vault larger
+        than the cache slows down; a cache that holds the vault's pages removes that cost. The cache holds
+        decrypted pages in this process's memory.
         """
         self.db_path = str(db_path)
+        if cache_mb is not None and int(cache_mb) <= 0:
+            raise ValueError("cache_mb must be a positive number of MiB")
         if crypto_provider is not None:
             _require_aad_support(crypto_provider)  # before anything touches the file
         self.coordinator = coordinator
@@ -368,6 +376,7 @@ class SQLiteMemoryVault(MemoryVault):
         self._conn = sqlcipher3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         self._conn.row_factory = sqlcipher3.Row
         self._sqlcipher_active = False
+        self._cache_mb = int(cache_mb) if cache_mb is not None else None
         if passphrase:
             escaped_pass = passphrase.replace("'", "''")
             if memory_security:
@@ -384,6 +393,8 @@ class SQLiteMemoryVault(MemoryVault):
                 raise ValueError("Failed to authenticate or decrypt vault database with provided passphrase") from e
             self._conn.execute("PRAGMA secure_delete = ON;")
         self._configure_db()
+        if self._cache_mb is not None:
+            self._conn.execute(f"PRAGMA cache_size = -{self._cache_mb * 1024}")
         self._init_schema()
         if passphrase:
             self._was_keyed = self._has_meta_key("kdf_salt")  # written by an earlier open with a passphrase

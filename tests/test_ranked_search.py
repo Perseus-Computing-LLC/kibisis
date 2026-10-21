@@ -457,3 +457,24 @@ def test_memory_security_is_on_by_default_and_can_be_left_off(tmp_path):
     sqlcipher_default, default, left_off = seen
     assert default == "1"
     assert left_off == sqlcipher_default  # kibisis leaves SQLCipher's own setting alone
+
+
+def test_cache_mb_sets_the_page_cache_and_the_default_is_unchanged(tmp_path, monkeypatch):
+    default = _open("plain", tmp_path / "default.db", monkeypatch)
+    before = default._conn.execute("PRAGMA cache_size").fetchone()[0]
+    default.close()
+    for kind in ("plain", "sqlcipher"):
+        path = tmp_path / f"{kind}.db"
+        if kind == "plain":
+            vault = SQLiteMemoryVault(str(path), allow_plaintext=True, cache_mb=64)
+        else:
+            if not vault_module._sqlcipher_available():
+                continue
+            vault = SQLiteMemoryVault(str(path), passphrase=PASS, cache_mb=64)
+        assert vault._conn.execute("PRAGMA cache_size").fetchone()[0] == -64 * 1024
+        _fill(vault)
+        assert _key_ranking(vault, "budget")  # searches as before
+        vault.close()
+    assert before != -64 * 1024
+    with pytest.raises(ValueError):
+        SQLiteMemoryVault(str(tmp_path / "bad.db"), allow_plaintext=True, cache_mb=0)

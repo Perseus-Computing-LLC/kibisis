@@ -5,6 +5,16 @@ All notable changes to `kibisis` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Python: `SQLiteMemoryVault(..., cache_mb=N)` sets SQLite's page cache, in MiB. Under SQLCipher a page read from
+  outside the cache is decrypted again, so ranked search over a vault larger than the cache slows down. On a
+  97 MB SQLCipher vault (6,228 entries of one BEAM 10M conversation, `memory_security=False`), one-word
+  `search_keys()` calls took 35.0 ms on average with the default cache, 10.8 ms with `cache_mb=64` and 2.6 ms
+  with `cache_mb=512`; the same entries in a plaintext vault took 5.2 ms with the default cache. The default is
+  unchanged.
+
 ## [0.1.0-alpha.8] - 2026-10-21
 
 ### Added
