@@ -91,6 +91,12 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "query": {**_TEXT, "description": "Search words."},
+                "match": {
+                    "type": "string",
+                    "enum": ["any", "all"],
+                    "default": "any",
+                    "description": "'any': entries with any of the words, best match first. 'all': entries with every word.",
+                },
                 "category": {**_TEXT, "description": "Optional category filter."},
                 "limit": {"type": "integer", "description": f"Most results to return (1-{MAX_RECALL}).", "default": 10},
                 "as_of_valid_time": {**_NUMBER, "description": "Optional Unix time: return what was valid then."},
@@ -475,6 +481,9 @@ class KibisisMCPServer:
         include_candidates = args.get("include_candidates", True)
         if not isinstance(include_candidates, bool):
             raise ValueError("'include_candidates' must be true or false")
+        match = args.get("match", "any")
+        if match not in ("any", "all"):
+            raise ValueError("'match' must be 'any' or 'all'")
         results = self.vault.search(
             query=query,
             category=category,
@@ -483,6 +492,7 @@ class KibisisMCPServer:
             scope=self.scope,
             as_of_valid_time=_number(args, "as_of_valid_time"),
             include_unverified=include_candidates,
+            match=match,
         )
         shown = {EpistemicState.VERIFIED.value, EpistemicState.DISPUTED.value}
         if include_candidates:

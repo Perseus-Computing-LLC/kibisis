@@ -5,6 +5,35 @@ All notable changes to `kibisis` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Python: ranked search over sealed entries. With SQLCipher, a vault with a passphrase keeps a contentless
+  FTS5 index (`entities_search`) of entry content inside the encrypted file, ranks sealed entries by BM25
+  with the scores a plaintext vault gives the same entries, and decrypts only the results it returns.
+  Without SQLCipher, search builds an FTS5 index of the opened entries in memory, never on disk, and builds
+  it again after the vault changes.
+- Python: `search(..., match="any")` finds entries with any of the query's words and leaves out common
+  words, for questions in natural language. The MCP server's `kibisis_recall` takes `match` (`any`, the
+  default, or `all`).
+
+### Changed
+- Python: search over sealed entries follows the word rules of plaintext search, where a word also matches
+  longer words that start with it. It used to match substrings of entry text, in storage order, each with
+  a score of -0.5. Results with equal scores now come in entry order.
+- Python: the first open of a SQLCipher vault with its passphrase builds the index by opening each entry
+  once. Older versions keep working on the vault: triggers queue the rows they write, and the next search
+  indexes them. `scrub()` also rebuilds the index from the entries, leaving no words of deleted entries.
+
+### Fixed
+- Python: search no longer runs its full-text query once for every entry in the scope. With a scope filter,
+  SQLite could start from the entities index on scope (added in 0.1.0-alpha.5) and evaluate the query row by
+  row: an eight-word query over 2,000 entries took about 0.4 s, or 3.6 s under SQLCipher, against about 1 ms
+  now. The full-text index now drives the join (`CROSS JOIN`).
+- Python: under SQLCipher, a full-text query that SQLite rejects falls back to a substring match, as under
+  SQLite (sqlcipher3 raises its own `OperationalError`, which search did not catch). Query words without a
+  letter or digit are ignored.
+
 ## [0.1.0-alpha.6] - 2026-10-21
 
 ### Added

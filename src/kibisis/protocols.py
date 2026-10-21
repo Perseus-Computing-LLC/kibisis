@@ -147,6 +147,7 @@ class MemoryVault(Protocol):
         tenant_id: Optional[str] = None,
         principal_id: Optional[str] = None,
         authorized_lineage_roots: Optional[List[str]] = None,
+        match: str = "all",
     ) -> List[SearchResult]:
         """Search memory entities with strict scope filtering, epistemic filtering, and bi-temporal point-in-time evaluation."""
         ...

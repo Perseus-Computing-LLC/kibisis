@@ -12,6 +12,7 @@ try:
     import sqlcipher3
 except ImportError:
     import sqlite3 as sqlcipher3
+import re
 import sqlite3
 import string
 import time
@@ -44,6 +45,70 @@ logger = logging.getLogger(__name__)
 #: and in tombstones, and refuses entries without a signature. A vault without the marker is upgraded
 #: the first time it is opened with its passphrase.
 INTEGRITY_FORMAT = 2
+
+#: Version of the entry index (``entities_search``) that a SQLCipher vault keeps for ranked search. A vault
+#: whose index has another version, or none, gets one built from its entries when opened with its passphrase.
+SEARCH_INDEX_FORMAT = 1
+
+# sqlcipher3 raises its own OperationalError, which is not sqlite3's.
+_OPERATIONAL_ERRORS = (sqlite3.OperationalError, sqlcipher3.OperationalError)
+_ENTITY_COLUMNS = (
+    "e.id, e.category, e.key, e.content, e.metadata_json, e.version, e.archived, e.created_at, e.updated_at, "
+    "e.is_encrypted, e.encrypted_envelope_json, e.scope, e.epistemic_state, e.valid_from, e.valid_until, "
+    "e.tenant_sig, e.supersedes, e.superseded_by"
+)
+# Words that match="any" leaves out of a query while the query has other words.
+_SEARCH_STOPWORDS = frozenset(
+    "a an and are as at be been being but by can could did do does doing for from had has have having he her "
+    "hers him his how i if in into is it its me my no not of on or our ours she should so than that the their "
+    "theirs them then there these they this those to was we were what when where which who whom whose why will "
+    "with would you your yours".split()
+)
+_EDGE_PUNCTUATION = re.compile(r"^[\W_]+|[\W_]+$")
+_WORD = re.compile(r"[^\W_]+")
+
+
+def _search_terms(query: str, match: str) -> List[str]:
+    """Words of a search query, without surrounding punctuation and without words that have no letter or
+    digit. For ``match="any"`` also lowercased and without repeats, and without common function words and
+    single characters while other words remain."""
+    words = [w for w in (_EDGE_PUNCTUATION.sub("", raw) for raw in query.split()) if _WORD.search(w)]
+    if match != "any":
+        return words
+    unique: List[str] = []
+    for w in words:
+        if w.lower() not in unique:
+            unique.append(w.lower())
+    content = [w for w in unique if w not in _SEARCH_STOPWORDS] or unique
+    return [w for w in content if len(w) > 1] or content
+
+
+def _snippet_patterns(terms: Sequence[str]) -> Optional[Tuple[Any, Any]]:
+    """Patterns for :func:`_snippet`, built once per search: where a query term begins a word (as FTS5
+    prefix queries match), and the whole whitespace-separated word around such a place."""
+    prefixes = sorted({w.lower() for term in terms for w in _WORD.findall(term)}, key=len, reverse=True)
+    if not prefixes:
+        return None
+    alternatives = "|".join(map(re.escape, prefixes))
+    start = re.compile(r"(?<![^\W_])(?:" + alternatives + ")", re.IGNORECASE)
+    word = re.compile(r"\S*?(?<![^\W_])(?:" + alternatives + r")\S*", re.IGNORECASE)
+    return start, word
+
+
+def _snippet(text: str, patterns: Optional[Tuple[Any, Any]], width: int = 16) -> str:
+    """Up to ``width`` words of ``text`` from around the first word that a query term begins, each matching
+    word in <b>...</b>: the shape that FTS5's snippet() gives for entries stored in plaintext."""
+    words = text.split()
+    first = 0
+    m = patterns[0].search(text) if patterns is not None else None
+    if m is not None:
+        before = text[: m.start()]
+        first = len(before.split()) - (1 if before and not before[-1].isspace() else 0)
+    start = max(0, min(first - width // 4, len(words) - width))
+    body = " ".join(words[start : start + width])
+    if patterns is not None:
+        body = patterns[1].sub(lambda w: f"<b>{w.group(0)}</b>", body)
+    return ("..." if start > 0 else "") + body + ("..." if start + width < len(words) else "")
 
 
 def _sqlcipher_available() -> bool:
@@ -261,6 +326,8 @@ class SQLiteMemoryVault(MemoryVault):
                 self._migrate_file_to_sqlcipher(self.db_path, passphrase)
                 self._converted_to_sqlcipher = True
 
+        self._search_index = False  # True once a SQLCipher vault's entry index is in use
+        self._scan_cache: Optional[Tuple[Tuple[int, int], Any]] = None  # in-memory index without SQLCipher
         self._conn = sqlcipher3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         self._conn.row_factory = sqlcipher3.Row
         self._sqlcipher_active = False
@@ -289,6 +356,8 @@ class SQLiteMemoryVault(MemoryVault):
             self._keyed = True
             try:
                 self._upgrade_integrity()
+                if self._sqlcipher_active:
+                    self._ensure_search_index()
             except BaseException:
                 self._conn.close()
                 raise
@@ -691,6 +760,8 @@ class SQLiteMemoryVault(MemoryVault):
             "UPDATE entities SET content = ?, is_encrypted = ?, encrypted_envelope_json = ?, tenant_sig = ? WHERE id = ?",
             (stored, is_encrypted, envelope_json, signature, r["id"]),
         )
+        if self._search_index:
+            self._index_entry(cursor, r["id"], r["category"], r["key"], content, r["scope"])
 
     def _open_entry(self, r: Any) -> str:
         """Content of a stored row, after its integrity checks.
@@ -1244,6 +1315,8 @@ class SQLiteMemoryVault(MemoryVault):
                         ep_state.value, valid_from, valid_until, tenant_sig, supersedes_ref, entity_id
                     ),
                 )
+            if self._search_index:
+                self._index_entry(cursor, entity_id, category, key, content, scope)
 
             # Record hash-chained mutation audit event
             self._record_audit_event(
@@ -1611,161 +1684,46 @@ class SQLiteMemoryVault(MemoryVault):
         tenant_id: Optional[str] = None,
         principal_id: Optional[str] = None,
         authorized_lineage_roots: Optional[List[str]] = None,
+        match: str = "all",
     ) -> List[SearchResult]:
-        if not query.strip():
+        """Entries that match ``query``, best first by BM25 (``rank_score``: lower is better).
+
+        ``match="all"`` (the default) wants every word of the query. ``match="any"`` wants at least one and
+        leaves out common words such as "what" and "the": use it for questions in natural language. A word
+        also matches longer words that start with it.
+
+        A vault with a passphrase ranks its sealed entries with the scores a plaintext vault would give
+        them. With SQLCipher it searches an index of entry terms kept inside the encrypted file. Without
+        SQLCipher no entry terms are written to disk: it builds an index in memory by opening every entry,
+        and builds it again after the vault changes.
+        """
+        if match not in ("all", "any"):
+            raise ValueError("match must be 'all' or 'any'")
+        terms = _search_terms(query, match)
+        if not terms:
             return []
-
-        clean_terms = [t for t in query.replace('"', '""').split() if t]
-        if not clean_terms:
-            return []
-        fts_query = " ".join(f'"{t}"*' for t in clean_terms)
-
-        results: List[SearchResult] = []
-        cursor = self._conn.cursor()
-
+        fts_query = (" OR " if match == "any" else " ").join('"' + t.replace('"', '""') + '"*' for t in terms)
         # Normalize scope: None or empty string defaults to "default"
         target_scope = "default" if scope is None or scope == "" else scope
+        filter_sql, filter_params = self._search_filters(
+            target_scope, category, epistemic_state, as_of_valid_time, include_unverified, active_only
+        )
+        if self._search_index:
+            rows = self._indexed_rows(fts_query, filter_sql, filter_params, limit)
+        elif self.crypto_provider is not None and self.passphrase:
+            rows = self._scanned_rows(fts_query, filter_sql, filter_params, limit)
+        else:
+            rows = self._plaintext_rows(query, fts_query, filter_sql, filter_params, limit)
 
-        # Build dynamic SQL WHERE conditions for scope, epistemic status, and validity bounds
-        where_clauses = ["entities_fts MATCH ?", "e.archived = 0"]
-        params: List[Any] = [fts_query]
-        if target_scope != "*":
-            where_clauses.append("e.scope = ?")
-            params.append(target_scope)
-
-        if category:
-            where_clauses.append("e.category = ?")
-            params.append(category)
-
-        if epistemic_state:
-            where_clauses.append("e.epistemic_state = ?")
-            params.append(epistemic_state)
-        elif not include_unverified:
-            # Epistemic polarity: unverified candidate/revoked memories withheld from active recall unless explicitly requested
-            where_clauses.append("e.epistemic_state IN ('verified', 'disputed')")
-
-        if as_of_valid_time is not None:
-            # Bi-temporal point-in-time filter: valid_from <= T and (valid_until IS NULL or valid_until > T)
-            where_clauses.append("(e.valid_from IS NULL OR e.valid_from <= ?)")
-            where_clauses.append("(e.valid_until IS NULL OR e.valid_until > ?)")
-            params.extend([as_of_valid_time, as_of_valid_time])
-        elif active_only:
-            now_t = time.time()
-            where_clauses.append("(e.valid_from IS NULL OR e.valid_from <= ?)")
-            where_clauses.append("(e.valid_until IS NULL OR e.valid_until > ?)")
-            params.extend([now_t, now_t])
-
-        where_sql = " AND ".join(where_clauses)
-        params.append(limit)
-
-        try:
-            sql = f"""
-                SELECT e.id, e.category, e.key, e.content, e.metadata_json, e.version, e.archived,
-                       e.created_at, e.updated_at, e.is_encrypted, e.encrypted_envelope_json,
-                       e.scope, e.epistemic_state, e.valid_from, e.valid_until, e.tenant_sig,
-                       e.supersedes, e.superseded_by,
-                       rank, snippet(entities_fts, 2, '<b>', '</b>', '...', 16) AS snip
-                FROM entities_fts
-                JOIN entities e ON e.id = entities_fts.rowid
-                WHERE {where_sql}
-                ORDER BY rank
-                LIMIT ?
-            """
-            cursor.execute(sql, params)
-            rows = cursor.fetchall()
-        except sqlite3.OperationalError:
-            # Fallback for environments where FTS query syntax or schema differs
-            pattern = f"%{query}%"
-            fb_clauses = ["(content LIKE ? OR key LIKE ?)", "archived = 0"]
-            fb_params: List[Any] = [pattern, pattern]
-            if target_scope != "*":
-                fb_clauses.append("scope = ?")
-                fb_params.append(target_scope)
-            if category:
-                fb_clauses.append("category = ?")
-                fb_params.append(category)
-            if epistemic_state:
-                fb_clauses.append("epistemic_state = ?")
-                fb_params.append(epistemic_state)
-            elif not include_unverified:
-                fb_clauses.append("epistemic_state IN ('verified', 'disputed')")
-            if as_of_valid_time is not None:
-                fb_clauses.append("(valid_from IS NULL OR valid_from <= ?)")
-                fb_clauses.append("(valid_until IS NULL OR valid_until > ?)")
-                fb_params.extend([as_of_valid_time, as_of_valid_time])
-            elif active_only:
-                now_t = time.time()
-                fb_clauses.append("(valid_from IS NULL OR valid_from <= ?)")
-                fb_clauses.append("(valid_until IS NULL OR valid_until > ?)")
-                fb_params.extend([now_t, now_t])
-            fb_sql = " AND ".join(fb_clauses)
-            fb_params.append(limit)
-            cursor.execute(
-                f"""
-                SELECT id, category, key, content, metadata_json, version, archived,
-                       created_at, updated_at, is_encrypted, encrypted_envelope_json,
-                       scope, epistemic_state, valid_from, valid_until, tenant_sig,
-                       supersedes, superseded_by,
-                       0.0 as rank, '' as snip
-                FROM entities
-                WHERE {fb_sql}
-                LIMIT ?
-                """,
-                fb_params,
-            )
-            rows = cursor.fetchall()
-
-        matched_ids = set()
-        for r in rows:
-            matched_ids.add(r["id"])
+        results: List[SearchResult] = []
+        patterns = _snippet_patterns(terms) if any(snip is None for _, _, snip in rows) else None
+        for r, score, snip in rows:
             content = self._readable_content(r)
             if content is None:
                 continue  # failed its integrity check: tampered, damaged, or moved from another entry
-            sig = r["tenant_sig"]
-
-            entity = MemoryEntity(
-                id=r["id"],
-                category=r["category"],
-                key=r["key"],
-                content=content,
-                metadata=json.loads(r["metadata_json"]),
-                version=r["version"],
-                archived=bool(r["archived"]),
-                created_at=r["created_at"],
-                updated_at=r["updated_at"],
-                epistemic_state=EpistemicState(r["epistemic_state"]) if "epistemic_state" in r.keys() else EpistemicState.VERIFIED,
-                valid_from=r["valid_from"] if "valid_from" in r.keys() else None,
-                valid_until=r["valid_until"] if "valid_until" in r.keys() else None,
-                scope=r["scope"] if "scope" in r.keys() else "default",
-                tenant_sig=sig,
-                supersedes=r["supersedes"] if "supersedes" in r.keys() else None,
-                superseded_by=r["superseded_by"] if "superseded_by" in r.keys() else None,
-            )
-            results.append(SearchResult(entity=entity, rank_score=float(r["rank"]), snippet=str(r["snip"])))
-
-        # If encrypted and user searched for content terms that weren't indexed in plaintext FTS,
-        # scan active entities within scope if we have crypto provider and haven't hit limit:
-        if self.crypto_provider is not None and len(results) < limit:
-            query_lower = query.lower().strip()
-            terms = [t.lower() for t in query.split() if len(t) >= 2]
-            all_entities = self.list_entities(
-                category=category,
-                include_archived=False,
-                scope=target_scope,
-                epistemic_state=epistemic_state,
-                as_of_valid_time=as_of_valid_time,
-                include_unverified=include_unverified,
-                active_only=active_only,
-            )
-            for ent in all_entities:
-                if ent.id in matched_ids:
-                    continue
-                ent_text = f"{ent.category} {ent.key} {ent.content}".lower()
-                if query_lower in ent_text or (terms and all(t in ent_text for t in terms)):
-                    results.append(SearchResult(entity=ent, rank_score=-0.5, snippet=f"...{query}..."))
-                    matched_ids.add(ent.id)
-                    if len(results) >= limit:
-                        break
+            if snip is None:
+                snip = _snippet(content, patterns)
+            results.append(SearchResult(entity=self._entity(r, content), rank_score=float(score), snippet=str(snip)))
 
         # Hard post-retrieval governance gating (MemLeak arXiv:2610.04195 & Lineage AMU arXiv:2610.07258)
         filtered_results: List[SearchResult] = []
@@ -1785,6 +1743,270 @@ class SQLiteMemoryVault(MemoryVault):
             filtered_results.append(res)
 
         return filtered_results
+
+    @staticmethod
+    def _search_filters(
+        target_scope: str,
+        category: Optional[str],
+        epistemic_state: Optional[str],
+        as_of_valid_time: Optional[float],
+        include_unverified: bool,
+        active_only: bool,
+    ) -> Tuple[str, List[Any]]:
+        """SQL conditions on entities ``e`` for a search's scope, category, epistemic state and valid time.
+
+        Search queries join with ``CROSS JOIN`` so that the full-text index drives the join: given a plain
+        join, SQLite can start from the scope index on entities and run the full-text query once per row,
+        which costs hundreds of times more."""
+        clauses = ["e.archived = 0"]
+        params: List[Any] = []
+        if target_scope != "*":
+            clauses.append("e.scope = ?")
+            params.append(target_scope)
+        if category:
+            clauses.append("e.category = ?")
+            params.append(category)
+        if epistemic_state:
+            clauses.append("e.epistemic_state = ?")
+            params.append(epistemic_state)
+        elif not include_unverified:
+            # Epistemic polarity: unverified candidate/revoked memories withheld from active recall unless explicitly requested
+            clauses.append("e.epistemic_state IN ('verified', 'disputed')")
+        # Bi-temporal point-in-time filter: valid_from <= T and (valid_until IS NULL or valid_until > T)
+        at = as_of_valid_time if as_of_valid_time is not None else (time.time() if active_only else None)
+        if at is not None:
+            clauses.append("(e.valid_from IS NULL OR e.valid_from <= ?)")
+            clauses.append("(e.valid_until IS NULL OR e.valid_until > ?)")
+            params.extend([at, at])
+        return " AND ".join(clauses), params
+
+    def _plaintext_rows(
+        self, query: str, fts_query: str, filter_sql: str, params: List[Any], limit: int
+    ) -> List[Tuple[Any, float, Optional[str]]]:
+        """Ranked rows from the FTS5 index of the entities table, for entries stored in plaintext."""
+        try:
+            rows = self._conn.execute(
+                f"""
+                SELECT {_ENTITY_COLUMNS},
+                       rank AS score, snippet(entities_fts, 2, '<b>', '</b>', '...', 16) AS snip
+                FROM entities_fts
+                CROSS JOIN entities e ON e.id = entities_fts.rowid
+                WHERE entities_fts MATCH ? AND {filter_sql}
+                ORDER BY score, e.id
+                LIMIT ?
+                """,
+                [fts_query, *params, limit],
+            ).fetchall()
+            return [(r, r["score"], r["snip"]) for r in rows]
+        except _OPERATIONAL_ERRORS:
+            # Fallback for environments where FTS query syntax or schema differs
+            pattern = f"%{query}%"
+            rows = self._conn.execute(
+                f"SELECT {_ENTITY_COLUMNS} FROM entities e WHERE (e.content LIKE ? OR e.key LIKE ?) AND {filter_sql} LIMIT ?",
+                [pattern, pattern, *params, limit],
+            ).fetchall()
+            return [(r, 0.0, "") for r in rows]
+
+    def _indexed_rows(
+        self, fts_query: str, filter_sql: str, params: List[Any], limit: int
+    ) -> List[Tuple[Any, float, Optional[str]]]:
+        """Ranked rows from the entry index of a SQLCipher vault."""
+        try:
+            self._drain_search_queue()
+        except _OPERATIONAL_ERRORS as exc:  # another connection holds the write lock: search what is indexed
+            logger.debug("kibisis: searching before queued entries were indexed: %s", exc)
+        rows = self._conn.execute(
+            f"""
+            SELECT {_ENTITY_COLUMNS}, entities_search.rank AS score
+            FROM entities_search
+            CROSS JOIN entities e ON e.id = entities_search.rowid
+            WHERE entities_search MATCH ? AND {filter_sql}
+            ORDER BY score, e.id
+            LIMIT ?
+            """,
+            [fts_query, *params, limit],
+        ).fetchall()
+        return [(r, r["score"], None) for r in rows]
+
+    def _scanned_rows(
+        self, fts_query: str, filter_sql: str, params: List[Any], limit: int
+    ) -> List[Tuple[Any, float, Optional[str]]]:
+        """Ranked rows from an in-memory index of the opened entries: a vault with a passphrase, without SQLCipher."""
+        index = self._scan_index()
+        ranked = index.execute(
+            f"""
+            SELECT e.id, m.rank FROM m CROSS JOIN e ON e.id = m.rowid
+            WHERE m MATCH ? AND {filter_sql}
+            ORDER BY m.rank, e.id
+            LIMIT ?
+            """,
+            [fts_query, *params, limit],
+        ).fetchall()
+        if not ranked:
+            return []
+        marks = ", ".join("?" for _ in ranked)
+        stored = {
+            r["id"]: r
+            for r in self._conn.execute(
+                f"SELECT {_ENTITY_COLUMNS} FROM entities e WHERE e.id IN ({marks})", [row[0] for row in ranked]
+            ).fetchall()
+        }
+        return [(stored[i], score, None) for i, score in ranked if i in stored]
+
+    def _scan_index(self) -> Any:
+        """In-memory FTS5 index of every entry this vault can open, with the columns that search filters on.
+
+        Built again once the vault has changed: ``PRAGMA data_version`` moves when another connection
+        commits, and ``total_changes`` when this one writes."""
+        stamp = (self._conn.execute("PRAGMA data_version").fetchone()[0], self._conn.total_changes)
+        if self._scan_cache is not None and self._scan_cache[0] == stamp:
+            return self._scan_cache[1]
+        index = sqlite3.connect(":memory:", check_same_thread=False)
+        index.execute("CREATE VIRTUAL TABLE m USING fts5(category, key, content, scope, content='')")
+        index.execute(
+            "CREATE TABLE e (id INTEGER PRIMARY KEY, category TEXT, scope TEXT, archived INTEGER, "
+            "epistemic_state TEXT, valid_from REAL, valid_until REAL)"
+        )
+        rows = self._conn.execute(
+            "SELECT id, category, key, content, scope, archived, epistemic_state, valid_from, valid_until, "
+            "is_encrypted, encrypted_envelope_json, tenant_sig FROM entities ORDER BY id"
+        ).fetchall()
+        for r in rows:
+            content = self._readable_content(r)
+            if content is None:
+                continue  # failed its integrity check: tampered, damaged, or moved from another entry
+            index.execute(
+                "INSERT INTO m (rowid, category, key, content, scope) VALUES (?, ?, ?, ?, ?)",
+                (r["id"], r["category"], r["key"], content, r["scope"]),
+            )
+            index.execute(
+                "INSERT INTO e VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (r["id"], r["category"], r["scope"], r["archived"], r["epistemic_state"], r["valid_from"], r["valid_until"]),
+            )
+        if self._scan_cache is not None:
+            self._scan_cache[1].close()
+        self._scan_cache = (stamp, index)
+        return index
+
+    def _ensure_search_index(self) -> None:
+        """Keep an index of entry terms inside the SQLCipher file, so that search ranks sealed entries.
+
+        The index (``entities_search``, a contentless FTS5 table) holds each entry's words and their
+        positions, enough to rebuild its text without case or punctuation. SQLCipher's page encryption
+        protects it with the rest of the file; each entry also stays sealed on its own. Triggers queue every row whose text changes, so rows that a process running an
+        older kibisis writes without feeding the index are indexed before the next search. A vault without
+        the index, or with an index of another version, gets one built by opening each entry once.
+        """
+        current = self._meta("search_index_format")
+        if current is None or int(current) != SEARCH_INDEX_FORMAT:
+            try:
+                with self._conn:
+                    cursor = self._conn.cursor()
+                    if not self._conn.in_transaction:
+                        cursor.execute("BEGIN IMMEDIATE")
+                    for trigger in ("entities_search_ai", "entities_search_au", "entities_search_ad"):
+                        cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                    cursor.execute("DROP TABLE IF EXISTS entities_search")
+                    cursor.execute(
+                        "CREATE VIRTUAL TABLE entities_search USING fts5("
+                        "category, key, content, scope, content='', contentless_delete=1)"
+                    )
+                    cursor.execute("CREATE TABLE IF NOT EXISTS entities_search_dirty (id INTEGER PRIMARY KEY)")
+                    cursor.execute(
+                        "CREATE TRIGGER entities_search_ai AFTER INSERT ON entities BEGIN "
+                        "INSERT OR IGNORE INTO entities_search_dirty (id) VALUES (new.id); END"
+                    )
+                    cursor.execute(
+                        "CREATE TRIGGER entities_search_au AFTER UPDATE OF category, key, content, scope, "
+                        "is_encrypted, encrypted_envelope_json, tenant_sig ON entities BEGIN "
+                        "INSERT OR IGNORE INTO entities_search_dirty (id) VALUES (new.id); END"
+                    )
+                    cursor.execute(
+                        "CREATE TRIGGER entities_search_ad AFTER DELETE ON entities BEGIN "
+                        "DELETE FROM entities_search WHERE rowid = old.id; "
+                        "DELETE FROM entities_search_dirty WHERE id = old.id; END"
+                    )
+                    cursor.execute("INSERT OR IGNORE INTO entities_search_dirty (id) SELECT id FROM entities")
+                    self._set_meta(cursor, "search_index_format", SEARCH_INDEX_FORMAT)
+            except _OPERATIONAL_ERRORS as exc:
+                text = str(exc).lower()
+                if not any(s in text for s in ("no such module", "unrecognized option", "contentless")):
+                    raise
+                # SQLite before 3.43 has no contentless-delete FTS5 tables: search opens the entries instead.
+                logger.warning("kibisis: sealed entries are searched without an index: %s", exc)
+                return
+        self._search_index = True
+        self._drain_search_queue()
+
+    def _index_entry(self, cursor: Any, entity_id: int, category: str, key: str, content: str, scope: str) -> None:
+        """Put an entry's terms in the entry index, in place of any it had there."""
+        cursor.execute(
+            "INSERT OR REPLACE INTO entities_search (rowid, category, key, content, scope) VALUES (?, ?, ?, ?, ?)",
+            (entity_id, category, key, content, scope),
+        )
+        cursor.execute("DELETE FROM entities_search_dirty WHERE id = ?", (entity_id,))
+
+    def _index_queued(self, cursor: Any) -> int:
+        """Index the rows the triggers queued, within the caller's write transaction. Returns how many."""
+        ids = [row[0] for row in cursor.execute("SELECT id FROM entities_search_dirty ORDER BY id").fetchall()]
+        for entity_id in ids:
+            r = cursor.execute(
+                "SELECT id, category, key, content, scope, is_encrypted, encrypted_envelope_json, tenant_sig "
+                "FROM entities WHERE id = ?",
+                (entity_id,),
+            ).fetchone()
+            content = None if r is None else self._readable_content(r)
+            if content is None:  # deleted, or failed its integrity check: keep it out of the index
+                cursor.execute("DELETE FROM entities_search WHERE rowid = ?", (entity_id,))
+                cursor.execute("DELETE FROM entities_search_dirty WHERE id = ?", (entity_id,))
+            else:
+                self._index_entry(cursor, entity_id, r["category"], r["key"], content, r["scope"])
+        return len(ids)
+
+    def _drain_search_queue(self) -> None:
+        """Index the rows written since the last search by a process that did not feed the index."""
+        if not self._search_index:
+            return
+        if not self._conn.execute("SELECT EXISTS (SELECT 1 FROM entities_search_dirty)").fetchone()[0]:
+            return
+        with self._conn:
+            cursor = self._conn.cursor()
+            if not self._conn.in_transaction:
+                cursor.execute("BEGIN IMMEDIATE")
+            self._index_queued(cursor)
+
+    def _rebuild_search_index(self) -> None:
+        """Build the entry index again from the entries, so that no deleted or replaced terms stay in it."""
+        with self._conn:
+            cursor = self._conn.cursor()
+            if not self._conn.in_transaction:
+                cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute("INSERT INTO entities_search (entities_search) VALUES ('delete-all')")
+            cursor.execute("INSERT OR IGNORE INTO entities_search_dirty (id) SELECT id FROM entities")
+            self._index_queued(cursor)
+            cursor.execute("INSERT INTO entities_search (entities_search) VALUES ('optimize')")
+
+    @staticmethod
+    def _entity(r: Any, content: str) -> MemoryEntity:
+        keys = r.keys()
+        return MemoryEntity(
+            id=r["id"],
+            category=r["category"],
+            key=r["key"],
+            content=content,
+            metadata=json.loads(r["metadata_json"]),
+            version=r["version"],
+            archived=bool(r["archived"]),
+            created_at=r["created_at"],
+            updated_at=r["updated_at"],
+            epistemic_state=EpistemicState(r["epistemic_state"]) if "epistemic_state" in keys else EpistemicState.VERIFIED,
+            valid_from=r["valid_from"] if "valid_from" in keys else None,
+            valid_until=r["valid_until"] if "valid_until" in keys else None,
+            scope=r["scope"] if "scope" in keys else "default",
+            tenant_sig=r["tenant_sig"],
+            supersedes=r["supersedes"] if "supersedes" in keys else None,
+            superseded_by=r["superseded_by"] if "superseded_by" in keys else None,
+        )
 
     def list_entities(
         self,
@@ -2131,15 +2353,18 @@ class SQLiteMemoryVault(MemoryVault):
         )
 
     def scrub(self) -> None:
-        """Remove deleted or replaced content from the search index, the write-ahead log and free pages.
+        """Remove deleted or replaced content from the search indexes, the write-ahead log and free pages.
 
-        FTS5 'delete' leaves old terms in index segments until the index is rebuilt, and the
-        write-ahead log and free pages keep old bytes until a checkpoint and VACUUM. Run after a
-        delete (the MCP server's forget does) or after migrating plaintext.
+        FTS5 'delete' leaves old terms in index segments until the index is rebuilt (a SQLCipher
+        vault's entry index is rebuilt from its decrypted entries), and the write-ahead log and free
+        pages keep old bytes until a checkpoint and VACUUM. Run after a delete (the MCP server's
+        forget does) or after migrating plaintext.
         """
         self._conn.execute("INSERT INTO entities_fts(entities_fts) VALUES ('rebuild')")
         self._conn.execute("INSERT INTO entities_fts(entities_fts) VALUES ('optimize')")
         self._conn.commit()
+        if self._search_index:
+            self._rebuild_search_index()
         if self.db_path != ":memory:":
             self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             self._conn.execute("VACUUM")
@@ -2569,4 +2794,7 @@ class SQLiteMemoryVault(MemoryVault):
         }
 
     def close(self) -> None:
+        if self._scan_cache is not None:
+            self._scan_cache[1].close()
+            self._scan_cache = None
         self._conn.close()
