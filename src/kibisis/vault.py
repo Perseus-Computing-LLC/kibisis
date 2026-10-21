@@ -148,7 +148,7 @@ def _event_hash(
     prev_hash: str,
     author_id: Optional[str],
 ) -> str:
-    """The journal's hash of one event, as _record_audit_event and verify_audit_chain compute it."""
+    """SHA-256 of one journal event, which links to the one before it through ``prev_hash``."""
     payload = f"{sequence}:{timestamp:.6f}:{action}:{category}:{key}:{scope}:{value_sha256}:{prev_hash}:{author_id or ''}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -633,10 +633,7 @@ class SQLiteMemoryVault(MemoryVault):
         last_row = cursor.fetchone()
         seq, prev_hash = (last_row["sequence"] + 1, last_row["event_hash"]) if last_row else (1, "0" * 64)
 
-        payload_to_hash = (
-            f"{seq}:{now:.6f}:{action}:{category}:{key}:{scope}:{value_sha256}:{prev_hash}:{author_id or ''}"
-        )
-        event_hash = hashlib.sha256(payload_to_hash.encode("utf-8")).hexdigest()
+        event_hash = _event_hash(seq, now, action, category, key, scope, value_sha256, prev_hash, author_id)
         meta_json = json.dumps(meta_dict, sort_keys=True)
 
         cursor.execute(
@@ -753,10 +750,7 @@ class SQLiteMemoryVault(MemoryVault):
 
     def _digests(self, value: str) -> Tuple[str, str]:
         """(exact, canonical) digests of a value as this vault stores them: keyed when it has a passphrase."""
-        exact, canonical = value_digests(value)
-        if self._digest_key is None:
-            return exact, canonical
-        return keyed_value_digest(self._digest_key, exact), keyed_value_digest(self._digest_key, canonical)
+        return self._stored_digests(*value_digests(value))
 
     def _digest_key_id(self) -> Optional[str]:
         """Short public identifier of the digest key, so snapshot digests can be matched to their vault."""
@@ -922,16 +916,7 @@ class SQLiteMemoryVault(MemoryVault):
                 counts["tombstones_rekeyed"] += 1
 
             old_head = events[-1]["event_hash"] if events else "0" * 64
-            chain_was_valid, expected_prev = True, "0" * 64
-            for ev in events:
-                recomputed = _event_hash(
-                    ev["sequence"], ev["timestamp"], ev["action"], ev["category"], ev["key"], ev["scope"],
-                    ev["value_sha256"], ev["prev_hash"], ev["author_id"],
-                )
-                if ev["prev_hash"] != expected_prev or recomputed != ev["event_hash"]:
-                    chain_was_valid = False
-                    break
-                expected_prev = ev["event_hash"]
+            chain_was_valid = self.verify_audit_chain()
             prev_hash = "0" * 64
             for ev in events:
                 value = keyed_value_digest(digest_key, ev["value_sha256"])
@@ -2214,10 +2199,10 @@ class SQLiteMemoryVault(MemoryVault):
         for ev in events:
             if ev.prev_hash != expected_prev:
                 return False
-            payload = (
-                f"{ev.sequence}:{ev.timestamp:.6f}:{ev.action}:{ev.category}:{ev.key}:{ev.scope}:{ev.value_sha256}:{ev.prev_hash}:{ev.author_id or ''}"
+            recomputed = _event_hash(
+                ev.sequence, ev.timestamp, ev.action, ev.category, ev.key, ev.scope, ev.value_sha256, ev.prev_hash,
+                ev.author_id,
             )
-            recomputed = hashlib.sha256(payload.encode("utf-8")).hexdigest()
             if recomputed != ev.event_hash:
                 return False
             expected_prev = ev.event_hash
