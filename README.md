@@ -93,7 +93,7 @@ python -m kibisis.review approve CATEGORY KEY      # or: dispute, reject
 
 ## Measured
 
-Medians of five runs of [telarch-benchmarks](https://github.com/Perseus-Computing-LLC/telarch-benchmarks) v0.1.0-alpha.5 against kibisis 0.1.0-alpha.9 (the Rust crate, and the Python package 0.1.0a9 for the multi-process rows), with synthetic data on one shared server. Every run, its range and the command that reproduces it are on [telarch.ai/evidence](https://telarch.ai/evidence).
+Medians of five runs of [telarch-benchmarks](https://github.com/Perseus-Computing-LLC/telarch-benchmarks) v0.1.0-alpha.7 against kibisis 0.1.0-alpha.9 (the Rust crate, and the Python package 0.1.0a9 for the multi-process rows), with synthetic data on one EC2 m8azn.metal-12xl bare-metal server. Every run, its range and the command that reproduces it are on [telarch.ai/evidence](https://telarch.ai/evidence).
 
 | Measurement | Result |
 | --- | --- |
@@ -102,7 +102,7 @@ Medians of five runs of [telarch-benchmarks](https://github.com/Perseus-Computin
 | Times two processes held the lease at once, 2 to 32 processes sharing one SQLite file | 0 |
 | Late write from a paused holder | rejected |
 | Lease database after its holder is killed with SIGKILL while holding the lease | intact |
-| Lease operations per second, 16 threads, in memory (Rust) | 1,607,449 |
+| Lease operations per second, 16 threads, in memory (Rust) | 1,291,700 |
 
 ## How it works
 
