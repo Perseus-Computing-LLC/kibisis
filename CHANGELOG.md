@@ -5,6 +5,13 @@ All notable changes to `kibisis` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- CI: every action is pinned to a full commit SHA (the Rust toolchain action followed a branch) and runs on Node 24.
+  Dependabot proposes weekly grouped updates for actions, Cargo and Python (uv) dependencies once a release is 7 days
+  old, and an OpenSSF Scorecard workflow reports to code scanning.
+
 ## [0.1.0-alpha.9] - 2026-10-21
 
 ### Added
