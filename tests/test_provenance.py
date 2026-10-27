@@ -134,14 +134,25 @@ def test_admit_cli_sets_reviewer_origin_user(tmp_path, monkeypatch):
     r = subprocess.run(
         [sys.executable, "-m", "kibisis", "admit", "--db", db, "--category", "c", "--key", "k", "--by", "user",
          "--note", "looked at it"],
-        capture_output=True, text=True, env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+        capture_output=True, text=True, env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path), "KIBISIS_ADMIT_ALLOW_NOTTY": "1"},
     )
     assert r.returncode == 0, r.stdout + r.stderr
     r2 = subprocess.run(
         [sys.executable, "-m", "kibisis", "admit", "--db", db, "--category", "c", "--key", "k", "--by", "model"],
-        capture_output=True, text=True, env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+        capture_output=True, text=True, env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path), "KIBISIS_ADMIT_ALLOW_NOTTY": "1"},
     )
     assert r2.returncode != 0
     v = SQLiteMemoryVault(db, passphrase="test-passphrase")
     assert v.get("c", "k").epistemic_state == EpistemicState.VERIFIED
     v.close()
+
+
+def test_admit_cli_refuses_without_tty(tmp_path, monkeypatch):
+    """The human admit path must not be drivable from a pipe (agent shell tool, cron)."""
+    import io
+    from kibisis.__main__ import main
+    monkeypatch.delenv("KIBISIS_ADMIT_ALLOW_NOTTY", raising=False)
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))  # no isatty -> False
+    rc = main(["admit", "--db", str(tmp_path / "v.sqlite"), "--category", "c", "--key", "k", "--by", "user"])
+    assert rc == 3
+    assert not (tmp_path / "v.sqlite").exists() or (tmp_path / "v.sqlite").stat().st_size == 0

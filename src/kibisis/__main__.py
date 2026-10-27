@@ -11,7 +11,28 @@ from .vault import ORIGINS, AdmissionRefused, SQLiteMemoryVault
 DEFAULT_DB_PATH = os.environ.get("KIBISIS_DB_PATH", os.path.expanduser("~/.hermes/kibisis/vault.sqlite"))
 
 
+class NotInteractive(RuntimeError):
+    """``admit`` was invoked without a terminal on stdin."""
+
+
+def _require_tty() -> None:
+    """``admit --by user`` asserts a person is present; refuse when stdin is not a terminal.
+
+    An agent driving a shell tool, a cron job or a pipe has no TTY, so this check keeps the
+    human path from being replayed by automation. ``KIBISIS_ADMIT_ALLOW_NOTTY=1`` is for tests only.
+    """
+    if os.environ.get("KIBISIS_ADMIT_ALLOW_NOTTY") == "1":
+        return
+    if not sys.stdin.isatty():
+        raise NotInteractive("admit requires an interactive terminal (stdin is not a TTY); run it yourself in a shell")
+
+
 def _admit(args: argparse.Namespace) -> int:
+    try:
+        _require_tty()
+    except NotInteractive as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 3
     vault = SQLiteMemoryVault(args.db)
     try:
         entity = vault.admit(
