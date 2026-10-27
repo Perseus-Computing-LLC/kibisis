@@ -55,8 +55,40 @@ _OPERATIONAL_ERRORS = (sqlite3.OperationalError, sqlcipher3.OperationalError)
 _ENTITY_COLUMNS = (
     "e.id, e.category, e.key, e.content, e.metadata_json, e.version, e.archived, e.created_at, e.updated_at, "
     "e.is_encrypted, e.encrypted_envelope_json, e.scope, e.epistemic_state, e.valid_from, e.valid_until, "
-    "e.tenant_sig, e.supersedes, e.superseded_by"
+    "e.tenant_sig, e.supersedes, e.superseded_by, e.origin, e.source_ref, e.confidence"
 )
+
+# Where an entry came from. "model" writes are capped at candidate and cannot promote themselves.
+ORIGINS = ("user", "model", "tool", "import", "unknown")
+_ORIGIN_CHECK = "CHECK (origin IN ('user','model','tool','import','unknown'))"
+DEFAULT_ARGUS_LEDGER_PATH = "/opt/data/runtime/argus/audit.jsonl"
+
+
+def _validate_origin(origin: Optional[str], what: str = "origin") -> Optional[str]:
+    if origin is None:
+        return None
+    if origin not in ORIGINS:
+        raise ValueError(f"{what} must be one of {ORIGINS}, got {origin!r}")
+    return origin
+
+
+def _argus_ledger_path() -> Optional[str]:
+    """Argus ledger that state transitions are mirrored to; ARGUS_LEDGER_PATH="" turns it off."""
+    if "ARGUS_LEDGER_PATH" in os.environ:
+        return os.environ["ARGUS_LEDGER_PATH"] or None
+    return DEFAULT_ARGUS_LEDGER_PATH if os.path.exists(DEFAULT_ARGUS_LEDGER_PATH) else None
+
+
+def _argus_append(event_type: str, actor: str, payload: Dict[str, Any]) -> None:
+    """Append through the argus_ledger library only, so the hash chain stays valid. Never raises."""
+    path = _argus_ledger_path()
+    if not path:
+        return
+    try:
+        from argus_ledger import AppendOnlyLedger  # optional dependency
+        AppendOnlyLedger(path).append(event_type=event_type, actor=actor, payload=payload)
+    except Exception as exc:  # pragma: no cover - best effort mirror
+        logger.debug("argus mirror skipped (%s): %s", event_type, exc)
 # What keys-only search reads: no content, no sealed content.
 _HIT_COLUMNS = "e.id, e.category, e.key, e.scope, e.metadata_json"
 # Words that match="any" leaves out of a query while the query has other words.
@@ -211,6 +243,10 @@ class ReviewedEntryError(PermissionError):
     """Raised when a capped (model-originated) write targets an entry a person verified or reviewed."""
 
 
+class AdmissionRefused(PermissionError):
+    """Raised when a reviewer that is not a person tries to promote an entry to ``verified``."""
+
+
 class EntryIntegrityError(PermissionError):
     """Raised when a stored entry fails its integrity check: it has no signature, its signature does
     not verify, or its sealed content does not belong to it. ``get`` raises it; ``search`` and
@@ -258,6 +294,14 @@ def _rekey_metadata(metadata: Dict[str, Any], digest_key: bytes) -> bool:
         del detail["value_digest_prefix"]  # a prefix of a plain digest cannot be keyed, and still leaks
         changed = True
     return changed
+
+
+def row_origin(row: Any) -> str:
+    """Origin of a fetched row; 'unknown' for rows and cursors that predate the column."""
+    try:
+        return row["origin"] or "unknown"
+    except (IndexError, KeyError):
+        return "unknown"
 
 
 def _is_reviewed(row: Any) -> bool:
@@ -568,6 +612,9 @@ class SQLiteMemoryVault(MemoryVault):
                     tenant_sig TEXT DEFAULT NULL,
                     supersedes TEXT DEFAULT NULL,
                     superseded_by TEXT DEFAULT NULL,
+                    origin TEXT NOT NULL DEFAULT 'unknown' CHECK (origin IN ('user','model','tool','import','unknown')),
+                    source_ref TEXT DEFAULT NULL,
+                    confidence REAL DEFAULT NULL,
                     UNIQUE(category, key, scope)
                 )
                 """
@@ -595,6 +642,15 @@ class SQLiteMemoryVault(MemoryVault):
                 self._conn.execute("ALTER TABLE entities ADD COLUMN supersedes TEXT DEFAULT NULL")
             if "superseded_by" not in cols:
                 self._conn.execute("ALTER TABLE entities ADD COLUMN superseded_by TEXT DEFAULT NULL")
+            if "origin" not in cols:
+                # Rows that predate provenance read as 'unknown'; nothing claims they were a person's.
+                self._conn.execute(
+                    "ALTER TABLE entities ADD COLUMN origin TEXT NOT NULL DEFAULT 'unknown' " + _ORIGIN_CHECK
+                )
+            if "source_ref" not in cols:
+                self._conn.execute("ALTER TABLE entities ADD COLUMN source_ref TEXT DEFAULT NULL")
+            if "confidence" not in cols:
+                self._conn.execute("ALTER TABLE entities ADD COLUMN confidence REAL DEFAULT NULL")
 
             # Covering B-Tree index for bitemporal point-in-time and interval queries
             self._conn.execute(
@@ -1182,10 +1238,19 @@ class SQLiteMemoryVault(MemoryVault):
         supersedes_category: Optional[str] = None,
         auto_gate: Optional[bool] = None,
         trust_ceiling: Optional[str] = None,
+        origin: Optional[str] = None,
+        source_ref: Optional[str] = None,
+        confidence: Optional[float] = None,
     ) -> MemoryEntity:
         """Write path behind :meth:`put`, which journals the tombstone refusals this raises."""
         if trust_ceiling is not None and trust_ceiling != EpistemicState.CANDIDATE.value:
             raise ValueError("trust_ceiling supports only 'candidate'")
+        _validate_origin(origin)
+        if confidence is not None and not (0.0 <= float(confidence) <= 1.0):
+            raise ValueError("confidence must be within [0, 1]")
+        if origin == "model":
+            # Trust comes from where the write came from, not from what it says about itself.
+            trust_ceiling = EpistemicState.CANDIDATE.value
         now = time.time()
         meta = dict(metadata or {})
         if author_id:
@@ -1251,7 +1316,7 @@ class SQLiteMemoryVault(MemoryVault):
             if supersedes_key:
                 target_cat = supersedes_category or category
                 cursor.execute(
-                    "SELECT id, metadata_json, epistemic_state FROM entities WHERE category = ? AND key = ? AND scope = ? AND archived = 0",
+                    "SELECT id, metadata_json, epistemic_state, origin FROM entities WHERE category = ? AND key = ? AND scope = ? AND archived = 0",
                     (target_cat, supersedes_key, scope),
                 )
                 target_row = cursor.fetchone()
@@ -1291,6 +1356,11 @@ class SQLiteMemoryVault(MemoryVault):
                         author_id=author_id,
                         metadata={"superseded_by": f"{category}:{key}", "superseded_at": now},
                     )
+                    if target_row["epistemic_state"] != EpistemicState.REVOKED.value:
+                        self._record_state_transition(
+                            cursor, target_cat, supersedes_key, scope, target_row["epistemic_state"],
+                            EpistemicState.REVOKED.value, row_origin(target_row), author_id,
+                        )
 
             # Skip canonicalization when the vault has no tombstones. Asked of the database on every
             # write: a flag cached at open misses tombstones that other processes add later.
@@ -1317,10 +1387,12 @@ class SQLiteMemoryVault(MemoryVault):
             )
 
             cursor.execute(
-                "SELECT id, version, created_at, supersedes, superseded_by FROM entities WHERE category = ? AND key = ? AND scope = ?",
+                "SELECT id, version, created_at, supersedes, superseded_by, epistemic_state, origin, source_ref, confidence "
+                "FROM entities WHERE category = ? AND key = ? AND scope = ?",
                 (category, key, scope),
             )
             row = cursor.fetchone()
+            previous_state: Optional[str] = None
 
             if row is None:
                 action = "put"
@@ -1330,38 +1402,47 @@ class SQLiteMemoryVault(MemoryVault):
                         category, key, content, metadata_json, version, archived,
                         created_at, updated_at, is_encrypted, encrypted_envelope_json,
                         scope, epistemic_state, valid_from, valid_until, tenant_sig,
-                        supersedes, superseded_by
+                        supersedes, superseded_by, origin, source_ref, confidence
                     )
-                    VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
                     """,
                     (
                         category, key, stored_content, meta_str, now, now,
                         is_encrypted, envelope_json, scope, ep_state.value, valid_from, valid_until, tenant_sig,
-                        supersedes_ref
+                        supersedes_ref, origin or "unknown", source_ref, confidence
                     ),
                 )
                 entity_id = cursor.lastrowid
                 version = 1
                 created_at = now
                 existing_superseded_by = None
+                stored_origin = origin or "unknown"
+                stored_source_ref, stored_confidence = source_ref, confidence
             else:
                 action = "update"
                 entity_id = row["id"]
                 version = row["version"] + 1
                 created_at = row["created_at"]
                 existing_superseded_by = row["superseded_by"]
+                previous_state = row["epistemic_state"]
+                # Provenance belongs to the fact: a re-write that does not state an origin keeps the original.
+                stored_origin = origin or row["origin"] or "unknown"
+                stored_source_ref = source_ref if source_ref is not None else row["source_ref"]
+                stored_confidence = confidence if confidence is not None else row["confidence"]
                 cursor.execute(
                     """
                     UPDATE entities
                     SET content = ?, metadata_json = ?, version = ?, archived = 0, updated_at = ?,
                         is_encrypted = ?, encrypted_envelope_json = ?, epistemic_state = ?,
                         valid_from = ?, valid_until = ?, tenant_sig = ?,
-                        supersedes = COALESCE(?, supersedes)
+                        supersedes = COALESCE(?, supersedes),
+                        origin = ?, source_ref = ?, confidence = ?
                     WHERE id = ?
                     """,
                     (
                         stored_content, meta_str, version, now, is_encrypted, envelope_json,
-                        ep_state.value, valid_from, valid_until, tenant_sig, supersedes_ref, entity_id
+                        ep_state.value, valid_from, valid_until, tenant_sig, supersedes_ref,
+                        stored_origin, stored_source_ref, stored_confidence, entity_id
                     ),
                 )
             if self._search_index:
@@ -1378,6 +1459,10 @@ class SQLiteMemoryVault(MemoryVault):
                 author_id=author_id,
                 metadata={"version": version, "epistemic_state": ep_state.value},
             )
+            if previous_state is not None and previous_state != ep_state.value:
+                self._record_state_transition(
+                    cursor, category, key, scope, previous_state, ep_state.value, stored_origin, author_id
+                )
 
         return MemoryEntity(
             id=entity_id,
@@ -1396,6 +1481,44 @@ class SQLiteMemoryVault(MemoryVault):
             tenant_sig=tenant_sig,
             supersedes=supersedes_ref or meta.get("supersedes"),
             superseded_by=existing_superseded_by or meta.get("superseded_by"),
+            origin=stored_origin,
+            source_ref=stored_source_ref,
+            confidence=stored_confidence,
+        )
+
+    def _record_state_transition(
+        self,
+        cursor: sqlite3.Cursor,
+        category: str,
+        key: str,
+        scope: str,
+        previous: str,
+        new: str,
+        origin: str,
+        reviewer: Optional[str],
+    ) -> None:
+        """Journal an epistemic-state change and mirror it to the Argus ledger when one is configured."""
+        payload = {
+            "event": "state_transition",
+            "from": previous,
+            "to": new,
+            "origin": origin,
+            "reviewer": reviewer,
+        }
+        self._record_audit_event(
+            cursor=cursor,
+            action="state_transition",
+            category=category,
+            key=key,
+            scope=scope,
+            value_sha256="",
+            author_id=reviewer,
+            metadata=payload,
+        )
+        _argus_append(
+            "kibisis.state_transition",
+            reviewer or "kibisis",
+            {**payload, "category": category, "key": key, "scope": scope},
         )
 
     def put(
@@ -1419,8 +1542,14 @@ class SQLiteMemoryVault(MemoryVault):
         supersedes_category: Optional[str] = None,
         auto_gate: Optional[bool] = None,
         trust_ceiling: Optional[str] = None,
+        origin: Optional[str] = None,
+        source_ref: Optional[str] = None,
+        confidence: Optional[float] = None,
     ) -> MemoryEntity:
         """Insert or update an entity. See ``__init__`` for ``fencing_token``, ``resource`` and ``holder_id``.
+
+        ``origin`` records where the write came from (:data:`ORIGINS`); ``origin="model"`` implies
+        ``trust_ceiling="candidate"``. A re-write that gives no origin keeps the entry's existing one.
 
         ``trust_ceiling="candidate"`` caps the stored state: a write that the admission gate or the
         ``epistemic_state`` argument would store as ``verified`` or ``disputed`` is stored as
@@ -1453,6 +1582,9 @@ class SQLiteMemoryVault(MemoryVault):
                 supersedes_category=supersedes_category,
                 auto_gate=auto_gate,
                 trust_ceiling=trust_ceiling,
+                origin=origin,
+                source_ref=source_ref,
+                confidence=confidence,
             )
         except TombstonedValueError as exc:
             # The write's transaction rolled back; journal the refusal in its own transaction.
@@ -1488,6 +1620,9 @@ class SQLiteMemoryVault(MemoryVault):
         supersedes_category: Optional[str] = None,
         auto_gate: Optional[bool] = None,
         trust_ceiling: Optional[str] = None,
+        origin: Optional[str] = None,
+        source_ref: Optional[str] = None,
+        confidence: Optional[float] = None,
     ) -> MemoryEntity:
         """Alias for put() for ergonomic convenience."""
         return self.put(
@@ -1510,6 +1645,9 @@ class SQLiteMemoryVault(MemoryVault):
             supersedes_category=supersedes_category,
             auto_gate=auto_gate,
             trust_ceiling=trust_ceiling,
+            origin=origin,
+            source_ref=source_ref,
+            confidence=confidence,
         )
 
     def record_refusal(
@@ -1622,7 +1760,7 @@ class SQLiteMemoryVault(MemoryVault):
             """
             SELECT id, category, key, content, metadata_json, version, archived, created_at, updated_at,
                    is_encrypted, encrypted_envelope_json, scope, epistemic_state, valid_from, valid_until, tenant_sig,
-                   supersedes, superseded_by
+                   supersedes, superseded_by, origin, source_ref, confidence
             FROM entities
             WHERE category = ? AND key = ? AND scope = ?
             """,
@@ -1653,6 +1791,9 @@ class SQLiteMemoryVault(MemoryVault):
             tenant_sig=sig,
             supersedes=row["supersedes"] if "supersedes" in row_keys else None,
             superseded_by=row["superseded_by"] if "superseded_by" in row_keys else None,
+            origin=(row["origin"] or "unknown") if "origin" in row_keys else "unknown",
+            source_ref=row["source_ref"] if "source_ref" in row_keys else None,
+            confidence=row["confidence"] if "confidence" in row_keys else None,
         )
 
     def archive(
@@ -2121,7 +2262,7 @@ class SQLiteMemoryVault(MemoryVault):
             "SELECT id, category, key, content, metadata_json, version, archived, "
             "created_at, updated_at, is_encrypted, encrypted_envelope_json, "
             "scope, epistemic_state, valid_from, valid_until, tenant_sig, "
-            "supersedes, superseded_by FROM entities WHERE 1=1"
+            "supersedes, superseded_by, origin, source_ref, confidence FROM entities WHERE 1=1"
         )
         params: List[Any] = []
 
@@ -2379,6 +2520,68 @@ class SQLiteMemoryVault(MemoryVault):
             holder_id=holder_id,
         )
 
+    def remember(
+        self,
+        category: str,
+        key: str,
+        content: str,
+        *,
+        origin: str,
+        source_ref: Optional[str] = None,
+        confidence: Optional[float] = None,
+        **kwargs: Any,
+    ) -> MemoryEntity:
+        """Store a fact with its provenance. ``origin`` is required and must be one of :data:`ORIGINS`.
+
+        A ``model`` write is stored as ``candidate`` whatever ``epistemic_state`` says, and cannot
+        replace an entry a person verified (:class:`ReviewedEntryError`). Other keyword arguments
+        are those of :meth:`put`.
+        """
+        _validate_origin(origin)
+        return self.put(
+            category=category, key=key, content=content, origin=origin, source_ref=source_ref,
+            confidence=confidence, **kwargs,
+        )
+
+    def admit(
+        self,
+        category: str,
+        key: str,
+        *,
+        reviewer: str,
+        reviewer_origin: str,
+        note: Optional[str] = None,
+        scope: str = "default",
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
+    ) -> MemoryEntity:
+        """Promote an entry to ``verified``. Only a person (``reviewer_origin="user"``) may do so.
+
+        A model or tool asking to verify raises :class:`AdmissionRefused`; the entry is left as it is.
+        The human path is ``python -m kibisis admit --category C --key K --by user``.
+        """
+        _validate_origin(reviewer_origin, "reviewer_origin")
+        if reviewer_origin != "user":
+            entity = self.get(category=category, key=key, scope=scope)
+            raise AdmissionRefused(
+                f"'{category}:{key}' [scope={scope}] cannot be promoted to verified by a {reviewer_origin} reviewer "
+                f"(entry origin={entity.origin if entity else 'missing'}). A person admits it with: "
+                f"python -m kibisis admit --category {category} --key {key} --scope {scope} --by user"
+            )
+        return self.review_entity(
+            category=category,
+            key=key,
+            verdict=EpistemicState.VERIFIED.value,
+            scope=scope,
+            reviewer_id=reviewer,
+            notes=note,
+            reviewer_origin=reviewer_origin,
+            fencing_token=fencing_token,
+            resource=resource,
+            holder_id=holder_id,
+        )
+
     def review_entity(
         self,
         category: str,
@@ -2390,11 +2593,17 @@ class SQLiteMemoryVault(MemoryVault):
         fencing_token: Optional[int] = None,
         resource: Optional[str] = None,
         holder_id: Optional[str] = None,
+        reviewer_origin: str = "user",
     ) -> MemoryEntity:
-        """Human review gate: update epistemic state based on review decision (verified, disputed, revoked)."""
+        """Human review gate: update epistemic state based on review decision (verified, disputed, revoked).
+
+        This is the person's API; callers that relay a model's request use :meth:`admit`, which refuses
+        anything but ``reviewer_origin="user"``. The verdict's origin is kept in ``human_reviews``.
+        """
         valid_verdicts = {EpistemicState.VERIFIED.value, EpistemicState.DISPUTED.value, EpistemicState.REVOKED.value}
         if verdict not in valid_verdicts:
             raise ValueError(f"Verdict must be one of {valid_verdicts}, got '{verdict}'")
+        _validate_origin(reviewer_origin, "reviewer_origin")
 
         entity = self.get(category=category, key=key, scope=scope)
         if entity is None:
@@ -2408,6 +2617,7 @@ class SQLiteMemoryVault(MemoryVault):
             "verdict": verdict,
             "notes": notes or "",
             "previous_state": entity.epistemic_state.value,
+            "reviewer_origin": reviewer_origin,
         })
         meta["human_reviews"] = reviews
 
@@ -2423,6 +2633,12 @@ class SQLiteMemoryVault(MemoryVault):
                 resource=resource,
                 holder_id=holder_id,
             )
+            if entity.epistemic_state != EpistemicState.REVOKED:
+                with self._conn:
+                    self._record_state_transition(
+                        self._conn.cursor(), category, key, scope, entity.epistemic_state.value,
+                        EpistemicState.REVOKED.value, entity.origin, reviewer_id,
+                    )
             entity.archived = True
             entity.epistemic_state = EpistemicState.REVOKED
             entity.metadata = meta
@@ -2474,6 +2690,7 @@ class SQLiteMemoryVault(MemoryVault):
         scope: Optional[str] = None,
         category: Optional[str] = None,
         limit: int = 100,
+        key: Optional[str] = None,
     ) -> List[AuditEvent]:
         """Fetch chronological audit records from the tamper-evident hash chain."""
         cursor = self._conn.cursor()
@@ -2488,6 +2705,9 @@ class SQLiteMemoryVault(MemoryVault):
         if category:
             query_sql += " AND category = ?"
             params.append(category)
+        if key:
+            query_sql += " AND key = ?"
+            params.append(key)
         query_sql += " ORDER BY sequence ASC LIMIT ?"
         params.append(limit)
         cursor.execute(query_sql, params)

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Provenance on every entry: `entities.origin` (`user` | `model` | `tool` | `import` | `unknown`, NOT NULL,
+  CHECK-constrained), `source_ref` and `confidence`. Rows that predate the column migrate as `unknown`; nothing
+  claims they were a person's. `Vault.remember(..., origin=...)` requires an origin; `put()`/`store()` accept it.
+- `origin="model"` writes are stored as `candidate` whatever `epistemic_state` says (the trust ceiling is implied by
+  provenance, not by the caller) and cannot replace an entry a person verified (`ReviewedEntryError`).
+- `Vault.admit(category, key, reviewer=, reviewer_origin=)` promotes to `verified` only for `reviewer_origin="user"`;
+  a model or tool reviewer raises `AdmissionRefused` and the entry is left untouched. Human path:
+  `python -m kibisis admit --category C --key K --by user` (new `__main__`).
+- Every epistemic-state transition (review, admit, supersede, revoke) is journaled as a `state_transition` audit
+  event and mirrored to the Argus ledger through the `argus_ledger` library (`ARGUS_LEDGER_PATH`; empty string
+  disables), so the hash chain stays valid. `list_audit_events()` gains a `key` filter.
+- The MCP server's `remember` path now carries `origin="model"`.
+
 ### Changed
 - CI: every action is pinned to a full commit SHA (the Rust toolchain action followed a branch) and runs on Node 24.
   Dependabot proposes weekly grouped updates for actions, Cargo and Python (uv) dependencies once a release is 7 days

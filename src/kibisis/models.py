@@ -56,6 +56,14 @@ class MemoryEntity(BaseModel):
         description="HMAC-SHA256 signature for post-retrieval tenant ownership validation."
     )
 
+    # Provenance: who put the fact here, and how sure they were.
+    origin: str = Field(
+        default="unknown",
+        description="Where the entry came from: user, model, tool, import, or unknown (predates provenance).",
+    )
+    source_ref: Optional[str] = Field(default=None, description="Opaque pointer to the source (session/turn, tool call, file).")
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Writer's confidence in [0, 1], if stated.")
+
     # Directional Supersession Linkage
     supersedes: Optional[str] = Field(
         default=None,
