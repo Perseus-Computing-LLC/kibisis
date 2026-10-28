@@ -61,6 +61,18 @@ _ENTITY_COLUMNS = (
 
 # Where an entry came from. "model" writes are capped at candidate and cannot promote themselves.
 ORIGINS = ("user", "model", "tool", "import", "unknown")
+
+#: Metadata keys the vault writes itself and reads back as facts about trust and ownership. A caller's
+#: ``metadata`` argument cannot set them: ``_put`` drops them (and logs the drop) unless the write
+#: comes from an internal path whose metadata the vault produced (``review_entity``, ``import_snapshot``).
+#: ``human_reviews`` is what ``_is_reviewed`` consults, so a caller-supplied value would forge a
+#: person's review; ``tenant_id`` and ``principal_id`` bound recall; ``lineage_*`` is reserved.
+RESERVED_METADATA_KEYS = frozenset({"human_reviews", "tenant_id", "principal_id"})
+RESERVED_METADATA_PREFIX = "lineage_"
+
+
+def _reserved_metadata_keys(meta: Dict[str, Any]) -> List[str]:
+    return sorted(k for k in meta if k in RESERVED_METADATA_KEYS or str(k).startswith(RESERVED_METADATA_PREFIX))
 _ORIGIN_CHECK = "CHECK (origin IN ('user','model','tool','import','unknown'))"
 DEFAULT_ARGUS_LEDGER_PATH = "/opt/data/runtime/argus/audit.jsonl"
 
@@ -1265,8 +1277,13 @@ class SQLiteMemoryVault(MemoryVault):
         origin: Optional[str] = None,
         source_ref: Optional[str] = None,
         confidence: Optional[float] = None,
+        _trusted_metadata: bool = False,
     ) -> MemoryEntity:
-        """Write path behind :meth:`put`, which journals the tombstone refusals this raises."""
+        """Write path behind :meth:`put`, which journals the tombstone refusals this raises.
+
+        ``_trusted_metadata`` is set only by internal callers whose ``metadata`` the vault itself
+        produced; a caller's reserved keys (:data:`RESERVED_METADATA_KEYS`) are dropped otherwise.
+        """
         if trust_ceiling is not None and trust_ceiling != EpistemicState.CANDIDATE.value:
             raise ValueError("trust_ceiling supports only 'candidate'")
         _validate_origin(origin)
@@ -1277,6 +1294,14 @@ class SQLiteMemoryVault(MemoryVault):
             trust_ceiling = EpistemicState.CANDIDATE.value
         now = time.time()
         meta = dict(metadata or {})
+        if not _trusted_metadata:
+            # Trust facts come from the vault's own paths, never from the payload: a caller that writes
+            # metadata["human_reviews"] would otherwise count as a person's review in _is_reviewed.
+            dropped = _reserved_metadata_keys(meta)
+            for k in dropped:
+                meta.pop(k)
+            if dropped:
+                logger.warning("put %s:%s [scope=%s] dropped reserved metadata keys %s", category, key, scope, dropped)
         if author_id:
             # Keep the original author when a reviewer re-writes an entry; the review is in human_reviews.
             meta.setdefault("author_id", author_id)
@@ -1547,6 +1572,7 @@ class SQLiteMemoryVault(MemoryVault):
         origin: Optional[str] = None,
         source_ref: Optional[str] = None,
         confidence: Optional[float] = None,
+        _trusted_metadata: bool = False,
     ) -> MemoryEntity:
         """Insert or update an entity. See ``__init__`` for ``fencing_token``, ``resource`` and ``holder_id``.
 
@@ -1562,6 +1588,10 @@ class SQLiteMemoryVault(MemoryVault):
 
         ``author_id`` is recorded in the entity's metadata and in the audit journal. A write whose
         value a tombstone rejects raises :class:`TombstonedValueError`, and the refusal is journaled.
+
+        Reserved metadata keys (:data:`RESERVED_METADATA_KEYS`, ``lineage_*``) in ``metadata`` are
+        dropped and logged; the vault sets them itself (``review_entity``, the ``tenant_id`` and
+        ``principal_id`` arguments). ``_trusted_metadata`` is internal.
         """
         try:
             return self._put(
@@ -1587,6 +1617,7 @@ class SQLiteMemoryVault(MemoryVault):
                 origin=origin,
                 source_ref=source_ref,
                 confidence=confidence,
+                _trusted_metadata=_trusted_metadata,
             )
         except TombstonedValueError as exc:
             # The write's transaction rolled back; journal the refusal in its own transaction.
@@ -2639,6 +2670,7 @@ class SQLiteMemoryVault(MemoryVault):
             holder_id=holder_id,
             supersedes_key=proposal["key"] if proposal else None,
             supersedes_category=proposal["category"] if proposal else None,
+            _trusted_metadata=True,  # human_reviews was appended here, inside the write transaction
         )
 
     def scrub(self) -> None:
@@ -3048,6 +3080,9 @@ class SQLiteMemoryVault(MemoryVault):
                 fencing_token=fencing_token,
                 resource=resource,
                 holder_id=holder_id,
+                # A restore keeps the exported review history and tenant bounds. The snapshot's
+                # epistemic_state is already trusted here, so this grants nothing it did not have.
+                _trusted_metadata=True,
             )
             if ent_data.get("archived"):
                 self.archive(
