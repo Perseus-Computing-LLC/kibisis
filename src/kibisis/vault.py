@@ -1437,16 +1437,11 @@ class SQLiteMemoryVault(MemoryVault):
                 )
                 entity_id = cursor.lastrowid
                 version = 1
-                created_at = now
-                existing_superseded_by = None
                 stored_origin = origin or "unknown"
-                stored_source_ref, stored_confidence = source_ref, confidence
             else:
                 action = "update"
                 entity_id = row["id"]
                 version = row["version"] + 1
-                created_at = row["created_at"]
-                existing_superseded_by = row["superseded_by"]
                 previous_state = row["epistemic_state"]
                 # Provenance belongs to the fact: a re-write that does not state an origin keeps the original.
                 stored_origin = origin or row["origin"] or "unknown"
@@ -1486,28 +1481,12 @@ class SQLiteMemoryVault(MemoryVault):
                 self._record_state_transition(
                     cursor, category, key, scope, previous_state, ep_state.value, stored_origin, author_id
                 )
+            # Return what was stored, through the same constructor the read paths use, so the write
+            # path cannot report a field differently from a later get() or search().
+            cursor.execute(f"SELECT {_ENTITY_COLUMNS} FROM entities e WHERE e.id = ?", (entity_id,))
+            written = cursor.fetchone()
 
-        return MemoryEntity(
-            id=entity_id,
-            category=category,
-            key=key,
-            content=content,
-            metadata=meta,
-            version=version,
-            archived=False,
-            created_at=created_at,
-            updated_at=now,
-            epistemic_state=ep_state,
-            valid_from=valid_from,
-            valid_until=valid_until,
-            scope=scope,
-            tenant_sig=tenant_sig,
-            supersedes=supersedes_ref or meta.get("supersedes"),
-            superseded_by=existing_superseded_by or meta.get("superseded_by"),
-            origin=stored_origin,
-            source_ref=stored_source_ref,
-            confidence=stored_confidence,
-        )
+        return self._entity(written, content)
 
     def _record_state_transition(
         self,
@@ -1793,30 +1772,7 @@ class SQLiteMemoryVault(MemoryVault):
             return None
 
         content = self._open_entry(row)  # raises EntryIntegrityError for a tampered or unsigned entry
-        row_keys = row.keys()
-        sig = row["tenant_sig"]
-
-        return MemoryEntity(
-            id=row["id"],
-            category=row["category"],
-            key=row["key"],
-            content=content,
-            metadata=json.loads(row["metadata_json"]),
-            version=row["version"],
-            archived=bool(row["archived"]),
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-            epistemic_state=EpistemicState(row["epistemic_state"]) if "epistemic_state" in row_keys else EpistemicState.VERIFIED,
-            valid_from=row["valid_from"] if "valid_from" in row_keys else None,
-            valid_until=row["valid_until"] if "valid_until" in row_keys else None,
-            scope=row["scope"] if "scope" in row_keys else "default",
-            tenant_sig=sig,
-            supersedes=row["supersedes"] if "supersedes" in row_keys else None,
-            superseded_by=row["superseded_by"] if "superseded_by" in row_keys else None,
-            origin=(row["origin"] or "unknown") if "origin" in row_keys else "unknown",
-            source_ref=row["source_ref"] if "source_ref" in row_keys else None,
-            confidence=row["confidence"] if "confidence" in row_keys else None,
-        )
+        return self._entity(row, content)
 
     def archive(
         self,
@@ -2238,6 +2194,12 @@ class SQLiteMemoryVault(MemoryVault):
 
     @staticmethod
     def _entity(r: Any, content: str) -> MemoryEntity:
+        """The one row-to-entity constructor, used by every read path and by the write path's return.
+
+        Three hand-written copies of this mapping drifted apart: search and list left out origin,
+        source_ref and confidence, so every entry they returned claimed origin 'unknown'. One
+        constructor means a column added to the entity is added to every path or to none.
+        """
         keys = r.keys()
         return MemoryEntity(
             id=r["id"],
@@ -2256,6 +2218,9 @@ class SQLiteMemoryVault(MemoryVault):
             tenant_sig=r["tenant_sig"],
             supersedes=r["supersedes"] if "supersedes" in keys else None,
             superseded_by=r["superseded_by"] if "superseded_by" in keys else None,
+            origin=(r["origin"] or "unknown") if "origin" in keys else "unknown",
+            source_ref=r["source_ref"] if "source_ref" in keys else None,
+            confidence=r["confidence"] if "confidence" in keys else None,
         )
 
     def list_entities(
@@ -2306,28 +2271,7 @@ class SQLiteMemoryVault(MemoryVault):
             content = self._readable_content(r)
             if content is None:
                 continue  # failed its integrity check: tampered, damaged, or moved from another entry
-            sig = r["tenant_sig"]
-
-            items.append(
-                MemoryEntity(
-                    id=r["id"],
-                    category=r["category"],
-                    key=r["key"],
-                    content=content,
-                    metadata=json.loads(r["metadata_json"]),
-                    version=r["version"],
-                    archived=bool(r["archived"]),
-                    created_at=r["created_at"],
-                    updated_at=r["updated_at"],
-                    epistemic_state=EpistemicState(r["epistemic_state"]) if "epistemic_state" in r.keys() else EpistemicState.VERIFIED,
-                    valid_from=r["valid_from"] if "valid_from" in r.keys() else None,
-                    valid_until=r["valid_until"] if "valid_until" in r.keys() else None,
-                    scope=r["scope"] if "scope" in r.keys() else "default",
-                    tenant_sig=sig,
-                    supersedes=r["supersedes"] if "supersedes" in r.keys() else None,
-                    superseded_by=r["superseded_by"] if "superseded_by" in r.keys() else None,
-                )
-            )
+            items.append(self._entity(r, content))
         return items
 
     @staticmethod

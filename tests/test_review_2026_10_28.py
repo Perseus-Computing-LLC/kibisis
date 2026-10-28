@@ -110,3 +110,36 @@ def test_tombstone_still_refuses_sequentially():
         v.put("c", "other", "a rejected value")
     assert v.list_audit_events(limit=100)[-1].action == "refuse"
     assert v.verify_audit_chain()
+
+
+# K-02: provenance must survive every read path, not only get().
+
+
+def _provenance(entity):
+    return (entity.origin, entity.source_ref, entity.confidence)
+
+
+@pytest.mark.parametrize("passphrase", [None, PASSPHRASE])
+def test_search_list_and_put_report_the_same_provenance_as_get(tmp_path, passphrase):
+    if passphrase is None:
+        v = SQLiteMemoryVault(":memory:", allow_plaintext=True)
+    else:
+        v = SQLiteMemoryVault(str(tmp_path / "prov.sqlite"), passphrase=passphrase)
+    written = v.put(
+        "c", "k", "tabs for indentation", origin="user", source_ref="ticket-7", confidence=0.9,
+        epistemic_state="verified",
+    )
+    got = v.get("c", "k")
+    assert _provenance(got) == ("user", "ticket-7", 0.9)
+    assert _provenance(written) == _provenance(got)
+    hits = v.search("indentation")
+    assert hits and hits[0].entity.origin == got.origin
+    assert _provenance(hits[0].entity) == _provenance(got)
+    listed = v.list_entities()
+    assert len(listed) == 1 and _provenance(listed[0]) == _provenance(got)
+    # A re-write that gives no provenance keeps the stored one on every path.
+    rewritten = v.put("c", "k", "tabs for indentation, always", epistemic_state="verified")
+    assert _provenance(rewritten) == ("user", "ticket-7", 0.9)
+    assert _provenance(v.search("indentation")[0].entity) == ("user", "ticket-7", 0.9)
+    assert _provenance(v.list_entities()[0]) == ("user", "ticket-7", 0.9)
+    v.close()
