@@ -55,8 +55,13 @@ Findings from the 2026-10-28 review, by id:
 - K-10: the Rust `sha256_hex` has FIPS 180-4 known-answer tests (empty string, `abc`, 56-, 64- and 112-byte inputs).
 - K-12: the `KIBISIS_ADMIT_ALLOW_NOTTY` escape from the admit TTY gate is removed; tests use a pseudo-terminal.
 
-### Not changed
-- K-03/K-04 (audit chain does not cover `metadata_json`; `:`-joined hash payload; no anchored tail) are open.
+- K-03/K-04: journal format 3. Each audit event's hash is now a SHA-256 of a canonical JSON array (field boundaries are
+  unambiguous: a `:` in a category or key can no longer alias another event) that includes a digest of the event's
+  metadata, so a rewritten reviewer or verdict fails `verify_audit_chain()`. Every append also signs the chain head
+  (sequence and hash, HMAC under the vault's signing key) into a one-row `audit_head` table, so deleting rows from
+  the tail, or the head itself, fails verification. Rows carry their `format`; journals written by older versions
+  keep verifying under their own layout and are anchored by their first new append. `AuditEvent` gains `format`.
+  The Rust crate's journal (`src/lib.rs`) is a separate implementation and is unchanged.
 
 ## [0.1.0-alpha.9] - 2026-10-21
 

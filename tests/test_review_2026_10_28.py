@@ -270,3 +270,102 @@ def test_lease_ttl_is_bounded_and_lease_carries_monotonic_deadline():
     # A lease read back from the table was not acquired here, so it has no local deadline.
     assert coord.get_lease("r").local_deadline is None
     coord.close()
+
+
+# K-03 / K-04: the journal hash covers metadata and field boundaries; the signed head anchors the tail.
+
+
+def _journal_vault(tmp_path):
+    v = SQLiteMemoryVault(str(tmp_path / "audit.sqlite"), passphrase=PASSPHRASE)
+    for i in range(5):
+        v.put("c", f"k{i}", f"value {i}", epistemic_state="verified")
+    v.review_entity("c", "k1", "disputed", reviewer_id="alice")
+    assert v.verify_audit_chain()
+    return v
+
+
+def test_event_hash_has_unambiguous_field_boundaries_and_covers_metadata():
+    from kibisis.vault import JOURNAL_FORMAT, _event_hash
+
+    assert JOURNAL_FORMAT == 3
+    zero = "0" * 64
+    assert _event_hash(1, 1.0, "put", "a:b", "c", "s", "", zero, None) != _event_hash(1, 1.0, "put", "a", "b:c", "s", "", zero, None)
+    assert _event_hash(1, 1.0, "put", "a", "b", "s", "", zero, None, {"reviewer": "alice"}) != _event_hash(
+        1, 1.0, "put", "a", "b", "s", "", zero, None, {"reviewer": "mallory"}
+    )
+    # The legacy layout is still reproducible for rows written under it.
+    legacy = _event_hash(1, 1.0, "put", "a:b", "c", "s", "", zero, None, fmt=2)
+    assert legacy == _event_hash(1, 1.0, "put", "a", "b:c", "s", "", zero, None, fmt=2)
+
+
+def test_metadata_rewrite_fails_verification(tmp_path):
+    v = _journal_vault(tmp_path)
+    with v._conn:
+        v._conn.execute(
+            "UPDATE audit_journal SET metadata_json = ? WHERE action = 'state_transition'",
+            ('{"reviewer":"mallory","forged":true}',),
+        )
+    assert not v.verify_audit_chain()
+    v.close()
+
+
+def test_tail_truncation_fails_verification(tmp_path):
+    v = _journal_vault(tmp_path)
+    with v._conn:
+        v._conn.execute("DELETE FROM audit_journal WHERE sequence = (SELECT MAX(sequence) FROM audit_journal)")
+    assert not v.verify_audit_chain()
+    v.close()
+
+
+def test_removing_or_forging_the_head_fails_verification(tmp_path):
+    v = _journal_vault(tmp_path)
+    head = v._conn.execute("SELECT sequence, event_hash, mac FROM audit_head").fetchone()
+    assert head is not None
+    with v._conn:
+        v._conn.execute("DELETE FROM audit_head")
+    assert not v.verify_audit_chain()  # a format 3 journal must be anchored
+    # Re-pointing the head at an earlier row without the signing key does not verify either.
+    with v._conn:
+        v._conn.execute("DELETE FROM audit_journal WHERE sequence = (SELECT MAX(sequence) FROM audit_journal)")
+        last = v._conn.execute("SELECT sequence, event_hash FROM audit_journal ORDER BY sequence DESC LIMIT 1").fetchone()
+        v._conn.execute(
+            "INSERT INTO audit_head (id, sequence, event_hash, mac) VALUES (1, ?, ?, ?)",
+            (last["sequence"], last["event_hash"], "00" * 32),
+        )
+    assert not v.verify_audit_chain()
+    v.close()
+
+
+def test_legacy_format_rows_still_verify_and_new_rows_anchor(tmp_path):
+    """A journal written by an older version has format 2 rows and no head; it verifies on its links,
+    and the first new append anchors it."""
+    from kibisis.vault import _event_hash
+
+    v = _journal_vault(tmp_path)
+    rows = v._conn.execute(
+        "SELECT sequence, timestamp, action, category, key, scope, value_sha256, author_id FROM audit_journal ORDER BY sequence"
+    ).fetchall()
+    with v._conn:
+        prev = "0" * 64
+        for r in rows:  # rewrite the journal as an older version would have written it
+            h = _event_hash(r["sequence"], r["timestamp"], r["action"], r["category"], r["key"], r["scope"],
+                            r["value_sha256"], prev, r["author_id"], fmt=2)
+            v._conn.execute(
+                "UPDATE audit_journal SET prev_hash = ?, event_hash = ?, format = 2 WHERE sequence = ?",
+                (prev, h, r["sequence"]),
+            )
+            prev = h
+        v._conn.execute("DELETE FROM audit_head")
+    assert v.verify_audit_chain()
+    assert all(e.format == 2 for e in v.list_audit_events(limit=100))
+    v.put("c", "new", "appended by the current version")
+    events = v.list_audit_events(limit=100)
+    assert events[-1].format == 3 and events[-2].format == 2
+    assert v.verify_audit_chain()
+    head = v._conn.execute("SELECT sequence, event_hash FROM audit_head").fetchone()
+    assert (head["sequence"], head["event_hash"]) == (events[-1].sequence, events[-1].event_hash)
+    # Tail truncation of the mixed journal is now detected too.
+    with v._conn:
+        v._conn.execute("DELETE FROM audit_journal WHERE sequence = (SELECT MAX(sequence) FROM audit_journal)")
+    assert not v.verify_audit_chain()
+    v.close()

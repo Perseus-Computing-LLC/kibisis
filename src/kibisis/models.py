@@ -180,6 +180,14 @@ class AuditEvent(BaseModel):
     event_hash: str = Field(description="SHA-256 hash of this event.")
     author_id: Optional[str] = Field(default=None, description="Identifier of author or agent.")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional context metadata.")
+    format: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            "Hash layout the row was written under. 1 and 2: ':'-joined fields, metadata not covered. "
+            "3: canonical JSON array including a digest of the metadata."
+        ),
+    )
 
 
 class SearchResult(BaseModel):

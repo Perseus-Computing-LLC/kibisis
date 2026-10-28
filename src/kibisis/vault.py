@@ -47,6 +47,14 @@ logger = logging.getLogger(__name__)
 #: the first time it is opened with its passphrase.
 INTEGRITY_FORMAT = 2
 
+#: Journal hash layout this version writes (``audit_journal.format``). Formats 1 and 2 hashed a
+#: ``':'``-joined string of eight fields and left ``metadata_json`` out, so a ``':'`` inside a category
+#: or key could alias another event and a rewritten reviewer or verdict passed verification. Format 3
+#: hashes a canonical JSON array (unambiguous field boundaries) that includes a digest of the metadata,
+#: and every append also signs the chain head into ``audit_head`` so a deleted tail is detected.
+#: Rows written under an older format keep verifying under their own layout.
+JOURNAL_FORMAT = 3
+
 #: Version of the entry index (``entities_search``) that a SQLCipher vault keeps for ranked search. A vault
 #: whose index has another version, or none, gets one built from its entries when opened with its passphrase.
 SEARCH_INDEX_FORMAT = 1
@@ -290,10 +298,38 @@ def _event_hash(
     value_sha256: str,
     prev_hash: str,
     author_id: Optional[str],
+    metadata: Optional[Dict[str, Any]] = None,
+    fmt: int = JOURNAL_FORMAT,
 ) -> str:
-    """SHA-256 of one journal event, which links to the one before it through ``prev_hash``."""
-    payload = f"{sequence}:{timestamp:.6f}:{action}:{category}:{key}:{scope}:{value_sha256}:{prev_hash}:{author_id or ''}"
+    """SHA-256 of one journal event, which links to the one before it through ``prev_hash``.
+
+    ``fmt`` selects the layout the row was written under (see :data:`JOURNAL_FORMAT`). Formats below 3
+    reproduce the legacy ``':'``-joined payload, metadata excluded, so older journals still verify.
+    """
+    if fmt < 3:
+        payload = f"{sequence}:{timestamp:.6f}:{action}:{category}:{key}:{scope}:{value_sha256}:{prev_hash}:{author_id or ''}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    # A digest of the canonical metadata, not the metadata itself, keeps the payload bounded and makes
+    # the hash independent of how the stored JSON happens to be spaced.
+    meta_digest = hashlib.sha256(
+        json.dumps(metadata or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    fields = [
+        int(sequence), f"{timestamp:.6f}", action, category, key, scope, value_sha256, prev_hash, author_id or "",
+        meta_digest,
+    ]
+    payload = json.dumps(fields, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _head_mac(signing_key: bytes, sequence: int, event_hash: str) -> str:
+    """HMAC over the chain head, so the last row cannot be removed or replaced without the signing key.
+
+    Without a passphrase the signing key is not secret (it is derived from the path), so the head
+    then catches accidental truncation only; with a passphrase it is derived from the passphrase.
+    """
+    payload = json.dumps([int(sequence), event_hash], separators=(",", ":")).encode("utf-8")
+    return hmac.new(signing_key, b"kibisis audit head v1:" + payload, hashlib.sha256).hexdigest()
 
 
 def _rekey_metadata(metadata: Dict[str, Any], digest_key: bytes) -> bool:
@@ -822,6 +858,21 @@ class SQLiteMemoryVault(MemoryVault):
                 ON audit_journal(scope, category, key)
                 """
             )
+            # Journal rows written before the column existed used the legacy layout (format 2 at most).
+            journal_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(audit_journal)").fetchall()}
+            if "format" not in journal_cols:
+                self._conn.execute("ALTER TABLE audit_journal ADD COLUMN format INTEGER NOT NULL DEFAULT 2")
+            # One row: the sequence and hash of the newest event, signed. Updated with every append.
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_head (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    sequence INTEGER NOT NULL,
+                    event_hash TEXT NOT NULL,
+                    mac TEXT NOT NULL
+                )
+                """
+            )
 
     def _record_audit_event(
         self,
@@ -847,19 +898,23 @@ class SQLiteMemoryVault(MemoryVault):
         last_row = cursor.fetchone()
         seq, prev_hash = (last_row["sequence"] + 1, last_row["event_hash"]) if last_row else (1, "0" * 64)
 
-        event_hash = _event_hash(seq, now, action, category, key, scope, value_sha256, prev_hash, author_id)
+        event_hash = _event_hash(
+            seq, now, action, category, key, scope, value_sha256, prev_hash, author_id, meta_dict, fmt=JOURNAL_FORMAT
+        )
         meta_json = json.dumps(meta_dict, sort_keys=True)
 
         cursor.execute(
             """
             INSERT INTO audit_journal (
                 sequence, timestamp, action, category, key, scope, value_sha256,
-                prev_hash, event_hash, author_id, metadata_json
+                prev_hash, event_hash, author_id, metadata_json, format
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (seq, now, action, category, key, scope, value_sha256, prev_hash, event_hash, author_id, meta_json),
+            (seq, now, action, category, key, scope, value_sha256, prev_hash, event_hash, author_id, meta_json,
+             JOURNAL_FORMAT),
         )
+        self._write_audit_head(cursor, seq, event_hash)
         return AuditEvent(
             sequence=seq,
             timestamp=now,
@@ -872,6 +927,14 @@ class SQLiteMemoryVault(MemoryVault):
             event_hash=event_hash,
             author_id=author_id,
             metadata=meta_dict,
+            format=JOURNAL_FORMAT,
+        )
+
+    def _write_audit_head(self, cursor: Any, sequence: int, event_hash: str) -> None:
+        """Sign the chain head, in the same transaction as the append it describes."""
+        cursor.execute(
+            "INSERT OR REPLACE INTO audit_head (id, sequence, event_hash, mac) VALUES (1, ?, ?, ?)",
+            (sequence, event_hash, _head_mac(self._signing_key, sequence, event_hash)),
         )
 
     # Integrity: sealing, signing and checking entries, keyed digests, and the format 2 upgrade.
@@ -1066,7 +1129,7 @@ class SQLiteMemoryVault(MemoryVault):
             ).fetchall()
             events = cursor.execute(
                 "SELECT sequence, timestamp, action, category, key, scope, value_sha256, prev_hash, event_hash, "
-                "author_id, metadata_json FROM audit_journal ORDER BY sequence ASC"
+                "author_id, metadata_json, format FROM audit_journal ORDER BY sequence ASC"
             ).fetchall()
             if not (rows or tombstones or events):
                 self._set_meta(cursor, "integrity_format", INTEGRITY_FORMAT)
@@ -1139,7 +1202,7 @@ class SQLiteMemoryVault(MemoryVault):
                     counts["journal_events_rekeyed"] += 1
                 event_hash = _event_hash(
                     ev["sequence"], ev["timestamp"], ev["action"], ev["category"], ev["key"], ev["scope"],
-                    value, prev_hash, ev["author_id"],
+                    value, prev_hash, ev["author_id"], metadata, fmt=ev["format"],
                 )
                 cursor.execute(
                     "UPDATE audit_journal SET value_sha256 = ?, prev_hash = ?, event_hash = ?, metadata_json = ? "
@@ -2703,7 +2766,7 @@ class SQLiteMemoryVault(MemoryVault):
         cursor = self._conn.cursor()
         query_sql = (
             "SELECT sequence, timestamp, action, category, key, scope, value_sha256, "
-            "prev_hash, event_hash, author_id, metadata_json FROM audit_journal WHERE 1=1"
+            "prev_hash, event_hash, author_id, metadata_json, format FROM audit_journal WHERE 1=1"
         )
         params: List[Any] = []
         if scope:
@@ -2734,16 +2797,22 @@ class SQLiteMemoryVault(MemoryVault):
                     event_hash=r["event_hash"],
                     author_id=r["author_id"],
                     metadata=json.loads(r["metadata_json"]),
+                    format=r["format"],
                 )
             )
         return events
 
     def verify_audit_chain(self, scope: Optional[str] = None) -> bool:
-        """Verify the cryptographic integrity of the append-only mutation journal hash chain."""
+        """Verify the append-only mutation journal: every link, every row's hash, and the signed head.
+
+        Each row is recomputed under the layout it was written with (``format``), so journals from
+        older versions verify. Once the vault has written a format 3 row, ``audit_head`` must exist,
+        carry a valid MAC and name the last row: deleting rows from the tail, or the head itself,
+        then fails verification. A journal with only legacy rows and no head verifies on its links
+        alone, as it did before the head existed.
+        """
         # Always verify the entire hash chain (or records up to limit), because prev_hash links consecutive global events
         events = self.list_audit_events(scope=None, limit=1_000_000)
-        if not events:
-            return True
 
         expected_prev = "0" * 64
         for ev in events:
@@ -2751,12 +2820,21 @@ class SQLiteMemoryVault(MemoryVault):
                 return False
             recomputed = _event_hash(
                 ev.sequence, ev.timestamp, ev.action, ev.category, ev.key, ev.scope, ev.value_sha256, ev.prev_hash,
-                ev.author_id,
+                ev.author_id, ev.metadata, fmt=ev.format,
             )
-            if recomputed != ev.event_hash:
+            if not hmac.compare_digest(recomputed, ev.event_hash):
                 return False
             expected_prev = ev.event_hash
-        return True
+
+        head = self._conn.execute("SELECT sequence, event_hash, mac FROM audit_head WHERE id = 1").fetchone()
+        anchored = any(ev.format >= 3 for ev in events)
+        if head is None:
+            return not anchored
+        if not hmac.compare_digest(_head_mac(self._signing_key, head["sequence"], head["event_hash"]), head["mac"]):
+            return False
+        if not events:
+            return False  # a signed head with no rows: the whole journal was removed
+        return head["sequence"] == events[-1].sequence and head["event_hash"] == events[-1].event_hash
 
     def set_persona_slot(
         self,
