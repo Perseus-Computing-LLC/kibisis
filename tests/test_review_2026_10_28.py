@@ -215,3 +215,31 @@ def test_snapshot_round_trip_keeps_review_history_and_tenant(tmp_path):
     got = dst.get("c", "k")
     assert got.metadata["tenant_id"] == "acme"
     assert got.metadata["human_reviews"][-1]["reviewer_id"] == "alice"
+
+
+# K-09: a stored iteration count is unauthenticated; bound it before paying for PBKDF2.
+
+
+def test_envelope_iteration_count_is_bounded(monkeypatch):
+    import pydantic
+
+    from kibisis.crypto import AESGCMCryptoEnvelopeProvider
+    from kibisis.models import EncryptedEnvelope
+
+    provider = AESGCMCryptoEnvelopeProvider()
+    envelope = provider.encrypt(b"x", PASSPHRASE)
+    assert provider.decrypt(envelope, PASSPHRASE) == b"x"
+
+    with pytest.raises(pydantic.ValidationError):
+        EncryptedEnvelope.model_validate({**envelope.model_dump(), "iterations": 5_000_001})
+
+    calls = []
+    monkeypatch.setattr(provider, "_derive_key", lambda *a, **k: calls.append(a) or (_ for _ in ()).throw(AssertionError))
+    too_many = envelope.model_copy(update={"iterations": provider.MAX_ITERATIONS + 1})
+    with pytest.raises(ValueError, match="iteration count"):
+        provider.decrypt(too_many, PASSPHRASE)
+    assert calls == []  # rejected before any key derivation
+
+    # The default and twice the default are still accepted (older and future envelopes).
+    assert provider.MAX_ITERATIONS == provider.ITERATIONS * 2
+    assert EncryptedEnvelope.model_validate({**envelope.model_dump(), "iterations": provider.MAX_ITERATIONS}).iterations == provider.MAX_ITERATIONS
