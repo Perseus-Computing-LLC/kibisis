@@ -19,10 +19,10 @@ def _require_tty() -> None:
     """``admit --by user`` asserts a person is present; refuse when stdin is not a terminal.
 
     An agent driving a shell tool, a cron job or a pipe has no TTY, so this check keeps the
-    human path from being replayed by automation. ``KIBISIS_ADMIT_ALLOW_NOTTY=1`` is for tests only.
+    human path from being replayed by automation. There is no environment-variable escape: an
+    agent can set a variable as easily as a person can, so one would turn the gate into a
+    convention. The test suite drives this through a pseudo-terminal instead.
     """
-    if os.environ.get("KIBISIS_ADMIT_ALLOW_NOTTY") == "1":
-        return
     if not sys.stdin.isatty():
         raise NotInteractive("admit requires an interactive terminal (stdin is not a TTY); run it yourself in a shell")
 

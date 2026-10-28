@@ -124,6 +124,26 @@ def test_state_transition_emits_audit_event(tmp_path, monkeypatch):
     assert r.returncode == 0, r.stdout + r.stderr
 
 
+def _run_admit(args, *, tty: bool):
+    """Run the CLI's admit command with stdin on a pseudo-terminal (``tty=True``) or on /dev/null.
+
+    The gate checks ``sys.stdin.isatty()``; a pty slave is the real thing, so the test exercises the
+    same code path a person at a shell does, with no environment escape to keep in sync.
+    """
+    import pty
+
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    cmd = [sys.executable, "-m", "kibisis", "admit", *args]
+    if not tty:
+        return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env, timeout=60)
+    master, slave = pty.openpty()
+    try:
+        return subprocess.run(cmd, stdin=slave, capture_output=True, text=True, env=env, timeout=60)
+    finally:
+        os.close(slave)
+        os.close(master)
+
+
 def test_admit_cli_sets_reviewer_origin_user(tmp_path, monkeypatch):
     db = str(tmp_path / "v.sqlite")
     monkeypatch.setenv("KIBISIS_PASSPHRASE", "test-passphrase")
@@ -131,19 +151,30 @@ def test_admit_cli_sets_reviewer_origin_user(tmp_path, monkeypatch):
     v = SQLiteMemoryVault(db, passphrase="test-passphrase")
     v.remember("c", "k", "fact", origin="model")
     v.close()
-    r = subprocess.run(
-        [sys.executable, "-m", "kibisis", "admit", "--db", db, "--category", "c", "--key", "k", "--by", "user",
-         "--note", "looked at it"],
-        capture_output=True, text=True, env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path), "KIBISIS_ADMIT_ALLOW_NOTTY": "1"},
-    )
+    common = ["--db", db, "--category", "c", "--key", "k"]
+    r = _run_admit([*common, "--by", "user", "--note", "looked at it"], tty=True)
     assert r.returncode == 0, r.stdout + r.stderr
-    r2 = subprocess.run(
-        [sys.executable, "-m", "kibisis", "admit", "--db", db, "--category", "c", "--key", "k", "--by", "model"],
-        capture_output=True, text=True, env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path), "KIBISIS_ADMIT_ALLOW_NOTTY": "1"},
-    )
+    r2 = _run_admit([*common, "--by", "model"], tty=True)
     assert r2.returncode != 0
     v = SQLiteMemoryVault(db, passphrase="test-passphrase")
     assert v.get("c", "k").epistemic_state == EpistemicState.VERIFIED
+    v.close()
+
+
+def test_admit_cli_refuses_without_tty_even_with_env_escape(tmp_path, monkeypatch):
+    """The gate has no environment escape: the variable the old test suite used must do nothing."""
+    db = str(tmp_path / "v.sqlite")
+    monkeypatch.setenv("KIBISIS_PASSPHRASE", "test-passphrase")
+    monkeypatch.delenv("KIBISIS_PASSPHRASE_FILE", raising=False)
+    monkeypatch.setenv("KIBISIS_ADMIT_ALLOW_NOTTY", "1")
+    v = SQLiteMemoryVault(db, passphrase="test-passphrase")
+    v.remember("c", "k", "fact", origin="model")
+    v.close()
+    r = _run_admit(["--db", db, "--category", "c", "--key", "k", "--by", "user"], tty=False)
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "interactive terminal" in r.stderr
+    v = SQLiteMemoryVault(db, passphrase="test-passphrase")
+    assert v.get("c", "k").epistemic_state == EpistemicState.CANDIDATE
     v.close()
 
 
@@ -151,7 +182,6 @@ def test_admit_cli_refuses_without_tty(tmp_path, monkeypatch):
     """The human admit path must not be drivable from a pipe (agent shell tool, cron)."""
     import io
     from kibisis.__main__ import main
-    monkeypatch.delenv("KIBISIS_ADMIT_ALLOW_NOTTY", raising=False)
     monkeypatch.setattr("sys.stdin", io.StringIO(""))  # no isatty -> False
     rc = main(["admit", "--db", str(tmp_path / "v.sqlite"), "--category", "c", "--key", "k", "--by", "user"])
     assert rc == 3

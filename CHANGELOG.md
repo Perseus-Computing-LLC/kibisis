@@ -21,7 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disables), so the hash chain stays valid. `list_audit_events()` gains a `key` filter.
 - The MCP server's `remember` path now carries `origin="model"`.
 - `python -m kibisis admit` refuses when stdin is not a terminal (exit 3), so the human path cannot be replayed
-  through an agent's shell tool, a pipe or cron. `KIBISIS_ADMIT_ALLOW_NOTTY=1` exists for the test suite only.
+  through an agent's shell tool, a pipe or cron. There is no environment-variable escape; the test suite drives
+  the command through a pseudo-terminal.
 
 ### Changed
 - CI: every action is pinned to a full commit SHA (the Rust toolchain action followed a branch) and runs on Node 24.
