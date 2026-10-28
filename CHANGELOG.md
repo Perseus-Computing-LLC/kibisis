@@ -7,10 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Provenance on every entry: `entities.origin` (`user` | `model` | `tool` | `import` | `unknown`, NOT NULL,
+  CHECK-constrained), `source_ref` and `confidence`. Rows that predate the column migrate as `unknown`; nothing
+  claims they were a person's. `Vault.remember(..., origin=...)` requires an origin; `put()`/`store()` accept it.
+- `origin="model"` writes are stored as `candidate` whatever `epistemic_state` says (the trust ceiling is implied by
+  provenance, not by the caller) and cannot replace an entry a person verified (`ReviewedEntryError`).
+- `Vault.admit(category, key, reviewer=, reviewer_origin=)` promotes to `verified` only for `reviewer_origin="user"`;
+  a model or tool reviewer raises `AdmissionRefused` and the entry is left untouched. Human path:
+  `python -m kibisis admit --category C --key K --by user` (new `__main__`).
+- Every epistemic-state transition (review, admit, supersede, revoke) is journaled as a `state_transition` audit
+  event and mirrored to the Argus ledger through the `argus_ledger` library (`ARGUS_LEDGER_PATH`; empty string
+  disables), so the hash chain stays valid. `list_audit_events()` gains a `key` filter.
+- The MCP server's `remember` path now carries `origin="model"`.
+- `python -m kibisis admit` refuses when stdin is not a terminal (exit 3), so the human path cannot be replayed
+  through an agent's shell tool, a pipe or cron. There is no environment-variable escape; the test suite drives
+  the command through a pseudo-terminal.
+
 ### Changed
 - CI: every action is pinned to a full commit SHA (the Rust toolchain action followed a branch) and runs on Node 24.
   Dependabot proposes weekly grouped updates for actions, Cargo and Python (uv) dependencies once a release is 7 days
   old, and an OpenSSF Scorecard workflow reports to code scanning.
+- `Lease` gains `local_deadline` (a `time.monotonic()` deadline set by the coordinator that acquired or renewed it)
+  and `is_locally_expired`; `renew` updates the caller's `Lease` in place. `SQLiteLeaseCoordinator`'s docstring
+  states the wall-clock assumption behind `expires_at` (K-07).
+- README: the lease throughput figure is labelled as lease decisions per second under contention on the Rust
+  in-memory coordinator (about 95% of counted attempts were rejected); the Python vault's leases are SQLite
+  transactions.
+
+### Fixed
+Findings from the 2026-10-28 review, by id:
+- K-01: every mutating vault method takes the SQLite write lock (`BEGIN IMMEDIATE`) before its first read, through
+  one `_write_tx()` context manager. The tombstone gate, the reviewed-entry check and the audit head read used to
+  run unlocked, so a second connection could tombstone a value between the check and the insert and the rejected
+  value stayed readable. `review_entity` runs its read and re-write in one transaction. Regression test with two
+  connections on one file.
+- K-02: `search()` and `list_entities()` reported `origin="unknown"` and dropped `source_ref` and `confidence` for
+  every entry. One `_entity()` constructor now serves `get`, `search`, `list_entities` and the `put` return value.
+- K-05: `export_snapshot(path)` creates its file with mode `0600` (`O_EXCL`), fsyncs and renames atomically, and
+  removes the temp file on failure. It used to inherit the umask and write decrypted entries world-readable.
+- K-06: `human_reviews`, `tenant_id`, `principal_id` and `lineage_*` are reserved metadata keys. `put()` drops them
+  from caller-supplied `metadata` (and logs the drop); only `review_entity` and `import_snapshot` write them. A
+  caller could previously forge a person's review and lock an entry against model correction.
+- K-07: `acquire` and `renew` reject `ttl_seconds` outside `(0, 86400]`.
+- K-09: `EncryptedEnvelope.iterations` is capped at 5,000,000, and `decrypt` refuses counts above
+  `ITERATIONS * 2` before running PBKDF2, so a tampered row cannot dictate an unbounded KDF cost.
+- K-10: the Rust `sha256_hex` has FIPS 180-4 known-answer tests (empty string, `abc`, 56-, 64- and 112-byte inputs).
+- K-12: the `KIBISIS_ADMIT_ALLOW_NOTTY` escape from the admit TTY gate is removed; tests use a pseudo-terminal.
+
+- K-03/K-04: journal format 3. Each audit event's hash is now a SHA-256 of a canonical JSON array (field boundaries are
+  unambiguous: a `:` in a category or key can no longer alias another event) that includes a digest of the event's
+  metadata, so a rewritten reviewer or verdict fails `verify_audit_chain()`. Every append also signs the chain head
+  (sequence and hash, HMAC under the vault's signing key) into a one-row `audit_head` table, so deleting rows from
+  the tail, or the head itself, fails verification. Rows carry their `format`; journals written by older versions
+  keep verifying under their own layout and are anchored by their first new append. `AuditEvent` gains `format`.
+  The Rust crate's journal (`src/lib.rs`) is a separate implementation and is unchanged.
 
 ## [0.1.0-alpha.9] - 2026-10-21
 

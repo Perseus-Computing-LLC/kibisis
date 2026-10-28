@@ -17,8 +17,35 @@ from .models import Lease
 from .protocols import LeaseConflictError, LeaseCoordinator
 
 
+#: Longest lease a caller may ask for, in seconds. A lease that outlives its holder blocks every
+#: other holder until the wall clock passes ``expires_at``; one day bounds that damage. Callers that
+#: need longer hold renew.
+MAX_TTL_SECONDS = 86_400.0
+
+
+def _check_ttl(ttl_seconds: float) -> float:
+    ttl = float(ttl_seconds)
+    if not ttl > 0:
+        raise ValueError("ttl_seconds must be positive")
+    if ttl > MAX_TTL_SECONDS:
+        raise ValueError(f"ttl_seconds must be at most {MAX_TTL_SECONDS:.0f} (one day); renew to hold longer")
+    return ttl
+
+
 class SQLiteLeaseCoordinator(LeaseCoordinator):
-    """Atomic concurrency lease coordinator utilizing SQLite IMMEDIATE transactions and monotonic fencing tokens."""
+    """Atomic concurrency lease coordinator utilizing SQLite IMMEDIATE transactions and monotonic fencing tokens.
+
+    Clock assumption. Expiry (``expires_at``) is compared against the wall clock (``time.time()``) of
+    whichever process asks, because the lease row is shared by processes and hosts that have no
+    common monotonic clock. Fencing tokens live in the row, increase under ``BEGIN IMMEDIATE`` and
+    never reset, so their ordering does not depend on any clock. Expiry does: a backwards clock step
+    or a paused VM can make a live lease look expired to another process (which may then take it
+    over while the first holder still writes until its next fenced call) or an expired lease look
+    live. Keep the hosts' clocks synchronised, keep TTLs short (at most :data:`MAX_TTL_SECONDS`),
+    renew rather than over-provision, and fence every write. Each :class:`~kibisis.models.Lease`
+    this coordinator hands out also carries ``local_deadline``, a ``time.monotonic()`` deadline the
+    holder can check in its own process without trusting the wall clock.
+    """
 
     def __init__(self, db_path: str = ":memory:", passphrase: Optional[str] = None) -> None:
         self.db_path = db_path
@@ -97,11 +124,11 @@ class SQLiteLeaseCoordinator(LeaseCoordinator):
             raise ValueError("resource must be a non-empty string")
         if not holder_id or not holder_id.strip():
             raise ValueError("holder_id must be a non-empty string")
-        if ttl_seconds <= 0:
-            raise ValueError("ttl_seconds must be positive")
+        ttl_seconds = _check_ttl(ttl_seconds)
 
         with self._immediate_tx() as cursor:
             now = time.time()
+            local_deadline = time.monotonic() + ttl_seconds
             new_expires_at = now + ttl_seconds
             cursor.execute(
                 "SELECT holder_id, fencing_token, expires_at FROM concurrency_leases WHERE resource = ?",
@@ -149,14 +176,15 @@ class SQLiteLeaseCoordinator(LeaseCoordinator):
             fencing_token=fencing_token,
             acquired_at=now,
             expires_at=new_expires_at,
+            local_deadline=local_deadline,
         )
 
     def renew(self, lease: Lease, ttl_seconds: float) -> bool:
-        if ttl_seconds <= 0:
-            raise ValueError("ttl_seconds must be positive")
+        ttl_seconds = _check_ttl(ttl_seconds)
 
         with self._immediate_tx() as cursor:
             now = time.time()
+            local_deadline = time.monotonic() + ttl_seconds
             new_expires_at = now + ttl_seconds
             cursor.execute(
                 """
@@ -166,7 +194,12 @@ class SQLiteLeaseCoordinator(LeaseCoordinator):
                 """,
                 (new_expires_at, lease.resource, lease.holder_id, lease.fencing_token, now),
             )
-            return cursor.rowcount == 1
+            renewed = cursor.rowcount == 1
+        if renewed:
+            # Keep the caller's Lease in step with the row so its own deadline checks stay useful.
+            lease.expires_at = new_expires_at
+            lease.local_deadline = local_deadline
+        return renewed
 
     def release(self, lease: Lease) -> bool:
         with self._immediate_tx() as cursor:

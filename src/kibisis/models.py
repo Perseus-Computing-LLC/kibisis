@@ -56,6 +56,14 @@ class MemoryEntity(BaseModel):
         description="HMAC-SHA256 signature for post-retrieval tenant ownership validation."
     )
 
+    # Provenance: who put the fact here, and how sure they were.
+    origin: str = Field(
+        default="unknown",
+        description="Where the entry came from: user, model, tool, import, or unknown (predates provenance).",
+    )
+    source_ref: Optional[str] = Field(default=None, description="Opaque pointer to the source (session/turn, tool call, file).")
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Writer's confidence in [0, 1], if stated.")
+
     # Directional Supersession Linkage
     supersedes: Optional[str] = Field(
         default=None,
@@ -104,7 +112,15 @@ class EncryptedEnvelope(BaseModel):
     """Encrypted data envelope carrying ciphertext and KDF/cipher parameters."""
     cipher: str = Field(default="aes-256-gcm", description="Cipher identifier.")
     kdf: str = Field(default="pbkdf2-sha256", description="Key derivation function.")
-    iterations: int = Field(default=100_000, ge=1, description="PBKDF2 iteration count. Envelopes written before this field existed used 100,000.")
+    iterations: int = Field(
+        default=100_000,
+        ge=1,
+        le=5_000_000,
+        description=(
+            "PBKDF2 iteration count. Envelopes written before this field existed used 100,000. The upper bound "
+            "stops a tampered row from dictating an unbounded KDF cost before the tag check can reject it."
+        ),
+    )
     salt_b64: str = Field(description="Base64-encoded KDF salt.")
     nonce_b64: str = Field(description="Base64-encoded cipher initialization nonce/IV.")
     ciphertext_b64: str = Field(description="Base64-encoded ciphertext.")
@@ -124,12 +140,31 @@ class Lease(BaseModel):
     holder_id: str = Field(description="Identifier of the lease holder.")
     fencing_token: int = Field(ge=1, description="Monotonically increasing fencing counter.")
     acquired_at: float = Field(description="Unix timestamp when lease was granted.")
-    expires_at: float = Field(description="Unix timestamp when lease expires.")
+    expires_at: float = Field(description="Unix timestamp when lease expires (wall clock, shared across processes).")
+    local_deadline: Optional[float] = Field(
+        default=None,
+        description=(
+            "time.monotonic() deadline in the process that acquired or renewed the lease. Set by the coordinator; "
+            "None for a lease read back from the table. Not meaningful in any other process."
+        ),
+    )
 
     @property
     def is_expired(self) -> bool:
-        """Whether the lease has passed its expiration time."""
+        """Whether the lease has passed its expiration time by the wall clock."""
         return time.time() >= self.expires_at
+
+    @property
+    def is_locally_expired(self) -> bool:
+        """Whether the acquiring process's monotonic clock has passed the deadline.
+
+        Immune to wall-clock steps, so a holder can stop writing when its own TTL has run out even
+        if the shared ``expires_at`` still looks live. Falls back to :attr:`is_expired` when the
+        lease was not acquired in this process.
+        """
+        if self.local_deadline is None:
+            return self.is_expired
+        return time.monotonic() >= self.local_deadline
 
 
 class AuditEvent(BaseModel):
@@ -145,6 +180,14 @@ class AuditEvent(BaseModel):
     event_hash: str = Field(description="SHA-256 hash of this event.")
     author_id: Optional[str] = Field(default=None, description="Identifier of author or agent.")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional context metadata.")
+    format: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            "Hash layout the row was written under. 1 and 2: ':'-joined fields, metadata not covered. "
+            "3: canonical JSON array including a digest of the metadata."
+        ),
+    )
 
 
 class SearchResult(BaseModel):

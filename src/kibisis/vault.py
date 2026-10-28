@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import inspect
@@ -46,6 +47,14 @@ logger = logging.getLogger(__name__)
 #: the first time it is opened with its passphrase.
 INTEGRITY_FORMAT = 2
 
+#: Journal hash layout this version writes (``audit_journal.format``). Formats 1 and 2 hashed a
+#: ``':'``-joined string of eight fields and left ``metadata_json`` out, so a ``':'`` inside a category
+#: or key could alias another event and a rewritten reviewer or verdict passed verification. Format 3
+#: hashes a canonical JSON array (unambiguous field boundaries) that includes a digest of the metadata,
+#: and every append also signs the chain head into ``audit_head`` so a deleted tail is detected.
+#: Rows written under an older format keep verifying under their own layout.
+JOURNAL_FORMAT = 3
+
 #: Version of the entry index (``entities_search``) that a SQLCipher vault keeps for ranked search. A vault
 #: whose index has another version, or none, gets one built from its entries when opened with its passphrase.
 SEARCH_INDEX_FORMAT = 1
@@ -55,8 +64,52 @@ _OPERATIONAL_ERRORS = (sqlite3.OperationalError, sqlcipher3.OperationalError)
 _ENTITY_COLUMNS = (
     "e.id, e.category, e.key, e.content, e.metadata_json, e.version, e.archived, e.created_at, e.updated_at, "
     "e.is_encrypted, e.encrypted_envelope_json, e.scope, e.epistemic_state, e.valid_from, e.valid_until, "
-    "e.tenant_sig, e.supersedes, e.superseded_by"
+    "e.tenant_sig, e.supersedes, e.superseded_by, e.origin, e.source_ref, e.confidence"
 )
+
+# Where an entry came from. "model" writes are capped at candidate and cannot promote themselves.
+ORIGINS = ("user", "model", "tool", "import", "unknown")
+
+#: Metadata keys the vault writes itself and reads back as facts about trust and ownership. A caller's
+#: ``metadata`` argument cannot set them: ``_put`` drops them (and logs the drop) unless the write
+#: comes from an internal path whose metadata the vault produced (``review_entity``, ``import_snapshot``).
+#: ``human_reviews`` is what ``_is_reviewed`` consults, so a caller-supplied value would forge a
+#: person's review; ``tenant_id`` and ``principal_id`` bound recall; ``lineage_*`` is reserved.
+RESERVED_METADATA_KEYS = frozenset({"human_reviews", "tenant_id", "principal_id"})
+RESERVED_METADATA_PREFIX = "lineage_"
+
+
+def _reserved_metadata_keys(meta: Dict[str, Any]) -> List[str]:
+    return sorted(k for k in meta if k in RESERVED_METADATA_KEYS or str(k).startswith(RESERVED_METADATA_PREFIX))
+_ORIGIN_CHECK = "CHECK (origin IN ('user','model','tool','import','unknown'))"
+DEFAULT_ARGUS_LEDGER_PATH = "/opt/data/runtime/argus/audit.jsonl"
+
+
+def _validate_origin(origin: Optional[str], what: str = "origin") -> Optional[str]:
+    if origin is None:
+        return None
+    if origin not in ORIGINS:
+        raise ValueError(f"{what} must be one of {ORIGINS}, got {origin!r}")
+    return origin
+
+
+def _argus_ledger_path() -> Optional[str]:
+    """Argus ledger that state transitions are mirrored to; ARGUS_LEDGER_PATH="" turns it off."""
+    if "ARGUS_LEDGER_PATH" in os.environ:
+        return os.environ["ARGUS_LEDGER_PATH"] or None
+    return DEFAULT_ARGUS_LEDGER_PATH if os.path.exists(DEFAULT_ARGUS_LEDGER_PATH) else None
+
+
+def _argus_append(event_type: str, actor: str, payload: Dict[str, Any]) -> None:
+    """Append through the argus_ledger library only, so the hash chain stays valid. Never raises."""
+    path = _argus_ledger_path()
+    if not path:
+        return
+    try:
+        from argus_ledger import AppendOnlyLedger  # optional dependency
+        AppendOnlyLedger(path).append(event_type=event_type, actor=actor, payload=payload)
+    except Exception as exc:  # pragma: no cover - best effort mirror
+        logger.debug("argus mirror skipped (%s): %s", event_type, exc)
 # What keys-only search reads: no content, no sealed content.
 _HIT_COLUMNS = "e.id, e.category, e.key, e.scope, e.metadata_json"
 # Words that match="any" leaves out of a query while the query has other words.
@@ -211,6 +264,10 @@ class ReviewedEntryError(PermissionError):
     """Raised when a capped (model-originated) write targets an entry a person verified or reviewed."""
 
 
+class AdmissionRefused(PermissionError):
+    """Raised when a reviewer that is not a person tries to promote an entry to ``verified``."""
+
+
 class EntryIntegrityError(PermissionError):
     """Raised when a stored entry fails its integrity check: it has no signature, its signature does
     not verify, or its sealed content does not belong to it. ``get`` raises it; ``search`` and
@@ -241,10 +298,38 @@ def _event_hash(
     value_sha256: str,
     prev_hash: str,
     author_id: Optional[str],
+    metadata: Optional[Dict[str, Any]] = None,
+    fmt: int = JOURNAL_FORMAT,
 ) -> str:
-    """SHA-256 of one journal event, which links to the one before it through ``prev_hash``."""
-    payload = f"{sequence}:{timestamp:.6f}:{action}:{category}:{key}:{scope}:{value_sha256}:{prev_hash}:{author_id or ''}"
+    """SHA-256 of one journal event, which links to the one before it through ``prev_hash``.
+
+    ``fmt`` selects the layout the row was written under (see :data:`JOURNAL_FORMAT`). Formats below 3
+    reproduce the legacy ``':'``-joined payload, metadata excluded, so older journals still verify.
+    """
+    if fmt < 3:
+        payload = f"{sequence}:{timestamp:.6f}:{action}:{category}:{key}:{scope}:{value_sha256}:{prev_hash}:{author_id or ''}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    # A digest of the canonical metadata, not the metadata itself, keeps the payload bounded and makes
+    # the hash independent of how the stored JSON happens to be spaced.
+    meta_digest = hashlib.sha256(
+        json.dumps(metadata or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    fields = [
+        int(sequence), f"{timestamp:.6f}", action, category, key, scope, value_sha256, prev_hash, author_id or "",
+        meta_digest,
+    ]
+    payload = json.dumps(fields, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _head_mac(signing_key: bytes, sequence: int, event_hash: str) -> str:
+    """HMAC over the chain head, so the last row cannot be removed or replaced without the signing key.
+
+    Without a passphrase the signing key is not secret (it is derived from the path), so the head
+    then catches accidental truncation only; with a passphrase it is derived from the passphrase.
+    """
+    payload = json.dumps([int(sequence), event_hash], separators=(",", ":")).encode("utf-8")
+    return hmac.new(signing_key, b"kibisis audit head v1:" + payload, hashlib.sha256).hexdigest()
 
 
 def _rekey_metadata(metadata: Dict[str, Any], digest_key: bytes) -> bool:
@@ -258,6 +343,14 @@ def _rekey_metadata(metadata: Dict[str, Any], digest_key: bytes) -> bool:
         del detail["value_digest_prefix"]  # a prefix of a plain digest cannot be keyed, and still leaks
         changed = True
     return changed
+
+
+def row_origin(row: Any) -> str:
+    """Origin of a fetched row; 'unknown' for rows and cursors that predate the column."""
+    try:
+        return row["origin"] or "unknown"
+    except (IndexError, KeyError):
+        return "unknown"
 
 
 def _is_reviewed(row: Any) -> bool:
@@ -459,15 +552,41 @@ class SQLiteMemoryVault(MemoryVault):
     ) -> None:
         """Check the caller's fencing token inside the write transaction, holding the write lock.
 
-        Skipped when no token or resource is passed and ``enforce_fencing`` is off. Otherwise the
-        vault takes its write lock first (``BEGIN IMMEDIATE``), so a write whose token passes is
-        ordered before any write by a later lease holder, never after it.
+        Skipped when no token or resource is passed and ``enforce_fencing`` is off. The caller has
+        already taken the write lock through :meth:`_write_tx`, so a write whose token passes is
+        ordered before any write by a later lease holder, never after it. This method does not
+        begin a transaction itself: taking the lock here, after the caller's reads, is what let a
+        tombstone check run unlocked.
         """
         if fencing_token is None and resource is None and not self.enforce_fencing:
             return
-        if not self._conn.in_transaction:
-            cursor.execute("BEGIN IMMEDIATE")
         self._validate_fencing(fencing_token, resource, holder_id)
+
+    @contextlib.contextmanager
+    def _write_tx(self):
+        """Run a mutation under the SQLite write lock, taken before its first read.
+
+        Issues ``BEGIN IMMEDIATE`` when no transaction is open, commits when the block finishes and
+        rolls back when it raises. Python's sqlite3 module only begins a transaction before the first
+        DML statement, so a method that reads first (the tombstone gate, the reviewed-entry check,
+        the audit head) and then writes used to run its reads with no lock; another connection could
+        commit a tombstone or a review between the check and the insert. Every mutating method
+        enters this first so check-then-write is atomic against other connections.
+
+        Nested use inside an open transaction yields a cursor and leaves commit and rollback to the
+        outermost block, so a compound operation (review, then re-write) stays one transaction.
+        """
+        if self._conn.in_transaction:
+            yield self._conn.cursor()
+            return
+        cursor = self._conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            yield cursor
+        except BaseException:
+            self._conn.rollback()
+            raise
+        self._conn.commit()
 
     @staticmethod
     def _migrate_file_to_sqlcipher(path: str, passphrase: str) -> None:
@@ -493,13 +612,14 @@ class SQLiteMemoryVault(MemoryVault):
 
     def _vault_salt(self) -> bytes:
         """One random KDF salt per vault, stored beside the data. A salt is not a secret."""
-        with self._conn:
-            self._conn.execute("CREATE TABLE IF NOT EXISTS vault_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL)")
-            row = self._conn.execute("SELECT value FROM vault_meta WHERE key = 'kdf_salt'").fetchone()
+        # Locked before the read so two processes opening a new vault together agree on one salt.
+        with self._write_tx() as cursor:
+            cursor.execute("CREATE TABLE IF NOT EXISTS vault_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL)")
+            row = cursor.execute("SELECT value FROM vault_meta WHERE key = 'kdf_salt'").fetchone()
             if row is not None:
                 return bytes(row[0])
             salt = os.urandom(16)
-            self._conn.execute("INSERT INTO vault_meta (key, value) VALUES ('kdf_salt', ?)", (salt,))
+            cursor.execute("INSERT INTO vault_meta (key, value) VALUES ('kdf_salt', ?)", (salt,))
             return salt
 
     def _restrict_permissions(self) -> None:
@@ -528,14 +648,14 @@ class SQLiteMemoryVault(MemoryVault):
             "FROM entities WHERE is_encrypted = 0"
         ).fetchall()
         refused = 0
-        with self._conn:
+        with self._write_tx() as cursor:
             for r in rows:
                 try:
                     content = self._open_entry(r)  # never seal content that fails its signature check
                 except EntryIntegrityError:
                     refused += 1
                     continue
-                self._write_sealed(self._conn, r, content, encrypt=True)
+                self._write_sealed(cursor, r, content, encrypt=True)
         self.scrub()
         return {"migrated": len(rows) - refused, "remaining_plaintext": self.encryption_status()["plaintext"]}
 
@@ -568,6 +688,9 @@ class SQLiteMemoryVault(MemoryVault):
                     tenant_sig TEXT DEFAULT NULL,
                     supersedes TEXT DEFAULT NULL,
                     superseded_by TEXT DEFAULT NULL,
+                    origin TEXT NOT NULL DEFAULT 'unknown' CHECK (origin IN ('user','model','tool','import','unknown')),
+                    source_ref TEXT DEFAULT NULL,
+                    confidence REAL DEFAULT NULL,
                     UNIQUE(category, key, scope)
                 )
                 """
@@ -595,6 +718,15 @@ class SQLiteMemoryVault(MemoryVault):
                 self._conn.execute("ALTER TABLE entities ADD COLUMN supersedes TEXT DEFAULT NULL")
             if "superseded_by" not in cols:
                 self._conn.execute("ALTER TABLE entities ADD COLUMN superseded_by TEXT DEFAULT NULL")
+            if "origin" not in cols:
+                # Rows that predate provenance read as 'unknown'; nothing claims they were a person's.
+                self._conn.execute(
+                    "ALTER TABLE entities ADD COLUMN origin TEXT NOT NULL DEFAULT 'unknown' " + _ORIGIN_CHECK
+                )
+            if "source_ref" not in cols:
+                self._conn.execute("ALTER TABLE entities ADD COLUMN source_ref TEXT DEFAULT NULL")
+            if "confidence" not in cols:
+                self._conn.execute("ALTER TABLE entities ADD COLUMN confidence REAL DEFAULT NULL")
 
             # Covering B-Tree index for bitemporal point-in-time and interval queries
             self._conn.execute(
@@ -726,6 +858,21 @@ class SQLiteMemoryVault(MemoryVault):
                 ON audit_journal(scope, category, key)
                 """
             )
+            # Journal rows written before the column existed used the legacy layout (format 2 at most).
+            journal_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(audit_journal)").fetchall()}
+            if "format" not in journal_cols:
+                self._conn.execute("ALTER TABLE audit_journal ADD COLUMN format INTEGER NOT NULL DEFAULT 2")
+            # One row: the sequence and hash of the newest event, signed. Updated with every append.
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_head (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    sequence INTEGER NOT NULL,
+                    event_hash TEXT NOT NULL,
+                    mac TEXT NOT NULL
+                )
+                """
+            )
 
     def _record_audit_event(
         self,
@@ -751,19 +898,23 @@ class SQLiteMemoryVault(MemoryVault):
         last_row = cursor.fetchone()
         seq, prev_hash = (last_row["sequence"] + 1, last_row["event_hash"]) if last_row else (1, "0" * 64)
 
-        event_hash = _event_hash(seq, now, action, category, key, scope, value_sha256, prev_hash, author_id)
+        event_hash = _event_hash(
+            seq, now, action, category, key, scope, value_sha256, prev_hash, author_id, meta_dict, fmt=JOURNAL_FORMAT
+        )
         meta_json = json.dumps(meta_dict, sort_keys=True)
 
         cursor.execute(
             """
             INSERT INTO audit_journal (
                 sequence, timestamp, action, category, key, scope, value_sha256,
-                prev_hash, event_hash, author_id, metadata_json
+                prev_hash, event_hash, author_id, metadata_json, format
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (seq, now, action, category, key, scope, value_sha256, prev_hash, event_hash, author_id, meta_json),
+            (seq, now, action, category, key, scope, value_sha256, prev_hash, event_hash, author_id, meta_json,
+             JOURNAL_FORMAT),
         )
+        self._write_audit_head(cursor, seq, event_hash)
         return AuditEvent(
             sequence=seq,
             timestamp=now,
@@ -776,6 +927,14 @@ class SQLiteMemoryVault(MemoryVault):
             event_hash=event_hash,
             author_id=author_id,
             metadata=meta_dict,
+            format=JOURNAL_FORMAT,
+        )
+
+    def _write_audit_head(self, cursor: Any, sequence: int, event_hash: str) -> None:
+        """Sign the chain head, in the same transaction as the append it describes."""
+        cursor.execute(
+            "INSERT OR REPLACE INTO audit_head (id, sequence, event_hash, mac) VALUES (1, ?, ?, ?)",
+            (sequence, event_hash, _head_mac(self._signing_key, sequence, event_hash)),
         )
 
     # Integrity: sealing, signing and checking entries, keyed digests, and the format 2 upgrade.
@@ -959,9 +1118,7 @@ class SQLiteMemoryVault(MemoryVault):
         digest_key = self._digest_key
         assert digest_key is not None
         trust_unsigned = self._sqlcipher_active and not self._converted_to_sqlcipher
-        with self._conn:
-            cursor = self._conn.cursor()
-            cursor.execute("BEGIN IMMEDIATE")
+        with self._write_tx() as cursor:
             if int(self._meta("integrity_format") or 0) >= INTEGRITY_FORMAT:
                 return None  # another process upgraded it first
             rows = cursor.execute(
@@ -972,7 +1129,7 @@ class SQLiteMemoryVault(MemoryVault):
             ).fetchall()
             events = cursor.execute(
                 "SELECT sequence, timestamp, action, category, key, scope, value_sha256, prev_hash, event_hash, "
-                "author_id, metadata_json FROM audit_journal ORDER BY sequence ASC"
+                "author_id, metadata_json, format FROM audit_journal ORDER BY sequence ASC"
             ).fetchall()
             if not (rows or tombstones or events):
                 self._set_meta(cursor, "integrity_format", INTEGRITY_FORMAT)
@@ -1045,7 +1202,7 @@ class SQLiteMemoryVault(MemoryVault):
                     counts["journal_events_rekeyed"] += 1
                 event_hash = _event_hash(
                     ev["sequence"], ev["timestamp"], ev["action"], ev["category"], ev["key"], ev["scope"],
-                    value, prev_hash, ev["author_id"],
+                    value, prev_hash, ev["author_id"], metadata, fmt=ev["format"],
                 )
                 cursor.execute(
                     "UPDATE audit_journal SET value_sha256 = ?, prev_hash = ?, event_hash = ?, metadata_json = ? "
@@ -1133,9 +1290,7 @@ class SQLiteMemoryVault(MemoryVault):
             sql += " AND scope = ?"
             params.append(scope)
         adopted = 0
-        with self._conn:
-            cursor = self._conn.cursor()
-            cursor.execute("BEGIN IMMEDIATE")
+        with self._write_tx() as cursor:
             for r in cursor.execute(sql, params).fetchall():
                 try:
                     content = self._open_legacy(r)
@@ -1182,12 +1337,34 @@ class SQLiteMemoryVault(MemoryVault):
         supersedes_category: Optional[str] = None,
         auto_gate: Optional[bool] = None,
         trust_ceiling: Optional[str] = None,
+        origin: Optional[str] = None,
+        source_ref: Optional[str] = None,
+        confidence: Optional[float] = None,
+        _trusted_metadata: bool = False,
     ) -> MemoryEntity:
-        """Write path behind :meth:`put`, which journals the tombstone refusals this raises."""
+        """Write path behind :meth:`put`, which journals the tombstone refusals this raises.
+
+        ``_trusted_metadata`` is set only by internal callers whose ``metadata`` the vault itself
+        produced; a caller's reserved keys (:data:`RESERVED_METADATA_KEYS`) are dropped otherwise.
+        """
         if trust_ceiling is not None and trust_ceiling != EpistemicState.CANDIDATE.value:
             raise ValueError("trust_ceiling supports only 'candidate'")
+        _validate_origin(origin)
+        if confidence is not None and not (0.0 <= float(confidence) <= 1.0):
+            raise ValueError("confidence must be within [0, 1]")
+        if origin == "model":
+            # Trust comes from where the write came from, not from what it says about itself.
+            trust_ceiling = EpistemicState.CANDIDATE.value
         now = time.time()
         meta = dict(metadata or {})
+        if not _trusted_metadata:
+            # Trust facts come from the vault's own paths, never from the payload: a caller that writes
+            # metadata["human_reviews"] would otherwise count as a person's review in _is_reviewed.
+            dropped = _reserved_metadata_keys(meta)
+            for k in dropped:
+                meta.pop(k)
+            if dropped:
+                logger.warning("put %s:%s [scope=%s] dropped reserved metadata keys %s", category, key, scope, dropped)
         if author_id:
             # Keep the original author when a reviewer re-writes an entry; the review is in human_reviews.
             meta.setdefault("author_id", author_id)
@@ -1231,8 +1408,7 @@ class SQLiteMemoryVault(MemoryVault):
         meta_str = json.dumps(meta, sort_keys=True)
         val_hash, can_hash = self._digests(content)
 
-        with self._conn:
-            cursor = self._conn.cursor()
+        with self._write_tx() as cursor:
             self._fence(cursor, fencing_token, resource, holder_id)
             if trust_ceiling is not None:
                 # A capped write cannot replace an entry a person verified or reviewed.
@@ -1251,7 +1427,7 @@ class SQLiteMemoryVault(MemoryVault):
             if supersedes_key:
                 target_cat = supersedes_category or category
                 cursor.execute(
-                    "SELECT id, metadata_json, epistemic_state FROM entities WHERE category = ? AND key = ? AND scope = ? AND archived = 0",
+                    "SELECT id, metadata_json, epistemic_state, origin FROM entities WHERE category = ? AND key = ? AND scope = ? AND archived = 0",
                     (target_cat, supersedes_key, scope),
                 )
                 target_row = cursor.fetchone()
@@ -1291,6 +1467,11 @@ class SQLiteMemoryVault(MemoryVault):
                         author_id=author_id,
                         metadata={"superseded_by": f"{category}:{key}", "superseded_at": now},
                     )
+                    if target_row["epistemic_state"] != EpistemicState.REVOKED.value:
+                        self._record_state_transition(
+                            cursor, target_cat, supersedes_key, scope, target_row["epistemic_state"],
+                            EpistemicState.REVOKED.value, row_origin(target_row), author_id,
+                        )
 
             # Skip canonicalization when the vault has no tombstones. Asked of the database on every
             # write: a flag cached at open misses tombstones that other processes add later.
@@ -1317,10 +1498,12 @@ class SQLiteMemoryVault(MemoryVault):
             )
 
             cursor.execute(
-                "SELECT id, version, created_at, supersedes, superseded_by FROM entities WHERE category = ? AND key = ? AND scope = ?",
+                "SELECT id, version, created_at, supersedes, superseded_by, epistemic_state, origin, source_ref, confidence "
+                "FROM entities WHERE category = ? AND key = ? AND scope = ?",
                 (category, key, scope),
             )
             row = cursor.fetchone()
+            previous_state: Optional[str] = None
 
             if row is None:
                 action = "put"
@@ -1330,38 +1513,42 @@ class SQLiteMemoryVault(MemoryVault):
                         category, key, content, metadata_json, version, archived,
                         created_at, updated_at, is_encrypted, encrypted_envelope_json,
                         scope, epistemic_state, valid_from, valid_until, tenant_sig,
-                        supersedes, superseded_by
+                        supersedes, superseded_by, origin, source_ref, confidence
                     )
-                    VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
                     """,
                     (
                         category, key, stored_content, meta_str, now, now,
                         is_encrypted, envelope_json, scope, ep_state.value, valid_from, valid_until, tenant_sig,
-                        supersedes_ref
+                        supersedes_ref, origin or "unknown", source_ref, confidence
                     ),
                 )
                 entity_id = cursor.lastrowid
                 version = 1
-                created_at = now
-                existing_superseded_by = None
+                stored_origin = origin or "unknown"
             else:
                 action = "update"
                 entity_id = row["id"]
                 version = row["version"] + 1
-                created_at = row["created_at"]
-                existing_superseded_by = row["superseded_by"]
+                previous_state = row["epistemic_state"]
+                # Provenance belongs to the fact: a re-write that does not state an origin keeps the original.
+                stored_origin = origin or row["origin"] or "unknown"
+                stored_source_ref = source_ref if source_ref is not None else row["source_ref"]
+                stored_confidence = confidence if confidence is not None else row["confidence"]
                 cursor.execute(
                     """
                     UPDATE entities
                     SET content = ?, metadata_json = ?, version = ?, archived = 0, updated_at = ?,
                         is_encrypted = ?, encrypted_envelope_json = ?, epistemic_state = ?,
                         valid_from = ?, valid_until = ?, tenant_sig = ?,
-                        supersedes = COALESCE(?, supersedes)
+                        supersedes = COALESCE(?, supersedes),
+                        origin = ?, source_ref = ?, confidence = ?
                     WHERE id = ?
                     """,
                     (
                         stored_content, meta_str, version, now, is_encrypted, envelope_json,
-                        ep_state.value, valid_from, valid_until, tenant_sig, supersedes_ref, entity_id
+                        ep_state.value, valid_from, valid_until, tenant_sig, supersedes_ref,
+                        stored_origin, stored_source_ref, stored_confidence, entity_id
                     ),
                 )
             if self._search_index:
@@ -1378,24 +1565,50 @@ class SQLiteMemoryVault(MemoryVault):
                 author_id=author_id,
                 metadata={"version": version, "epistemic_state": ep_state.value},
             )
+            if previous_state is not None and previous_state != ep_state.value:
+                self._record_state_transition(
+                    cursor, category, key, scope, previous_state, ep_state.value, stored_origin, author_id
+                )
+            # Return what was stored, through the same constructor the read paths use, so the write
+            # path cannot report a field differently from a later get() or search().
+            cursor.execute(f"SELECT {_ENTITY_COLUMNS} FROM entities e WHERE e.id = ?", (entity_id,))
+            written = cursor.fetchone()
 
-        return MemoryEntity(
-            id=entity_id,
+        return self._entity(written, content)
+
+    def _record_state_transition(
+        self,
+        cursor: sqlite3.Cursor,
+        category: str,
+        key: str,
+        scope: str,
+        previous: str,
+        new: str,
+        origin: str,
+        reviewer: Optional[str],
+    ) -> None:
+        """Journal an epistemic-state change and mirror it to the Argus ledger when one is configured."""
+        payload = {
+            "event": "state_transition",
+            "from": previous,
+            "to": new,
+            "origin": origin,
+            "reviewer": reviewer,
+        }
+        self._record_audit_event(
+            cursor=cursor,
+            action="state_transition",
             category=category,
             key=key,
-            content=content,
-            metadata=meta,
-            version=version,
-            archived=False,
-            created_at=created_at,
-            updated_at=now,
-            epistemic_state=ep_state,
-            valid_from=valid_from,
-            valid_until=valid_until,
             scope=scope,
-            tenant_sig=tenant_sig,
-            supersedes=supersedes_ref or meta.get("supersedes"),
-            superseded_by=existing_superseded_by or meta.get("superseded_by"),
+            value_sha256="",
+            author_id=reviewer,
+            metadata=payload,
+        )
+        _argus_append(
+            "kibisis.state_transition",
+            reviewer or "kibisis",
+            {**payload, "category": category, "key": key, "scope": scope},
         )
 
     def put(
@@ -1419,8 +1632,15 @@ class SQLiteMemoryVault(MemoryVault):
         supersedes_category: Optional[str] = None,
         auto_gate: Optional[bool] = None,
         trust_ceiling: Optional[str] = None,
+        origin: Optional[str] = None,
+        source_ref: Optional[str] = None,
+        confidence: Optional[float] = None,
+        _trusted_metadata: bool = False,
     ) -> MemoryEntity:
         """Insert or update an entity. See ``__init__`` for ``fencing_token``, ``resource`` and ``holder_id``.
+
+        ``origin`` records where the write came from (:data:`ORIGINS`); ``origin="model"`` implies
+        ``trust_ceiling="candidate"``. A re-write that gives no origin keeps the entry's existing one.
 
         ``trust_ceiling="candidate"`` caps the stored state: a write that the admission gate or the
         ``epistemic_state`` argument would store as ``verified`` or ``disputed`` is stored as
@@ -1431,6 +1651,10 @@ class SQLiteMemoryVault(MemoryVault):
 
         ``author_id`` is recorded in the entity's metadata and in the audit journal. A write whose
         value a tombstone rejects raises :class:`TombstonedValueError`, and the refusal is journaled.
+
+        Reserved metadata keys (:data:`RESERVED_METADATA_KEYS`, ``lineage_*``) in ``metadata`` are
+        dropped and logged; the vault sets them itself (``review_entity``, the ``tenant_id`` and
+        ``principal_id`` arguments). ``_trusted_metadata`` is internal.
         """
         try:
             return self._put(
@@ -1453,6 +1677,10 @@ class SQLiteMemoryVault(MemoryVault):
                 supersedes_category=supersedes_category,
                 auto_gate=auto_gate,
                 trust_ceiling=trust_ceiling,
+                origin=origin,
+                source_ref=source_ref,
+                confidence=confidence,
+                _trusted_metadata=_trusted_metadata,
             )
         except TombstonedValueError as exc:
             # The write's transaction rolled back; journal the refusal in its own transaction.
@@ -1488,6 +1716,9 @@ class SQLiteMemoryVault(MemoryVault):
         supersedes_category: Optional[str] = None,
         auto_gate: Optional[bool] = None,
         trust_ceiling: Optional[str] = None,
+        origin: Optional[str] = None,
+        source_ref: Optional[str] = None,
+        confidence: Optional[float] = None,
     ) -> MemoryEntity:
         """Alias for put() for ergonomic convenience."""
         return self.put(
@@ -1510,6 +1741,9 @@ class SQLiteMemoryVault(MemoryVault):
             supersedes_category=supersedes_category,
             auto_gate=auto_gate,
             trust_ceiling=trust_ceiling,
+            origin=origin,
+            source_ref=source_ref,
+            confidence=confidence,
         )
 
     def record_refusal(
@@ -1530,8 +1764,7 @@ class SQLiteMemoryVault(MemoryVault):
         meta: Dict[str, Any] = {"path": path, "reason": reason}
         if detail:
             meta["detail"] = detail
-        with self._conn:
-            cursor = self._conn.cursor()
+        with self._write_tx() as cursor:
             return self._record_audit_event(
                 cursor=cursor,
                 action="refuse",
@@ -1622,7 +1855,7 @@ class SQLiteMemoryVault(MemoryVault):
             """
             SELECT id, category, key, content, metadata_json, version, archived, created_at, updated_at,
                    is_encrypted, encrypted_envelope_json, scope, epistemic_state, valid_from, valid_until, tenant_sig,
-                   supersedes, superseded_by
+                   supersedes, superseded_by, origin, source_ref, confidence
             FROM entities
             WHERE category = ? AND key = ? AND scope = ?
             """,
@@ -1633,27 +1866,7 @@ class SQLiteMemoryVault(MemoryVault):
             return None
 
         content = self._open_entry(row)  # raises EntryIntegrityError for a tampered or unsigned entry
-        row_keys = row.keys()
-        sig = row["tenant_sig"]
-
-        return MemoryEntity(
-            id=row["id"],
-            category=row["category"],
-            key=row["key"],
-            content=content,
-            metadata=json.loads(row["metadata_json"]),
-            version=row["version"],
-            archived=bool(row["archived"]),
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-            epistemic_state=EpistemicState(row["epistemic_state"]) if "epistemic_state" in row_keys else EpistemicState.VERIFIED,
-            valid_from=row["valid_from"] if "valid_from" in row_keys else None,
-            valid_until=row["valid_until"] if "valid_until" in row_keys else None,
-            scope=row["scope"] if "scope" in row_keys else "default",
-            tenant_sig=sig,
-            supersedes=row["supersedes"] if "supersedes" in row_keys else None,
-            superseded_by=row["superseded_by"] if "superseded_by" in row_keys else None,
-        )
+        return self._entity(row, content)
 
     def archive(
         self,
@@ -1666,8 +1879,7 @@ class SQLiteMemoryVault(MemoryVault):
         holder_id: Optional[str] = None,
     ) -> bool:
         now = time.time()
-        with self._conn:
-            cursor = self._conn.cursor()
+        with self._write_tx() as cursor:
             self._fence(cursor, fencing_token, resource, holder_id)
             cursor.execute(
                 """
@@ -1700,8 +1912,7 @@ class SQLiteMemoryVault(MemoryVault):
         resource: Optional[str] = None,
         holder_id: Optional[str] = None,
     ) -> bool:
-        with self._conn:
-            cursor = self._conn.cursor()
+        with self._write_tx() as cursor:
             self._fence(cursor, fencing_token, resource, holder_id)
             cursor.execute(
                 "DELETE FROM entities WHERE category = ? AND key = ? AND scope = ?",
@@ -1998,10 +2209,7 @@ class SQLiteMemoryVault(MemoryVault):
         current = self._meta("search_index_format")
         if current is None or int(current) != SEARCH_INDEX_FORMAT:
             try:
-                with self._conn:
-                    cursor = self._conn.cursor()
-                    if not self._conn.in_transaction:
-                        cursor.execute("BEGIN IMMEDIATE")
+                with self._write_tx() as cursor:
                     for trigger in ("entities_search_ai", "entities_search_au", "entities_search_ad"):
                         cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
                     cursor.execute("DROP TABLE IF EXISTS entities_search")
@@ -2067,18 +2275,12 @@ class SQLiteMemoryVault(MemoryVault):
             return
         if not self._conn.execute("SELECT EXISTS (SELECT 1 FROM entities_search_dirty)").fetchone()[0]:
             return
-        with self._conn:
-            cursor = self._conn.cursor()
-            if not self._conn.in_transaction:
-                cursor.execute("BEGIN IMMEDIATE")
+        with self._write_tx() as cursor:
             self._index_queued(cursor)
 
     def _rebuild_search_index(self) -> None:
         """Build the entry index again from the entries, so that no deleted or replaced terms stay in it."""
-        with self._conn:
-            cursor = self._conn.cursor()
-            if not self._conn.in_transaction:
-                cursor.execute("BEGIN IMMEDIATE")
+        with self._write_tx() as cursor:
             cursor.execute("INSERT INTO entities_search (entities_search) VALUES ('delete-all')")
             cursor.execute("INSERT OR IGNORE INTO entities_search_dirty (id) SELECT id FROM entities")
             self._index_queued(cursor)
@@ -2086,6 +2288,12 @@ class SQLiteMemoryVault(MemoryVault):
 
     @staticmethod
     def _entity(r: Any, content: str) -> MemoryEntity:
+        """The one row-to-entity constructor, used by every read path and by the write path's return.
+
+        Three hand-written copies of this mapping drifted apart: search and list left out origin,
+        source_ref and confidence, so every entry they returned claimed origin 'unknown'. One
+        constructor means a column added to the entity is added to every path or to none.
+        """
         keys = r.keys()
         return MemoryEntity(
             id=r["id"],
@@ -2104,6 +2312,9 @@ class SQLiteMemoryVault(MemoryVault):
             tenant_sig=r["tenant_sig"],
             supersedes=r["supersedes"] if "supersedes" in keys else None,
             superseded_by=r["superseded_by"] if "superseded_by" in keys else None,
+            origin=(r["origin"] or "unknown") if "origin" in keys else "unknown",
+            source_ref=r["source_ref"] if "source_ref" in keys else None,
+            confidence=r["confidence"] if "confidence" in keys else None,
         )
 
     def list_entities(
@@ -2121,7 +2332,7 @@ class SQLiteMemoryVault(MemoryVault):
             "SELECT id, category, key, content, metadata_json, version, archived, "
             "created_at, updated_at, is_encrypted, encrypted_envelope_json, "
             "scope, epistemic_state, valid_from, valid_until, tenant_sig, "
-            "supersedes, superseded_by FROM entities WHERE 1=1"
+            "supersedes, superseded_by, origin, source_ref, confidence FROM entities WHERE 1=1"
         )
         params: List[Any] = []
 
@@ -2154,28 +2365,7 @@ class SQLiteMemoryVault(MemoryVault):
             content = self._readable_content(r)
             if content is None:
                 continue  # failed its integrity check: tampered, damaged, or moved from another entry
-            sig = r["tenant_sig"]
-
-            items.append(
-                MemoryEntity(
-                    id=r["id"],
-                    category=r["category"],
-                    key=r["key"],
-                    content=content,
-                    metadata=json.loads(r["metadata_json"]),
-                    version=r["version"],
-                    archived=bool(r["archived"]),
-                    created_at=r["created_at"],
-                    updated_at=r["updated_at"],
-                    epistemic_state=EpistemicState(r["epistemic_state"]) if "epistemic_state" in r.keys() else EpistemicState.VERIFIED,
-                    valid_from=r["valid_from"] if "valid_from" in r.keys() else None,
-                    valid_until=r["valid_until"] if "valid_until" in r.keys() else None,
-                    scope=r["scope"] if "scope" in r.keys() else "default",
-                    tenant_sig=sig,
-                    supersedes=r["supersedes"] if "supersedes" in r.keys() else None,
-                    superseded_by=r["superseded_by"] if "superseded_by" in r.keys() else None,
-                )
-            )
+            items.append(self._entity(r, content))
         return items
 
     @staticmethod
@@ -2261,8 +2451,7 @@ class SQLiteMemoryVault(MemoryVault):
         SHA-256 hex digest; a vault with a passphrase stores it keyed (see :meth:`stored_digest`).
         """
         now = time.time()
-        with self._conn:
-            cursor = self._conn.cursor()
+        with self._write_tx() as cursor:
             self._fence(cursor, fencing_token, resource, holder_id)
             if content is None:
                 cursor.execute(
@@ -2379,6 +2568,68 @@ class SQLiteMemoryVault(MemoryVault):
             holder_id=holder_id,
         )
 
+    def remember(
+        self,
+        category: str,
+        key: str,
+        content: str,
+        *,
+        origin: str,
+        source_ref: Optional[str] = None,
+        confidence: Optional[float] = None,
+        **kwargs: Any,
+    ) -> MemoryEntity:
+        """Store a fact with its provenance. ``origin`` is required and must be one of :data:`ORIGINS`.
+
+        A ``model`` write is stored as ``candidate`` whatever ``epistemic_state`` says, and cannot
+        replace an entry a person verified (:class:`ReviewedEntryError`). Other keyword arguments
+        are those of :meth:`put`.
+        """
+        _validate_origin(origin)
+        return self.put(
+            category=category, key=key, content=content, origin=origin, source_ref=source_ref,
+            confidence=confidence, **kwargs,
+        )
+
+    def admit(
+        self,
+        category: str,
+        key: str,
+        *,
+        reviewer: str,
+        reviewer_origin: str,
+        note: Optional[str] = None,
+        scope: str = "default",
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
+    ) -> MemoryEntity:
+        """Promote an entry to ``verified``. Only a person (``reviewer_origin="user"``) may do so.
+
+        A model or tool asking to verify raises :class:`AdmissionRefused`; the entry is left as it is.
+        The human path is ``python -m kibisis admit --category C --key K --by user``.
+        """
+        _validate_origin(reviewer_origin, "reviewer_origin")
+        if reviewer_origin != "user":
+            entity = self.get(category=category, key=key, scope=scope)
+            raise AdmissionRefused(
+                f"'{category}:{key}' [scope={scope}] cannot be promoted to verified by a {reviewer_origin} reviewer "
+                f"(entry origin={entity.origin if entity else 'missing'}). A person admits it with: "
+                f"python -m kibisis admit --category {category} --key {key} --scope {scope} --by user"
+            )
+        return self.review_entity(
+            category=category,
+            key=key,
+            verdict=EpistemicState.VERIFIED.value,
+            scope=scope,
+            reviewer_id=reviewer,
+            notes=note,
+            reviewer_origin=reviewer_origin,
+            fencing_token=fencing_token,
+            resource=resource,
+            holder_id=holder_id,
+        )
+
     def review_entity(
         self,
         category: str,
@@ -2390,12 +2641,39 @@ class SQLiteMemoryVault(MemoryVault):
         fencing_token: Optional[int] = None,
         resource: Optional[str] = None,
         holder_id: Optional[str] = None,
+        reviewer_origin: str = "user",
     ) -> MemoryEntity:
-        """Human review gate: update epistemic state based on review decision (verified, disputed, revoked)."""
+        """Human review gate: update epistemic state based on review decision (verified, disputed, revoked).
+
+        This is the person's API; callers that relay a model's request use :meth:`admit`, which refuses
+        anything but ``reviewer_origin="user"``. The verdict's origin is kept in ``human_reviews``.
+        """
         valid_verdicts = {EpistemicState.VERIFIED.value, EpistemicState.DISPUTED.value, EpistemicState.REVOKED.value}
         if verdict not in valid_verdicts:
             raise ValueError(f"Verdict must be one of {valid_verdicts}, got '{verdict}'")
+        _validate_origin(reviewer_origin, "reviewer_origin")
 
+        # One write transaction from the read to the re-write: the entry a reviewer looked at is the
+        # entry the verdict lands on, and a concurrent write cannot slip in between the two.
+        with self._write_tx():
+            return self._review_locked(
+                category, key, verdict, scope, reviewer_id, notes, fencing_token, resource, holder_id, reviewer_origin
+            )
+
+    def _review_locked(
+        self,
+        category: str,
+        key: str,
+        verdict: str,
+        scope: str,
+        reviewer_id: Optional[str],
+        notes: Optional[str],
+        fencing_token: Optional[int],
+        resource: Optional[str],
+        holder_id: Optional[str],
+        reviewer_origin: str,
+    ) -> MemoryEntity:
+        """Body of :meth:`review_entity`; runs inside the caller's write transaction."""
         entity = self.get(category=category, key=key, scope=scope)
         if entity is None:
             raise KeyError(f"Entity not found for review: {category}:{key} [scope={scope}]")
@@ -2408,6 +2686,7 @@ class SQLiteMemoryVault(MemoryVault):
             "verdict": verdict,
             "notes": notes or "",
             "previous_state": entity.epistemic_state.value,
+            "reviewer_origin": reviewer_origin,
         })
         meta["human_reviews"] = reviews
 
@@ -2423,6 +2702,12 @@ class SQLiteMemoryVault(MemoryVault):
                 resource=resource,
                 holder_id=holder_id,
             )
+            if entity.epistemic_state != EpistemicState.REVOKED:
+                with self._write_tx() as cursor:
+                    self._record_state_transition(
+                        cursor, category, key, scope, entity.epistemic_state.value,
+                        EpistemicState.REVOKED.value, entity.origin, reviewer_id,
+                    )
             entity.archived = True
             entity.epistemic_state = EpistemicState.REVOKED
             entity.metadata = meta
@@ -2448,6 +2733,7 @@ class SQLiteMemoryVault(MemoryVault):
             holder_id=holder_id,
             supersedes_key=proposal["key"] if proposal else None,
             supersedes_category=proposal["category"] if proposal else None,
+            _trusted_metadata=True,  # human_reviews was appended here, inside the write transaction
         )
 
     def scrub(self) -> None:
@@ -2474,12 +2760,13 @@ class SQLiteMemoryVault(MemoryVault):
         scope: Optional[str] = None,
         category: Optional[str] = None,
         limit: int = 100,
+        key: Optional[str] = None,
     ) -> List[AuditEvent]:
         """Fetch chronological audit records from the tamper-evident hash chain."""
         cursor = self._conn.cursor()
         query_sql = (
             "SELECT sequence, timestamp, action, category, key, scope, value_sha256, "
-            "prev_hash, event_hash, author_id, metadata_json FROM audit_journal WHERE 1=1"
+            "prev_hash, event_hash, author_id, metadata_json, format FROM audit_journal WHERE 1=1"
         )
         params: List[Any] = []
         if scope:
@@ -2488,6 +2775,9 @@ class SQLiteMemoryVault(MemoryVault):
         if category:
             query_sql += " AND category = ?"
             params.append(category)
+        if key:
+            query_sql += " AND key = ?"
+            params.append(key)
         query_sql += " ORDER BY sequence ASC LIMIT ?"
         params.append(limit)
         cursor.execute(query_sql, params)
@@ -2507,16 +2797,22 @@ class SQLiteMemoryVault(MemoryVault):
                     event_hash=r["event_hash"],
                     author_id=r["author_id"],
                     metadata=json.loads(r["metadata_json"]),
+                    format=r["format"],
                 )
             )
         return events
 
     def verify_audit_chain(self, scope: Optional[str] = None) -> bool:
-        """Verify the cryptographic integrity of the append-only mutation journal hash chain."""
+        """Verify the append-only mutation journal: every link, every row's hash, and the signed head.
+
+        Each row is recomputed under the layout it was written with (``format``), so journals from
+        older versions verify. Once the vault has written a format 3 row, ``audit_head`` must exist,
+        carry a valid MAC and name the last row: deleting rows from the tail, or the head itself,
+        then fails verification. A journal with only legacy rows and no head verifies on its links
+        alone, as it did before the head existed.
+        """
         # Always verify the entire hash chain (or records up to limit), because prev_hash links consecutive global events
         events = self.list_audit_events(scope=None, limit=1_000_000)
-        if not events:
-            return True
 
         expected_prev = "0" * 64
         for ev in events:
@@ -2524,12 +2820,21 @@ class SQLiteMemoryVault(MemoryVault):
                 return False
             recomputed = _event_hash(
                 ev.sequence, ev.timestamp, ev.action, ev.category, ev.key, ev.scope, ev.value_sha256, ev.prev_hash,
-                ev.author_id,
+                ev.author_id, ev.metadata, fmt=ev.format,
             )
-            if recomputed != ev.event_hash:
+            if not hmac.compare_digest(recomputed, ev.event_hash):
                 return False
             expected_prev = ev.event_hash
-        return True
+
+        head = self._conn.execute("SELECT sequence, event_hash, mac FROM audit_head WHERE id = 1").fetchone()
+        anchored = any(ev.format >= 3 for ev in events)
+        if head is None:
+            return not anchored
+        if not hmac.compare_digest(_head_mac(self._signing_key, head["sequence"], head["event_hash"]), head["mac"]):
+            return False
+        if not events:
+            return False  # a signed head with no rows: the whole journal was removed
+        return head["sequence"] == events[-1].sequence and head["event_hash"] == events[-1].event_hash
 
     def set_persona_slot(
         self,
@@ -2704,9 +3009,20 @@ class SQLiteMemoryVault(MemoryVault):
             out_p = Path(path)
             out_p.parent.mkdir(parents=True, exist_ok=True)
             tmp_p = out_p.with_suffix(f".tmp.{os.getpid()}")
-            with open(tmp_p, "w", encoding="utf-8") as f:
-                json.dump(snapshot, f, indent=2, sort_keys=True)
-            tmp_p.replace(out_p)
+            # The snapshot holds decrypted content. A plain open() inherited the umask (0644 on most
+            # hosts) and undid the vault's at-rest protection; create the file owner-only, refuse a
+            # pre-existing path, flush to disk, then rename so a reader sees all or nothing.
+            fd = os.open(tmp_p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(snapshot, f, indent=2, sort_keys=True)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_p, out_p)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_p)
+                raise
 
         return snapshot
 
@@ -2751,8 +3067,7 @@ class SQLiteMemoryVault(MemoryVault):
         same_key = (
             scheme == "hmac-sha256" and self._digest_key is not None and data.get("digest_key_id") == self._digest_key_id()
         )
-        with self._conn:
-            cursor = self._conn.cursor()
+        with self._write_tx() as cursor:
             self._fence(cursor, fencing_token, resource, holder_id)
             for ts in data.get("tombstones", []):
                 t_scope, t_category, t_key = ts.get("scope", "default"), ts["category"], ts["key"]
@@ -2843,6 +3158,9 @@ class SQLiteMemoryVault(MemoryVault):
                 fencing_token=fencing_token,
                 resource=resource,
                 holder_id=holder_id,
+                # A restore keeps the exported review history and tenant bounds. The snapshot's
+                # epistemic_state is already trusted here, so this grants nothing it did not have.
+                _trusted_metadata=True,
             )
             if ent_data.get("archived"):
                 self.archive(

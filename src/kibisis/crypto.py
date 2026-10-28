@@ -31,6 +31,10 @@ class AESGCMCryptoEnvelopeProvider(CryptoEnvelopeProvider):
     """AES-256-GCM authenticated encryption with PBKDF2-HMAC-SHA256 key derivation."""
 
     ITERATIONS = 600_000  # new envelopes; older ones carry their own count
+    #: Highest stored iteration count ``decrypt`` will run. The count is not authenticated (it is
+    #: read before the tag check), so a writer with database access could otherwise set it to 10**9
+    #: and stall every read. Twice the current default leaves room to raise ITERATIONS once.
+    MAX_ITERATIONS = ITERATIONS * 2
     KEY_LENGTH = 32  # 256-bit key
     SALT_LENGTH = 16
     NONCE_LENGTH = 12
@@ -93,6 +97,11 @@ class AESGCMCryptoEnvelopeProvider(CryptoEnvelopeProvider):
         data, or ``aad`` that differs from the bytes it was sealed with."""
         if envelope.cipher != "aes-256-gcm":
             raise ValueError(f"Unsupported cipher: {envelope.cipher}")
+        if envelope.iterations > self.MAX_ITERATIONS:
+            # Checked before PBKDF2 runs: the cost is paid before the tag could reject the row.
+            raise ValueError(
+                f"Envelope iteration count {envelope.iterations} exceeds the limit {self.MAX_ITERATIONS}"
+            )
 
         salt = base64.b64decode(envelope.salt_b64)
         nonce = base64.b64decode(envelope.nonce_b64)

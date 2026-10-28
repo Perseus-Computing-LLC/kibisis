@@ -441,6 +441,7 @@ class KibisisMCPServer:
                 supersedes_key=_text(args, "supersedes_key"),
                 supersedes_category=_text(args, "supersedes_category"),
                 trust_ceiling=EpistemicState.CANDIDATE.value,
+                origin="model",
             )
         except ReviewedEntryError as exc:
             raise ToolRefused("reviewed_entry", str(exc), category=category, key=key) from exc
