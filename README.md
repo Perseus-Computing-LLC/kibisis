@@ -102,7 +102,7 @@ Medians of five runs of [telarch-benchmarks](https://github.com/Perseus-Computin
 | Times two processes held the lease at once, 2 to 32 processes sharing one SQLite file | 0 |
 | Late write from a paused holder | rejected |
 | Lease database after its holder is killed with SIGKILL while holding the lease | intact |
-| Lease operations per second, 16 threads, in memory (Rust) | 1,307,225 |
+| Lease decisions per second under contention, 16 threads, in memory (Rust coordinator; counts every acquire attempt, about 95% of which were rejected, so this is not acquire-release cycles and not the Python vault, whose leases are SQLite transactions) | 1,307,225 |
 
 ## How it works
 
