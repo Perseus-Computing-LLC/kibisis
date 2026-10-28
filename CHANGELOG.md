@@ -28,6 +28,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI: every action is pinned to a full commit SHA (the Rust toolchain action followed a branch) and runs on Node 24.
   Dependabot proposes weekly grouped updates for actions, Cargo and Python (uv) dependencies once a release is 7 days
   old, and an OpenSSF Scorecard workflow reports to code scanning.
+- `Lease` gains `local_deadline` (a `time.monotonic()` deadline set by the coordinator that acquired or renewed it)
+  and `is_locally_expired`; `renew` updates the caller's `Lease` in place. `SQLiteLeaseCoordinator`'s docstring
+  states the wall-clock assumption behind `expires_at` (K-07).
+- README: the lease throughput figure is labelled as lease decisions per second under contention on the Rust
+  in-memory coordinator (about 95% of counted attempts were rejected); the Python vault's leases are SQLite
+  transactions.
+
+### Fixed
+Findings from the 2026-10-28 review, by id:
+- K-01: every mutating vault method takes the SQLite write lock (`BEGIN IMMEDIATE`) before its first read, through
+  one `_write_tx()` context manager. The tombstone gate, the reviewed-entry check and the audit head read used to
+  run unlocked, so a second connection could tombstone a value between the check and the insert and the rejected
+  value stayed readable. `review_entity` runs its read and re-write in one transaction. Regression test with two
+  connections on one file.
+- K-02: `search()` and `list_entities()` reported `origin="unknown"` and dropped `source_ref` and `confidence` for
+  every entry. One `_entity()` constructor now serves `get`, `search`, `list_entities` and the `put` return value.
+- K-05: `export_snapshot(path)` creates its file with mode `0600` (`O_EXCL`), fsyncs and renames atomically, and
+  removes the temp file on failure. It used to inherit the umask and write decrypted entries world-readable.
+- K-06: `human_reviews`, `tenant_id`, `principal_id` and `lineage_*` are reserved metadata keys. `put()` drops them
+  from caller-supplied `metadata` (and logs the drop); only `review_entity` and `import_snapshot` write them. A
+  caller could previously forge a person's review and lock an entry against model correction.
+- K-07: `acquire` and `renew` reject `ttl_seconds` outside `(0, 86400]`.
+- K-09: `EncryptedEnvelope.iterations` is capped at 5,000,000, and `decrypt` refuses counts above
+  `ITERATIONS * 2` before running PBKDF2, so a tampered row cannot dictate an unbounded KDF cost.
+- K-10: the Rust `sha256_hex` has FIPS 180-4 known-answer tests (empty string, `abc`, 56-, 64- and 112-byte inputs).
+- K-12: the `KIBISIS_ADMIT_ALLOW_NOTTY` escape from the admit TTY gate is removed; tests use a pseudo-terminal.
+
+### Not changed
+- K-03/K-04 (audit chain does not cover `metadata_json`; `:`-joined hash payload; no anchored tail) are open.
 
 ## [0.1.0-alpha.9] - 2026-10-21
 
