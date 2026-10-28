@@ -243,3 +243,30 @@ def test_envelope_iteration_count_is_bounded(monkeypatch):
     # The default and twice the default are still accepted (older and future envelopes).
     assert provider.MAX_ITERATIONS == provider.ITERATIONS * 2
     assert EncryptedEnvelope.model_validate({**envelope.model_dump(), "iterations": provider.MAX_ITERATIONS}).iterations == provider.MAX_ITERATIONS
+
+
+# K-07: lease TTLs are bounded and the holder gets a monotonic deadline of its own.
+
+
+def test_lease_ttl_is_bounded_and_lease_carries_monotonic_deadline():
+    from kibisis.lease import MAX_TTL_SECONDS, SQLiteLeaseCoordinator
+
+    coord = SQLiteLeaseCoordinator(":memory:")
+    for bad in (0, -1, MAX_TTL_SECONDS + 1):
+        with pytest.raises(ValueError):
+            coord.acquire("r", "holder", ttl_seconds=bad)
+    lease = coord.acquire("r", "holder", ttl_seconds=MAX_TTL_SECONDS)
+    assert lease.local_deadline is not None
+    assert lease.local_deadline > time.monotonic()
+    assert not lease.is_locally_expired and not lease.is_expired
+    for bad in (0, MAX_TTL_SECONDS + 1):
+        with pytest.raises(ValueError):
+            coord.renew(lease, ttl_seconds=bad)
+    before = lease.local_deadline
+    assert coord.renew(lease, ttl_seconds=0.05)
+    assert lease.local_deadline < before  # renew re-arms the holder's own deadline to the new TTL
+    time.sleep(0.1)
+    assert lease.is_locally_expired
+    # A lease read back from the table was not acquired here, so it has no local deadline.
+    assert coord.get_lease("r").local_deadline is None
+    coord.close()

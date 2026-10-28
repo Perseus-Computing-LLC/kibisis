@@ -140,12 +140,31 @@ class Lease(BaseModel):
     holder_id: str = Field(description="Identifier of the lease holder.")
     fencing_token: int = Field(ge=1, description="Monotonically increasing fencing counter.")
     acquired_at: float = Field(description="Unix timestamp when lease was granted.")
-    expires_at: float = Field(description="Unix timestamp when lease expires.")
+    expires_at: float = Field(description="Unix timestamp when lease expires (wall clock, shared across processes).")
+    local_deadline: Optional[float] = Field(
+        default=None,
+        description=(
+            "time.monotonic() deadline in the process that acquired or renewed the lease. Set by the coordinator; "
+            "None for a lease read back from the table. Not meaningful in any other process."
+        ),
+    )
 
     @property
     def is_expired(self) -> bool:
-        """Whether the lease has passed its expiration time."""
+        """Whether the lease has passed its expiration time by the wall clock."""
         return time.time() >= self.expires_at
+
+    @property
+    def is_locally_expired(self) -> bool:
+        """Whether the acquiring process's monotonic clock has passed the deadline.
+
+        Immune to wall-clock steps, so a holder can stop writing when its own TTL has run out even
+        if the shared ``expires_at`` still looks live. Falls back to :attr:`is_expired` when the
+        lease was not acquired in this process.
+        """
+        if self.local_deadline is None:
+            return self.is_expired
+        return time.monotonic() >= self.local_deadline
 
 
 class AuditEvent(BaseModel):
