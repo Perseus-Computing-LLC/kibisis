@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.10] - 2026-10-28
+
+Provenance columns plus the repair set from the 2026-10-28 review (finding ids K-01 to K-12 refer to that
+review). The crate and the Python package move together to alpha.10; alpha.9 stays the last release without
+provenance.
+
 ### Added
 - Provenance on every entry: `entities.origin` (`user` | `model` | `tool` | `import` | `unknown`, NOT NULL,
   CHECK-constrained), `source_ref` and `confidence`. Rows that predate the column migrate as `unknown`; nothing
