@@ -86,6 +86,10 @@ def test_tombstone_cannot_land_between_check_and_insert(tmp_path):
 
 def test_write_tx_rolls_back_on_error_and_nests():
     v = SQLiteMemoryVault(":memory:", allow_plaintext=True)
+    # vault_meta exists only once a passphrase has been seen; create it here so the test does not depend
+    # on KIBISIS_PASSPHRASE being set in the environment (it is on developer hosts, not in CI).
+    v._conn.execute("CREATE TABLE IF NOT EXISTS vault_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL)")
+    v._conn.commit()
     with pytest.raises(RuntimeError):
         with v._write_tx() as cursor:
             cursor.execute("INSERT INTO vault_meta (key, value) VALUES ('probe', X'00')")
