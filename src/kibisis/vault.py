@@ -2899,9 +2899,20 @@ class SQLiteMemoryVault(MemoryVault):
             out_p = Path(path)
             out_p.parent.mkdir(parents=True, exist_ok=True)
             tmp_p = out_p.with_suffix(f".tmp.{os.getpid()}")
-            with open(tmp_p, "w", encoding="utf-8") as f:
-                json.dump(snapshot, f, indent=2, sort_keys=True)
-            tmp_p.replace(out_p)
+            # The snapshot holds decrypted content. A plain open() inherited the umask (0644 on most
+            # hosts) and undid the vault's at-rest protection; create the file owner-only, refuse a
+            # pre-existing path, flush to disk, then rename so a reader sees all or nothing.
+            fd = os.open(tmp_p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(snapshot, f, indent=2, sort_keys=True)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_p, out_p)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_p)
+                raise
 
         return snapshot
 

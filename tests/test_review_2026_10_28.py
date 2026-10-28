@@ -143,3 +143,29 @@ def test_search_list_and_put_report_the_same_provenance_as_get(tmp_path, passphr
     assert _provenance(v.search("indentation")[0].entity) == ("user", "ticket-7", 0.9)
     assert _provenance(v.list_entities()[0]) == ("user", "ticket-7", 0.9)
     v.close()
+
+
+# K-05: a snapshot holds decrypted content and must be owner-only on disk.
+
+
+def test_export_snapshot_file_is_owner_only_and_cleans_up(tmp_path, monkeypatch):
+    v = SQLiteMemoryVault(str(tmp_path / "enc.sqlite"), passphrase=PASSPHRASE)
+    v.put("c", "k", "secret-ish content", epistemic_state="verified")
+    old = os.umask(0o000)  # the mode must come from the create call, not from the process umask
+    try:
+        out = tmp_path / "snap.json"
+        v.export_snapshot(out)
+        assert stat.S_IMODE(out.stat().st_mode) == 0o600
+        assert "secret-ish content" in out.read_text(encoding="utf-8")
+        assert not list(tmp_path.glob("snap.tmp.*"))
+
+        # A failure while serialising leaves no temp file behind and no partial snapshot.
+        broken = tmp_path / "broken.json"
+        monkeypatch.setattr("kibisis.vault.json.dump", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+        with pytest.raises(RuntimeError):
+            v.export_snapshot(broken)
+        assert not broken.exists()
+        assert not list(tmp_path.glob("broken.tmp.*"))
+    finally:
+        os.umask(old)
+        v.close()
