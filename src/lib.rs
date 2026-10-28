@@ -1153,6 +1153,36 @@ impl LeaseCoordinator for InMemoryLeaseCoordinator {
 mod tests {
     use super::*;
 
+    /// FIPS 180-4 known-answer vectors. The implementation is hand-rolled (no dependencies), so a
+    /// padding or length-encoding bug would otherwise produce stable but wrong hashes and the Rust
+    /// journal would never cross-verify with the Python one.
+    #[test]
+    fn sha256_matches_fips_180_4_known_answers() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // 56 bytes: the message plus padding needs a second block.
+        assert_eq!(
+            sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        // 112 bytes: more than one full block of message.
+        assert_eq!(
+            sha256_hex(b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"),
+            "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1"
+        );
+        // Exactly 64 bytes: a block boundary, so the padding is a whole extra block.
+        assert_eq!(
+            sha256_hex(&[0x61u8; 64]),
+            "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb"
+        );
+    }
+
     #[test]
     fn test_vault_put_get_search() {
         let mut vault = InMemoryMemoryVault::new();
