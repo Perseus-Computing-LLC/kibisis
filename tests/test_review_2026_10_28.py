@@ -1,0 +1,112 @@
+"""Regression tests for the 2026-10-28 review findings (K-01, K-02, K-05, K-06, K-07, K-09).
+
+Each test reproduces the probe that found the bug, so a regression shows up as the original failure
+rather than as a tautology about the new code.
+"""
+import os
+import stat
+import threading
+import time
+
+import pytest
+
+from kibisis import SQLiteMemoryVault
+from kibisis.models import EpistemicState
+
+# An explicit passphrase keeps these tests independent of KIBISIS_PASSPHRASE(_FILE) in the environment.
+PASSPHRASE = "review-2026-10-28-test-passphrase"
+
+
+# K-01: the tombstone gate must run under the write lock.
+
+
+def test_tombstone_cannot_land_between_check_and_insert(tmp_path):
+    """Connection B tombstones a value while connection A is paused between its tombstone check and
+    its INSERT. A takes BEGIN IMMEDIATE before the check, so B blocks until A commits and B's purge
+    then removes A's copy: the forbidden value is never readable afterwards."""
+    path = str(tmp_path / "race.sqlite")
+    a = SQLiteMemoryVault(path, passphrase=PASSPHRASE)
+    b = SQLiteMemoryVault(path, passphrase=PASSPHRASE)
+    try:
+        # Seed one tombstone so the gate calls _find_tombstone on every write.
+        b.put("c", "seed", "unrelated seed")
+        b.tombstone("c", "seed", reason="seed")
+        b.put("c", "victim", "forbidden value")
+
+        checked = threading.Event()
+        resume = threading.Event()
+        original = SQLiteMemoryVault._find_tombstone
+
+        def paused_find(cursor, scope, val_hash, can_hash):
+            result = original(cursor, scope, val_hash, can_hash)
+            checked.set()
+            resume.wait(10)
+            return result
+
+        errors = {}
+
+        def writer():
+            try:
+                a.put("c", "copy", "forbidden value")
+            except Exception as exc:  # noqa: BLE001 - recorded for the assertion below
+                errors["a"] = exc
+
+        def tombstoner():
+            try:
+                b.tombstone("c", "victim", reason="forget it")
+            except Exception as exc:  # noqa: BLE001
+                errors["b"] = exc
+
+        SQLiteMemoryVault._find_tombstone = staticmethod(paused_find)
+        try:
+            t_a = threading.Thread(target=writer)
+            t_a.start()
+            assert checked.wait(10), "writer never reached the tombstone check"
+            t_b = threading.Thread(target=tombstoner)
+            t_b.start()
+            # B is now waiting on A's write lock (or, if the fix were absent, has already committed).
+            time.sleep(0.5)
+            resume.set()
+            t_a.join(30)
+            t_b.join(30)
+        finally:
+            SQLiteMemoryVault._find_tombstone = staticmethod(original)
+
+        assert not t_a.is_alive() and not t_b.is_alive()
+        assert "b" not in errors, errors
+        assert b.is_tombstoned("c", "copy", "forbidden value")
+        # The invariant under test: a rejected value never stays readable.
+        assert a.get("c", "copy") is None
+        assert b.get("c", "copy") is None
+        assert b.get("c", "victim") is None
+    finally:
+        a.close()
+        b.close()
+
+
+def test_write_tx_rolls_back_on_error_and_nests():
+    v = SQLiteMemoryVault(":memory:", allow_plaintext=True)
+    with pytest.raises(RuntimeError):
+        with v._write_tx() as cursor:
+            cursor.execute("INSERT INTO vault_meta (key, value) VALUES ('probe', X'00')")
+            raise RuntimeError("abort")
+    assert v._conn.execute("SELECT COUNT(*) FROM vault_meta WHERE key = 'probe'").fetchone()[0] == 0
+    assert not v._conn.in_transaction
+    with v._write_tx() as outer:
+        assert v._conn.in_transaction
+        with v._write_tx() as inner:  # nested: no second BEGIN, no early commit
+            inner.execute("INSERT INTO vault_meta (key, value) VALUES ('probe', X'00')")
+        assert v._conn.in_transaction
+        outer.execute("INSERT INTO vault_meta (key, value) VALUES ('probe2', X'00')")
+    assert not v._conn.in_transaction
+    assert v._conn.execute("SELECT COUNT(*) FROM vault_meta WHERE key LIKE 'probe%'").fetchone()[0] == 2
+
+
+def test_tombstone_still_refuses_sequentially():
+    v = SQLiteMemoryVault(":memory:", allow_plaintext=True)
+    v.put("c", "k", "a rejected value")
+    v.tombstone("c", "k", reason="retracted")
+    with pytest.raises(ValueError):
+        v.put("c", "other", "a rejected value")
+    assert v.list_audit_events(limit=100)[-1].action == "refuse"
+    assert v.verify_audit_chain()

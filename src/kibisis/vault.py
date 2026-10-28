@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import inspect
@@ -503,15 +504,41 @@ class SQLiteMemoryVault(MemoryVault):
     ) -> None:
         """Check the caller's fencing token inside the write transaction, holding the write lock.
 
-        Skipped when no token or resource is passed and ``enforce_fencing`` is off. Otherwise the
-        vault takes its write lock first (``BEGIN IMMEDIATE``), so a write whose token passes is
-        ordered before any write by a later lease holder, never after it.
+        Skipped when no token or resource is passed and ``enforce_fencing`` is off. The caller has
+        already taken the write lock through :meth:`_write_tx`, so a write whose token passes is
+        ordered before any write by a later lease holder, never after it. This method does not
+        begin a transaction itself: taking the lock here, after the caller's reads, is what let a
+        tombstone check run unlocked.
         """
         if fencing_token is None and resource is None and not self.enforce_fencing:
             return
-        if not self._conn.in_transaction:
-            cursor.execute("BEGIN IMMEDIATE")
         self._validate_fencing(fencing_token, resource, holder_id)
+
+    @contextlib.contextmanager
+    def _write_tx(self):
+        """Run a mutation under the SQLite write lock, taken before its first read.
+
+        Issues ``BEGIN IMMEDIATE`` when no transaction is open, commits when the block finishes and
+        rolls back when it raises. Python's sqlite3 module only begins a transaction before the first
+        DML statement, so a method that reads first (the tombstone gate, the reviewed-entry check,
+        the audit head) and then writes used to run its reads with no lock; another connection could
+        commit a tombstone or a review between the check and the insert. Every mutating method
+        enters this first so check-then-write is atomic against other connections.
+
+        Nested use inside an open transaction yields a cursor and leaves commit and rollback to the
+        outermost block, so a compound operation (review, then re-write) stays one transaction.
+        """
+        if self._conn.in_transaction:
+            yield self._conn.cursor()
+            return
+        cursor = self._conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            yield cursor
+        except BaseException:
+            self._conn.rollback()
+            raise
+        self._conn.commit()
 
     @staticmethod
     def _migrate_file_to_sqlcipher(path: str, passphrase: str) -> None:
@@ -537,13 +564,14 @@ class SQLiteMemoryVault(MemoryVault):
 
     def _vault_salt(self) -> bytes:
         """One random KDF salt per vault, stored beside the data. A salt is not a secret."""
-        with self._conn:
-            self._conn.execute("CREATE TABLE IF NOT EXISTS vault_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL)")
-            row = self._conn.execute("SELECT value FROM vault_meta WHERE key = 'kdf_salt'").fetchone()
+        # Locked before the read so two processes opening a new vault together agree on one salt.
+        with self._write_tx() as cursor:
+            cursor.execute("CREATE TABLE IF NOT EXISTS vault_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL)")
+            row = cursor.execute("SELECT value FROM vault_meta WHERE key = 'kdf_salt'").fetchone()
             if row is not None:
                 return bytes(row[0])
             salt = os.urandom(16)
-            self._conn.execute("INSERT INTO vault_meta (key, value) VALUES ('kdf_salt', ?)", (salt,))
+            cursor.execute("INSERT INTO vault_meta (key, value) VALUES ('kdf_salt', ?)", (salt,))
             return salt
 
     def _restrict_permissions(self) -> None:
@@ -572,14 +600,14 @@ class SQLiteMemoryVault(MemoryVault):
             "FROM entities WHERE is_encrypted = 0"
         ).fetchall()
         refused = 0
-        with self._conn:
+        with self._write_tx() as cursor:
             for r in rows:
                 try:
                     content = self._open_entry(r)  # never seal content that fails its signature check
                 except EntryIntegrityError:
                     refused += 1
                     continue
-                self._write_sealed(self._conn, r, content, encrypt=True)
+                self._write_sealed(cursor, r, content, encrypt=True)
         self.scrub()
         return {"migrated": len(rows) - refused, "remaining_plaintext": self.encryption_status()["plaintext"]}
 
@@ -1015,9 +1043,7 @@ class SQLiteMemoryVault(MemoryVault):
         digest_key = self._digest_key
         assert digest_key is not None
         trust_unsigned = self._sqlcipher_active and not self._converted_to_sqlcipher
-        with self._conn:
-            cursor = self._conn.cursor()
-            cursor.execute("BEGIN IMMEDIATE")
+        with self._write_tx() as cursor:
             if int(self._meta("integrity_format") or 0) >= INTEGRITY_FORMAT:
                 return None  # another process upgraded it first
             rows = cursor.execute(
@@ -1189,9 +1215,7 @@ class SQLiteMemoryVault(MemoryVault):
             sql += " AND scope = ?"
             params.append(scope)
         adopted = 0
-        with self._conn:
-            cursor = self._conn.cursor()
-            cursor.execute("BEGIN IMMEDIATE")
+        with self._write_tx() as cursor:
             for r in cursor.execute(sql, params).fetchall():
                 try:
                     content = self._open_legacy(r)
@@ -1296,8 +1320,7 @@ class SQLiteMemoryVault(MemoryVault):
         meta_str = json.dumps(meta, sort_keys=True)
         val_hash, can_hash = self._digests(content)
 
-        with self._conn:
-            cursor = self._conn.cursor()
+        with self._write_tx() as cursor:
             self._fence(cursor, fencing_token, resource, holder_id)
             if trust_ceiling is not None:
                 # A capped write cannot replace an entry a person verified or reviewed.
@@ -1668,8 +1691,7 @@ class SQLiteMemoryVault(MemoryVault):
         meta: Dict[str, Any] = {"path": path, "reason": reason}
         if detail:
             meta["detail"] = detail
-        with self._conn:
-            cursor = self._conn.cursor()
+        with self._write_tx() as cursor:
             return self._record_audit_event(
                 cursor=cursor,
                 action="refuse",
@@ -1807,8 +1829,7 @@ class SQLiteMemoryVault(MemoryVault):
         holder_id: Optional[str] = None,
     ) -> bool:
         now = time.time()
-        with self._conn:
-            cursor = self._conn.cursor()
+        with self._write_tx() as cursor:
             self._fence(cursor, fencing_token, resource, holder_id)
             cursor.execute(
                 """
@@ -1841,8 +1862,7 @@ class SQLiteMemoryVault(MemoryVault):
         resource: Optional[str] = None,
         holder_id: Optional[str] = None,
     ) -> bool:
-        with self._conn:
-            cursor = self._conn.cursor()
+        with self._write_tx() as cursor:
             self._fence(cursor, fencing_token, resource, holder_id)
             cursor.execute(
                 "DELETE FROM entities WHERE category = ? AND key = ? AND scope = ?",
@@ -2139,10 +2159,7 @@ class SQLiteMemoryVault(MemoryVault):
         current = self._meta("search_index_format")
         if current is None or int(current) != SEARCH_INDEX_FORMAT:
             try:
-                with self._conn:
-                    cursor = self._conn.cursor()
-                    if not self._conn.in_transaction:
-                        cursor.execute("BEGIN IMMEDIATE")
+                with self._write_tx() as cursor:
                     for trigger in ("entities_search_ai", "entities_search_au", "entities_search_ad"):
                         cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
                     cursor.execute("DROP TABLE IF EXISTS entities_search")
@@ -2208,18 +2225,12 @@ class SQLiteMemoryVault(MemoryVault):
             return
         if not self._conn.execute("SELECT EXISTS (SELECT 1 FROM entities_search_dirty)").fetchone()[0]:
             return
-        with self._conn:
-            cursor = self._conn.cursor()
-            if not self._conn.in_transaction:
-                cursor.execute("BEGIN IMMEDIATE")
+        with self._write_tx() as cursor:
             self._index_queued(cursor)
 
     def _rebuild_search_index(self) -> None:
         """Build the entry index again from the entries, so that no deleted or replaced terms stay in it."""
-        with self._conn:
-            cursor = self._conn.cursor()
-            if not self._conn.in_transaction:
-                cursor.execute("BEGIN IMMEDIATE")
+        with self._write_tx() as cursor:
             cursor.execute("INSERT INTO entities_search (entities_search) VALUES ('delete-all')")
             cursor.execute("INSERT OR IGNORE INTO entities_search_dirty (id) SELECT id FROM entities")
             self._index_queued(cursor)
@@ -2402,8 +2413,7 @@ class SQLiteMemoryVault(MemoryVault):
         SHA-256 hex digest; a vault with a passphrase stores it keyed (see :meth:`stored_digest`).
         """
         now = time.time()
-        with self._conn:
-            cursor = self._conn.cursor()
+        with self._write_tx() as cursor:
             self._fence(cursor, fencing_token, resource, holder_id)
             if content is None:
                 cursor.execute(
@@ -2605,6 +2615,27 @@ class SQLiteMemoryVault(MemoryVault):
             raise ValueError(f"Verdict must be one of {valid_verdicts}, got '{verdict}'")
         _validate_origin(reviewer_origin, "reviewer_origin")
 
+        # One write transaction from the read to the re-write: the entry a reviewer looked at is the
+        # entry the verdict lands on, and a concurrent write cannot slip in between the two.
+        with self._write_tx():
+            return self._review_locked(
+                category, key, verdict, scope, reviewer_id, notes, fencing_token, resource, holder_id, reviewer_origin
+            )
+
+    def _review_locked(
+        self,
+        category: str,
+        key: str,
+        verdict: str,
+        scope: str,
+        reviewer_id: Optional[str],
+        notes: Optional[str],
+        fencing_token: Optional[int],
+        resource: Optional[str],
+        holder_id: Optional[str],
+        reviewer_origin: str,
+    ) -> MemoryEntity:
+        """Body of :meth:`review_entity`; runs inside the caller's write transaction."""
         entity = self.get(category=category, key=key, scope=scope)
         if entity is None:
             raise KeyError(f"Entity not found for review: {category}:{key} [scope={scope}]")
@@ -2634,9 +2665,9 @@ class SQLiteMemoryVault(MemoryVault):
                 holder_id=holder_id,
             )
             if entity.epistemic_state != EpistemicState.REVOKED:
-                with self._conn:
+                with self._write_tx() as cursor:
                     self._record_state_transition(
-                        self._conn.cursor(), category, key, scope, entity.epistemic_state.value,
+                        cursor, category, key, scope, entity.epistemic_state.value,
                         EpistemicState.REVOKED.value, entity.origin, reviewer_id,
                     )
             entity.archived = True
@@ -2971,8 +3002,7 @@ class SQLiteMemoryVault(MemoryVault):
         same_key = (
             scheme == "hmac-sha256" and self._digest_key is not None and data.get("digest_key_id") == self._digest_key_id()
         )
-        with self._conn:
-            cursor = self._conn.cursor()
+        with self._write_tx() as cursor:
             self._fence(cursor, fencing_token, resource, holder_id)
             for ts in data.get("tombstones", []):
                 t_scope, t_category, t_key = ts.get("scope", "default"), ts["category"], ts["key"]
