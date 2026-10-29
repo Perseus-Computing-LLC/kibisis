@@ -24,7 +24,7 @@ from .vault import (
 )
 from .mcp_server import KibisisMCPServer
 
-__version__ = "0.1.0a10"
+__version__ = "0.1.0a11"
 
 __all__ = [
     "AuditEvent",

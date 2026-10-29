@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.11] - 2026-10-29
+
 ### Added
 - K-R2: three-way supersession. `put(supersedes_key=...)` resolves to `applied` (the writer's origin class
   is at or above the target's and the target is not reviewed, or a person confirmed the proposal: the target
