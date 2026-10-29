@@ -93,7 +93,7 @@ python -m kibisis.review approve CATEGORY KEY      # or: dispute, reject
 
 ## Measured
 
-Medians of five runs of [telarch-benchmarks](https://github.com/Perseus-Computing-LLC/telarch-benchmarks) v0.1.0-alpha.9 against kibisis 0.1.0-alpha.10 (the Rust crate, and the Python package 0.1.0a10 for the multi-process rows), with synthetic data on one EC2 m8azn.metal-12xl bare-metal server. Every run, its range and the command that reproduces it are on [telarch.ai/evidence](https://telarch.ai/evidence).
+Medians of five runs of [telarch-benchmarks](https://github.com/Perseus-Computing-LLC/telarch-benchmarks) v0.1.0-alpha.10 against kibisis 0.1.0-alpha.11 (the Rust crate, and the Python package 0.1.0a11 for the multi-process rows), with synthetic data on one EC2 m8azn.metal-12xl bare-metal server. Every run, its range and the command that reproduces it are on [telarch.ai/evidence](https://telarch.ai/evidence).
 
 | Measurement | Result |
 | --- | --- |
@@ -102,7 +102,7 @@ Medians of five runs of [telarch-benchmarks](https://github.com/Perseus-Computin
 | Times two processes held the lease at once, 2 to 32 processes sharing one SQLite file | 0 |
 | Late write from a paused holder | rejected |
 | Lease database after its holder is killed with SIGKILL while holding the lease | intact |
-| Lease decisions per second under contention, 16 threads, in memory (Rust coordinator; counts every acquire attempt, about 95% of which were rejected, so this is not acquire-release cycles and not the Python vault, whose leases are SQLite transactions) | 1,363,299 |
+| Lease decisions per second under contention, 16 threads, in memory (Rust coordinator; counts every acquire attempt, about 95% of which were rejected, so this is not acquire-release cycles and not the Python vault, whose leases are SQLite transactions) | 1,176,007 |
 
 ## How it works
 
