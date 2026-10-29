@@ -57,6 +57,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -572,7 +573,12 @@ pub trait LeaseCoordinator: Send + Sync {
 }
 
 /// In-memory reference implementation of [`MemoryVault`].
-#[derive(Default, Clone)]
+///
+/// The audit journal is written in [`journal::JOURNAL_FORMAT`] (format 3): each row's hash is
+/// [`journal::event_hash_v3`] over its fields, and every append re-signs the chain head with
+/// [`journal::head_mac_v1`] under the vault's signing key, so [`InMemoryMemoryVault::verify_audit_journal`]
+/// detects rows cut from the tail as well as edits in the middle.
+#[derive(Clone)]
 #[allow(clippy::type_complexity)]
 pub struct InMemoryMemoryVault {
     // Key: (category, key, scope)
@@ -581,12 +587,131 @@ pub struct InMemoryMemoryVault {
     tombstones: Arc<Mutex<HashMap<(String, String, String, String), String>>>,
     // Audit log
     audit_journal: Arc<Mutex<Vec<AuditEvent>>>,
+    // Signed head: the last row's sequence and hash under an HMAC with `signing_key`.
+    audit_head: Arc<Mutex<Option<journal::JournalHead>>>,
+    signing_key: Arc<Vec<u8>>,
+}
+
+impl Default for InMemoryMemoryVault {
+    /// A vault with its own signing key; see [`InMemoryMemoryVault::new`].
+    fn default() -> Self {
+        Self::with_signing_key(&fresh_signing_key())
+    }
+}
+
+/// A per-vault key for the audit head when the caller supplies none.
+///
+/// Not a secret: it mixes the clock, the process id and a counter through SHA-256 so that two vaults
+/// in one process do not share a key. Like the Python vault opened without a passphrase, such a head
+/// catches accidental truncation, not an attacker who can read the process. Pass a key derived from a
+/// secret to [`InMemoryMemoryVault::with_signing_key`] for the stronger guarantee.
+fn fresh_signing_key() -> [u8; 32] {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut seed = Vec::with_capacity(64);
+    seed.extend_from_slice(b"kibisis in-memory audit head key:");
+    seed.extend_from_slice(&nanos.to_le_bytes());
+    seed.extend_from_slice(&std::process::id().to_le_bytes());
+    seed.extend_from_slice(&COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+    sha256(&seed)
 }
 
 impl InMemoryMemoryVault {
-    /// Construct a new empty in-memory vault.
+    /// Construct a new empty in-memory vault with a fresh, non-secret signing key for its audit head.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct a new empty in-memory vault whose audit head is signed under `signing_key`.
+    ///
+    /// Use a key derived from a secret when the head must resist deliberate truncation, not only
+    /// accidental loss. The same key given to [`journal::verify_chain`] verifies the journal outside
+    /// the vault.
+    pub fn with_signing_key(signing_key: &[u8]) -> Self {
+        Self {
+            entities: Arc::default(),
+            tombstones: Arc::default(),
+            audit_journal: Arc::default(),
+            audit_head: Arc::default(),
+            signing_key: Arc::new(signing_key.to_vec()),
+        }
+    }
+
+    /// The signed chain head, or `None` before the first append.
+    pub fn audit_head(&self) -> Option<journal::JournalHead> {
+        self.audit_head.lock().ok().and_then(|h| h.clone())
+    }
+
+    /// Verify every link, every row's hash and the signed head; see [`journal::verify_chain`].
+    ///
+    /// [`MemoryVault::verify_audit_chain`] is this check reduced to a boolean.
+    pub fn verify_audit_journal(&self) -> Result<(), journal::ChainError> {
+        let journal = self
+            .audit_journal
+            .lock()
+            .map_err(|_| journal::ChainError::MissingHead)?;
+        let head = self
+            .audit_head
+            .lock()
+            .map_err(|_| journal::ChainError::MissingHead)?;
+        journal::verify_chain(&journal, head.as_ref(), &self.signing_key)
+    }
+
+    /// Append one format 3 row to a locked journal and re-sign the head.
+    ///
+    /// The caller holds the journal lock so that sequence, link and head move together.
+    #[allow(clippy::too_many_arguments)]
+    fn append_audit(
+        &self,
+        journal: &mut Vec<AuditEvent>,
+        timestamp: u64,
+        action: &str,
+        category: &str,
+        key: &str,
+        scope: &str,
+        value_sha256: String,
+        author_id: Option<&str>,
+    ) -> Result<(), VaultError> {
+        let sequence = (journal.len() as u64) + 1;
+        let prev_hash = match journal.last() {
+            Some(last) => last.event_hash.clone(),
+            None => journal::GENESIS_HASH.to_string(),
+        };
+        let event_hash = journal::event_hash_v3(&journal::EventFields {
+            sequence,
+            timestamp: timestamp as f64,
+            action,
+            category,
+            key,
+            scope,
+            value_sha256: &value_sha256,
+            prev_hash: &prev_hash,
+            author_id,
+            metadata_json: None,
+        });
+        let head = journal::JournalHead::sign(&self.signing_key, sequence, &event_hash);
+        journal.push(AuditEvent {
+            sequence,
+            timestamp,
+            action: action.to_string(),
+            category: category.to_string(),
+            key: key.to_string(),
+            scope: scope.to_string(),
+            value_sha256,
+            prev_hash,
+            event_hash,
+            author_id: author_id.map(str::to_string),
+            metadata_json: None,
+            format: journal::JOURNAL_FORMAT,
+        });
+        *self
+            .audit_head
+            .lock()
+            .map_err(|e| VaultError::StorageError(e.to_string()))? = Some(head);
+        Ok(())
     }
 }
 
@@ -636,11 +761,11 @@ impl MemoryVault for InMemoryMemoryVault {
         if let Some(existing) = store.get(&key_tuple) {
             saved.version = existing.version + 1;
             saved.created_at = existing.created_at;
-            action = "update".to_string();
+            action = "update";
         } else {
             saved.version = 1;
             saved.created_at = now;
-            action = "put".to_string();
+            action = "put";
         }
         saved.updated_at = now;
         saved.archived = false;
@@ -652,31 +777,16 @@ impl MemoryVault for InMemoryMemoryVault {
             .audit_journal
             .lock()
             .map_err(|e| VaultError::StorageError(e.to_string()))?;
-        let seq = (journal.len() as u64) + 1;
-        let prev_hash = if let Some(last) = journal.last() {
-            last.event_hash.clone()
-        } else {
-            "0".repeat(64)
-        };
-        let payload = format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}",
-            seq, now, action, saved.category, saved.key, saved.scope, val_hash, prev_hash
-        );
-        let event_hash = sha256_hex(payload.as_bytes());
-        journal.push(AuditEvent {
-            sequence: seq,
-            timestamp: now,
+        self.append_audit(
+            &mut journal,
+            now,
             action,
-            category: saved.category.clone(),
-            key: saved.key.clone(),
-            scope: saved.scope.clone(),
-            value_sha256: val_hash,
-            prev_hash,
-            event_hash,
-            author_id: None,
-            metadata_json: None,
-            format: 0, // legacy ':'-joined layout
-        });
+            &saved.category,
+            &saved.key,
+            &saved.scope,
+            val_hash,
+            None,
+        )?;
 
         Ok(saved)
     }
@@ -810,31 +920,16 @@ impl MemoryVault for InMemoryMemoryVault {
                 .audit_journal
                 .lock()
                 .map_err(|e| VaultError::StorageError(e.to_string()))?;
-            let seq = (journal.len() as u64) + 1;
-            let prev_hash = if let Some(last) = journal.last() {
-                last.event_hash.clone()
-            } else {
-                "0".repeat(64)
-            };
-            let payload = format!(
-                "{}:{}:archive:{}:{}:{}:{}:{}",
-                seq, now, category, key, scope, "", prev_hash
-            );
-            let event_hash = sha256_hex(payload.as_bytes());
-            journal.push(AuditEvent {
-                sequence: seq,
-                timestamp: now,
-                action: "archive".to_string(),
-                category: category.to_string(),
-                key: key.to_string(),
-                scope: scope.to_string(),
-                value_sha256: "".to_string(),
-                prev_hash,
-                event_hash,
-                author_id: None,
-                metadata_json: None,
-                format: 0, // legacy ':'-joined layout
-            });
+            self.append_audit(
+                &mut journal,
+                now,
+                "archive",
+                category,
+                key,
+                scope,
+                String::new(),
+                None,
+            )?;
 
             return Ok(true);
         }
@@ -927,30 +1022,16 @@ impl MemoryVault for InMemoryMemoryVault {
             )];
             events.extend(copies.into_iter().map(|(k, h)| ("purge", k, h)));
             for (action, (ev_category, ev_key, ev_scope), value_sha256) in events {
-                let seq = (journal.len() as u64) + 1;
-                let prev_hash = match journal.last() {
-                    Some(last) => last.event_hash.clone(),
-                    None => "0".repeat(64),
-                };
-                let payload = format!(
-                    "{}:{}:{}:{}:{}:{}:{}:{}",
-                    seq, now, action, ev_category, ev_key, ev_scope, value_sha256, prev_hash
-                );
-                let event_hash = sha256_hex(payload.as_bytes());
-                journal.push(AuditEvent {
-                    sequence: seq,
-                    timestamp: now,
-                    action: action.to_string(),
-                    category: ev_category,
-                    key: ev_key,
-                    scope: ev_scope,
+                self.append_audit(
+                    &mut journal,
+                    now,
+                    action,
+                    &ev_category,
+                    &ev_key,
+                    &ev_scope,
                     value_sha256,
-                    prev_hash,
-                    event_hash,
-                    author_id: author_id.map(|s| s.to_string()),
-                    metadata_json: None,
-                    format: 0, // legacy ':'-joined layout
-                });
+                    author_id,
+                )?;
             }
         }
 
@@ -1044,39 +1125,8 @@ impl MemoryVault for InMemoryMemoryVault {
     }
 
     fn verify_audit_chain(&self, _scope: Option<&str>) -> bool {
-        if let Ok(journal) = self.audit_journal.lock() {
-            if journal.is_empty() {
-                return true;
-            }
-            let mut expected_prev = "0".repeat(64);
-            for (idx, ev) in journal.iter().enumerate() {
-                if ev.sequence != (idx as u64) + 1 {
-                    return false;
-                }
-                if ev.prev_hash != expected_prev {
-                    return false;
-                }
-                let payload = format!(
-                    "{}:{}:{}:{}:{}:{}:{}:{}",
-                    ev.sequence,
-                    ev.timestamp,
-                    ev.action,
-                    ev.category,
-                    ev.key,
-                    ev.scope,
-                    ev.value_sha256,
-                    ev.prev_hash
-                );
-                let recomputed = sha256_hex(payload.as_bytes());
-                if recomputed != ev.event_hash {
-                    return false;
-                }
-                expected_prev = ev.event_hash.clone();
-            }
-            true
-        } else {
-            false
-        }
+        // The chain links consecutive global events, so the whole journal is always verified.
+        self.verify_audit_journal().is_ok()
     }
 }
 
@@ -1725,8 +1775,8 @@ mod tests {
             vault
                 .put(&MemoryEntity::new(
                     "c",
-                    &format!("k{i}"),
-                    &format!("value {i}"),
+                    format!("k{i}"),
+                    format!("value {i}"),
                 ))
                 .unwrap();
         }
@@ -1762,8 +1812,8 @@ mod tests {
             vault
                 .put(&MemoryEntity::new(
                     "c",
-                    &format!("k{i}"),
-                    &format!("value {i}"),
+                    format!("k{i}"),
+                    format!("value {i}"),
                 ))
                 .unwrap();
         }
