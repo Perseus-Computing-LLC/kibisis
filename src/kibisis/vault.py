@@ -605,10 +605,10 @@ class SQLiteMemoryVault(MemoryVault):
 
         self._search_index = False  # True once a SQLCipher vault's entry index is in use
         self._term_index = False  # True once the keyed term index of a vault without SQLCipher is in use
-<<<<<<< HEAD
-=======
+        self._scan_cache: Optional[Tuple[Tuple[int, int], Any]] = None  # in-memory index without SQLCipher
+        self._recent_recalls: Deque[Dict[str, Any]] = deque(maxlen=1000)  # K-R5 in-process recall log
         self._tokenizer: Optional[sqlite3.Connection] = None  # FTS5's tokenizer, for the term index
->>>>>>> 16f214b (feat: keyed term index for a passphrase vault without SQLCipher (K-D))
+        self._tokenizer_lock = threading.Lock()
         self._conn = sqlcipher3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         self._conn.row_factory = sqlcipher3.Row
         self._sqlcipher_active = False
