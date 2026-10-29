@@ -64,6 +64,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SECURITY.md gains a threat model (in scope / out of scope for a local file-write attacker, an agent-side
   writer, a forged review, the passphrase, and a vault without SQLCipher), with the functions that enforce each
   point.
+- K-D: a vault with a passphrase whose file is not SQLCipher-encrypted keeps a keyed term index
+  (`entities_terms`, `entities_terms_docs`, `term_index_format` in `vault_meta`), so search looks the query's
+  words up instead of opening every entry: it used to build an in-memory index of the decrypted vault after
+  each write, at a cost linear in the vault. Each token is the first 16 hex characters of HMAC-SHA256, under a
+  term key, of the entry's scope and the word as FTS5's tokenizer folds it; no word reaches the file in the
+  clear, the same word has another token in another scope or vault, and a token cannot be tested against a
+  guess without the passphrase. The term key is a third output of the key derivation the signing and digest
+  keys come from: `derive_vault_keys(passphrase, salt)` returns `(signing, digest, term)`;
+  `derive_integrity_keys` still returns the first two. Scores are the BM25 FTS5 computes, over whole-vault
+  statistics, so they equal a plaintext vault's for whole-word queries, and `search_keys` opens no entry. In
+  the test, a query that hits one entry takes 0.17 ms over 200 entries and 0.24 ms over 2000, against 3.5 ms
+  and 30 ms before. An older vault gets the index on its first open; rows written by an older version are
+  queued by triggers and indexed before the next search; a file later converted to SQLCipher drops it.
+
+### Changed
+- K-D: in a vault with a passphrase but without SQLCipher, a query word matches whole words only. In the other
+  modes a word also matches longer words that start with it ("project" finds "projects"); a keyed token says
+  nothing about the tokens of longer words, so this mode cannot. `SQLiteMemoryVault(..., term_index=False)`
+  keeps no term index (and removes one the file has) and searches as before, by opening every entry, for a
+  vault whose threat model cannot take what the index shows: word counts per entry, which entries in a scope
+  share a word, token frequency and order (SECURITY.md, threat model, "Reading the shape of the text").
 
 ### Changed
 - K-E: a `put()` with no `epistemic_state` stores a `candidate`. `verified` needs `verification_quorum`
