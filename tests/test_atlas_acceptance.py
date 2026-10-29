@@ -86,7 +86,7 @@ class TombstoneAcceptance(unittest.TestCase):
 
     def test_tombstone_no_second_memory_unit(self):
         before = _row_count(self.vault)
-        server = KibisisMCPServer(vault=self.vault)
+        server = KibisisMCPServer(vault=self.vault, scope="default")  # K-J: pinned; unset, it would be the checkout's project scope
         write_paths = {
             "put under a new key": lambda: self.vault.put("ops", "deploy_policy", self.REJECTED),
             "store": lambda: self.vault.store("notes", "deploy", self.REJECTED),
