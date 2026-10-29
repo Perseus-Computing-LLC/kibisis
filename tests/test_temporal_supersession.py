@@ -16,26 +16,41 @@ from kibisis.admission import FactDisposition, MemoryAdmissionGate
 
 def test_write_time_admission_gating_speculation_quarantine():
     """Verify that speculative statements are automatically quarantined as candidate."""
-    vault = SQLiteMemoryVault(":memory:", auto_gate=True)
+    # K-R1: the writer is a person and one attestation reaches quorum, so the gate's admit
+    # route can mint verified; speculation is quarantined regardless of who wrote it.
+    vault = SQLiteMemoryVault(":memory:", auto_gate=True, verification_quorum=1)
 
     # Speculation should be routed to candidate
     ent_spec = vault.put(
         category="planning",
         key="cloud-migration",
         content="We might migrate our primary database to BigQuery next quarter.",
+        origin="user",
     )
     assert ent_spec.epistemic_state == EpistemicState.CANDIDATE
     assert ent_spec.metadata.get("admission_disposition") == FactDisposition.SPECULATION.value
     assert ent_spec.metadata.get("unresolved_speculation") is True
 
-    # Normal factual statements should be admitted as verified
+    # Normal factual statements from a person should be admitted as verified
     ent_fact = vault.put(
         category="convention",
         key="license",
         content="The Telarch Suite software is released under the MIT License.",
+        origin="user",
     )
     assert ent_fact.epistemic_state == EpistemicState.VERIFIED
     assert ent_fact.metadata.get("admission_disposition") == FactDisposition.ADMIT.value
+
+    # The same factual statement from a model or an unstated origin is admitted, but stays a
+    # candidate: the gate classifies content, it does not confer trust (K-E).
+    ent_model = vault.put(
+        category="convention",
+        key="license-model",
+        content="The Telarch Suite software is released under the MIT License.",
+        origin="model",
+    )
+    assert ent_model.epistemic_state == EpistemicState.CANDIDATE
+    assert ent_model.metadata.get("admission_disposition") == FactDisposition.ADMIT.value
 
 
 def test_write_time_admission_transient_temporal_window():
@@ -55,12 +70,13 @@ def test_write_time_admission_transient_temporal_window():
 
 def test_write_time_admission_correction_detection():
     """Verify that explicit corrections are admitted and flagged as corrections."""
-    vault = SQLiteMemoryVault(":memory:", auto_gate=True)
+    vault = SQLiteMemoryVault(":memory:", auto_gate=True, verification_quorum=1)
 
     ent_corr = vault.put(
         category="architecture",
         key="cache-backend",
         content="Actually, the cache backend was switched to an in-memory ring buffer instead of disk storage.",
+        origin="user",
     )
     assert ent_corr.epistemic_state == EpistemicState.VERIFIED
     assert ent_corr.metadata.get("is_correction") is True
@@ -69,15 +85,17 @@ def test_write_time_admission_correction_detection():
 
 def test_explicit_superseding_invalidation_and_audit():
     """Verify that adding a superseding fact revokes the prior entity and records pointers."""
-    vault = SQLiteMemoryVault(":memory:", auto_gate=False)
+    vault = SQLiteMemoryVault(":memory:", auto_gate=False, verification_quorum=1)
 
     t0 = time.time() - 100.0
-    # Store initial fact
+    # Store initial fact, verified by the person who wrote it
     old_ent = vault.put(
         category="profile",
         key="residence_v1",
         content="User lives in Seattle, WA.",
         valid_from=t0,
+        epistemic_state="verified",
+        origin="user",
     )
     assert old_ent.epistemic_state == EpistemicState.VERIFIED
     assert old_ent.superseded_by is None
@@ -89,6 +107,7 @@ def test_explicit_superseding_invalidation_and_audit():
         key="residence_v2",
         content="User lives in Austin, TX.",
         supersedes_key="residence_v1",
+        origin="user",
     )
 
     assert new_ent.supersedes == "profile:residence_v1"
@@ -115,14 +134,15 @@ def test_explicit_superseding_invalidation_and_audit():
 
 def test_supersede_helper_method():
     """Verify the atomic supersede() convenience helper."""
-    vault = SQLiteMemoryVault(":memory:", auto_gate=False)
+    vault = SQLiteMemoryVault(":memory:", auto_gate=False, verification_quorum=1)
 
-    vault.put(category="infra", key="primary_db", content="Primary DB is Aurora MySQL 5.7")
+    vault.put(category="infra", key="primary_db", content="Primary DB is Aurora MySQL 5.7", origin="user")
     new_ent = vault.supersede(
         category="infra",
         old_key="primary_db",
         new_key="primary_db_v2",
         new_content="Primary DB is PostgreSQL 16 on Greg Unraid",
+        origin="user",
     )
 
     assert new_ent.key == "primary_db_v2"
@@ -132,6 +152,17 @@ def test_supersede_helper_method():
     old_ent = vault.get("infra", "primary_db")
     assert old_ent.epistemic_state == EpistemicState.REVOKED
     assert old_ent.superseded_by == "infra:primary_db_v2"
+
+    # Without a principal origin the replacement is still recorded, but its claim to verified is
+    # capped (K-E): supersession does not launder trust.
+    vault.put(category="infra", key="cache", content="Cache layer is the old in-process LRU")
+    capped = vault.supersede(
+        category="infra", old_key="cache", new_key="cache_v2", new_content="Cache layer is a shared key-value store", origin="model"
+    )
+    assert capped.supersedes == "infra:cache"
+    assert capped.epistemic_state == EpistemicState.CANDIDATE
+    assert capped.metadata.get("trust_capped_from") == "verified"
+    assert vault.get("infra", "cache").epistemic_state == EpistemicState.REVOKED
 
 
 def test_active_search_filters_superseded_and_expired_facts():
@@ -164,16 +195,20 @@ def test_active_search_filters_superseded_and_expired_facts():
 
     # 2. Point-in-time search at (past_time - 1800) should return Seattle, NOT Austin
     pit_time = past_time - 1800.0
-    # For point-in-time query, also include revoked if searching historical state
-    historical_results = vault.search("city", as_of_valid_time=pit_time, include_unverified=True)
+    # Austin is outside the window; Seattle is in it but revoked, and revoked entries are
+    # withheld unless asked for by state (K-K).
+    assert vault.search("city", as_of_valid_time=pit_time) == []
+    historical_results = vault.search("city", as_of_valid_time=pit_time, epistemic_state=EpistemicState.REVOKED.value)
     hist_keys = [r.entity.key for r in historical_results]
-    assert "residence_seattle" in hist_keys
-    assert "residence_austin" not in hist_keys
+    assert hist_keys == ["residence_seattle"]
+    # Asking for revoked entries at the present time still leaves Seattle out: its validity ended.
+    assert vault.search("city", epistemic_state=EpistemicState.REVOKED.value, active_only=True) == []
 
 
 def test_context_item_carries_supersession_and_temporal_metadata():
     """A context item exported from an entity carries its supersession link and temporal metadata."""
     vault = SQLiteMemoryVault(":memory:", auto_gate=False)
+    vault.put(category="policy", key="legacy_rule", content="Keep secret keys off the wire.")  # K-R2: the edge needs a target
     ent = vault.put(
         category="policy",
         key="security_rule",

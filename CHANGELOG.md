@@ -7,6 +7,111 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- K-R2: three-way supersession. `put(supersedes_key=...)` resolves to `applied` (the writer's origin class
+  is at or above the target's and the target is not reviewed, or a person confirmed the proposal: the target
+  is revoked and closed), `needs_confirmation` (the entry is stored as a proposal with
+  `metadata["proposed_supersedes"]`, the target stays active and carries `pending_supersession_by`; a
+  person's `verified` review applies it, any other verdict clears it), or `SupersessionRefused` (missing or
+  already superseded target). The outcome is in `metadata["supersession"]` and journaled as a
+  `supersession` event. Retiring an entry through an edge, a review or `archive()` marks every active entry
+  that `derived_from` it `disputed` with `invalidated_by`, recursively (cycles terminate). A key closed by
+  supersession refuses writes (`SupersededEntryError`, journaled as a `superseded_entry` refusal) unless a
+  principal passes `revive=True`, which opens a new version at or after the closed interval's end and
+  records `revived_from`; the old interval is never reopened. `state_transition` events carry a `cause`
+  (`write`, `supersede`, `review`, `cascade`).
+- K-R3/K-R4/K-R5: `recall()`, the model-facing read, returns a `RecallResult` of `results`, `withheld`
+  (`WithheldEntry`: ref, reason, sources; never content) and a `receipt`. Two verified entries that conflict
+  (an explicit `conflicts_with` edge, recorded on both sides and journaled as a `contradiction` before the
+  write, or the same `slot` with different content) are both withheld as `conflict_unresolved` until a
+  person resolves one. A hit is returned only if it covers at least `min_coverage_bp` of the query's words
+  (default 50%) and, with four or more matches, its BM25 z-score among the matched set is at most `z_max_bp`
+  (default -0.5): a crowd of tied scores carries no evidence and is dropped, so false accepts stay flat as
+  the store grows. `ttl_seconds` per origin class withholds entries older than `last_verified_at` (a verified
+  review refreshes it) as `stale`. The receipt carries `n_store`, `n_matched`, the counts withheld by reason,
+  the gate, and each hit's coverage and z-score in basis points. `contrasts_with` names confusables: a
+  symmetric edge, both sides returned, carried in the receipt. Every call is mirrored to Argus as
+  `kibisis.memory_recall` (channel, counts, withheld refs, a 12-hex digest of the query) and kept in a
+  bounded in-process log (`recent_recalls()`); a recall never writes to the vault.
+- K-J: `resolve_scope(env, cwd)` derives the default scope from the git checkout the process runs in
+  (`project:<name>-<8 hex of the real root path>`, the same for every subdirectory) and falls back to
+  `default` outside one. `KIBISIS_SCOPE` wins when set and is the only way to reach `global`.
+- K-B: the Rust crate's audit journal moves to format 3 and matches the Python vault byte for byte. New module
+  `kibisis::journal`: `event_hash_v3` (SHA-256 of the canonical JSON array, metadata as the digest of its sorted-key
+  JSON), `head_mac_v1` (HMAC-SHA256 over `kibisis audit head v1:` and `[sequence,"event_hash"]`, built on the crate's
+  own SHA-256, so the crate still has no runtime dependencies) and `verify_chain`, which names the failure
+  (`ChainError`: tail cut, mid-chain edit, missing head, bad MAC). `InMemoryMemoryVault` re-signs its head on every
+  append; `new()` derives a fresh non-secret key per vault, `with_signing_key` takes the caller's key, and
+  `verify_audit_journal` returns the `ChainError` behind `verify_audit_chain`. `AuditEvent` gains `metadata_json`
+  (canonical JSON, `None` in the in-memory vault) and `format`; its `timestamp` stays whole seconds, so Rust rows
+  hash as `<seconds>.000000`. The crate's former `:`-joined layout is gone (the in-memory journal is never persisted,
+  so there are no legacy journals to read). One vector file, `tests/fixtures/journal_format3_vectors.json`, written
+  by `tests/fixtures/make_journal_vectors.py` from the Python reference, is checked by both `tests/journal_vectors.rs`
+  and `tests/test_journal_vectors.py`, including a five-event chain whose tail cut and mid-chain edits must fail in
+  both languages. Vectors keep floats out of metadata: JSON writers print the same double differently, so a metadata
+  float is not guaranteed to hash alike across implementations. `serde_json` is a dev-dependency for the fixture.
+- `SQLiteMemoryVault.evaluate_abstention(probes, answerable=, unanswerable=, search_fn=, k=, scope=)` and
+  `kibisis.Probe` (#20). Scores probes the vault must answer (query -> expected `category:key`) and probes it
+  must refuse, through any caller-supplied `search_fn` (default: `search(query, match="any")`), and reports
+  every outcome: `answered`, `false_block`, `wrong_entry`, `abstained`, `false_accept`, with
+  `answerable_hit_rate`, `unanswerable_abstain_rate`, `false_accept_count`, `false_reject_count`, per-tag
+  figures, the matched entries of each miss, `store_size` (N) and a `verdict`. The verdict is `perfect` only
+  when the store holds entries, at least one probe is answerable, and nothing was missed or leaked: an empty
+  vault or a retriever that returns nothing is `empty_store` / `false_rejects`, never perfect.
+- `kibisis.mcp_server.recalled_refs(text)` lists the `category:key` of each entry in a `<kibisis-recall>`
+  envelope, so the eval can score the MCP recall tool's own output. Tests run it through the MCP recall handler
+  and through `search()` with the server's arguments and check the figures agree.
+- SECURITY.md gains a threat model (in scope / out of scope for a local file-write attacker, an agent-side
+  writer, a forged review, the passphrase, and a vault without SQLCipher), with the functions that enforce each
+  point.
+- K-D: a vault with a passphrase whose file is not SQLCipher-encrypted keeps a keyed term index
+  (`entities_terms`, `entities_terms_docs`, `term_index_format` in `vault_meta`), so search looks the query's
+  words up instead of opening every entry: it used to build an in-memory index of the decrypted vault after
+  each write, at a cost linear in the vault. Each token is the first 16 hex characters of HMAC-SHA256, under a
+  term key, of the entry's scope and the word as FTS5's tokenizer folds it; no word reaches the file in the
+  clear, the same word has another token in another scope or vault, and a token cannot be tested against a
+  guess without the passphrase. The term key is a third output of the key derivation the signing and digest
+  keys come from: `derive_vault_keys(passphrase, salt)` returns `(signing, digest, term)`;
+  `derive_integrity_keys` still returns the first two. Scores are the BM25 FTS5 computes, over whole-vault
+  statistics, so they equal a plaintext vault's for whole-word queries, and `search_keys` opens no entry. In
+  the test, a query that hits one entry takes 0.17 ms over 200 entries and 0.24 ms over 2000, against 3.5 ms
+  and 30 ms before. An older vault gets the index on its first open; rows written by an older version are
+  queued by triggers and indexed before the next search; a file later converted to SQLCipher drops it.
+
+### Changed
+- K-D: in a vault with a passphrase but without SQLCipher, a query word matches whole words only. In the other
+  modes a word also matches longer words that start with it ("project" finds "projects"); a keyed token says
+  nothing about the tokens of longer words, so this mode cannot. `SQLiteMemoryVault(..., term_index=False)`
+  keeps no term index (and removes one the file has) and searches as before, by opening every entry, for a
+  vault whose threat model cannot take what the index shows: word counts per entry, which entries in a scope
+  share a word, token frequency and order (SECURITY.md, threat model, "Reading the shape of the text").
+- K-A: `src/kibisis/vault.py` is split by concern. `SQLiteMemoryVault` is now composed from mixins in
+  `_vault_audit.py` (journal and chain head), `_vault_crypto.py` (sealing, signing, digests, integrity
+  upgrade), `_vault_review.py` (origins and trust classes, admission, review, state transitions, abstention),
+  `_vault_search.py` (search, recall, the entry and term indexes), `_vault_tombstone.py` (tombstones, purge,
+  scrub) and `_vault_snapshot.py` (export and import); `vault.py` keeps the constructor, schema, write lock
+  and fencing, the put family, get, archive, list_entities, persona slots and the exceptions. The code is
+  moved as it was, and every name that `kibisis.vault` had is still importable from it. No behaviour change.
+
+### Changed
+- K-E: a `put()` with no `epistemic_state` stores a `candidate`. `verified` needs `verification_quorum`
+  independent principal attestations (constructor argument or `KIBISIS_VERIFICATION_QUORUM`, default 2): a
+  user write with `author_id` counts as one, each `review_entity(verdict="verified")` by a different reviewer
+  adds one; until then the entry is a candidate with `metadata["attestations"]` and `verification_pending`.
+  `search()` returns candidates by default, labeled by state; only `revoked` entries are left out unless asked for.
+- K-R1: the vault stamps every entry with an immutable `origin_class` (`principal` for user/human origins,
+  `agent` for model origins, `external` for tool and other origins). A lower-class writer cannot overwrite a
+  higher-class entry (`OriginClassError`, journaled as an `origin_class_refused` refusal); `act_class` is capped
+  at `inform` unless the writer is a principal (`act_class_capped_from` records the request); an entry
+  inherits the lowest class along `supersedes` / `derived_from` links (`trust_inherited_from`).
+- `recall()` refuses `scope="*"`: a model-facing read is bound to one scope (the MCP server already was).
+
+### Deprecated
+- `evaluate_epistemic_abstention()` is a wrapper over `evaluate_abstention()` and warns (`DeprecationWarning`).
+  It keeps its keys; `perfect_abstention` still means only that every probe returned nothing, which an empty
+  vault also achieves. The report now also carries `store_size`, `verdict` and `perfect` from the new eval.
+
+
 ## [0.1.0-alpha.10] - 2026-10-28
 
 Provenance columns plus the repair set from the 2026-10-28 review (finding ids K-01 to K-12 refer to that

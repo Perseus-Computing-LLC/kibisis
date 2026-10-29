@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import hmac
 import inspect
 import json
 import logging
@@ -13,230 +12,112 @@ try:
     import sqlcipher3
 except ImportError:
     import sqlite3 as sqlcipher3
-import re
 import sqlite3
 import string
+import threading
 import time
-import unicodedata
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple, Union
 from .admission import AdmissionDecision, FactDisposition, MemoryAdmissionGate
-from .crypto import (
-    ENTRY_BINDING,
-    ENTRY_SIGNATURE_PREFIX,
-    TOMBSTONE_BINDING,
-    AESGCMCryptoEnvelopeProvider,
-    derive_integrity_keys,
-    entry_aad,
-    keyed_value_digest,
-    sign_entry,
-    sign_tenant_payload,
-    tombstone_aad,
-    verify_entry,
-    verify_tenant_payload,
-)
+from .crypto import AESGCMCryptoEnvelopeProvider, derive_vault_keys, verify_entry, verify_tenant_payload
 from .keys import MIN_PASSPHRASE_LENGTH, resolve_passphrase
-from .models import AuditEvent, EncryptedEnvelope, EpistemicState, MemoryEntity, SearchHit, SearchResult
+from .models import (  # noqa: F401  (the search models are re-exported)
+    AuditEvent,
+    EpistemicState,
+    MemoryEntity,
+    RecallResult,
+    SearchHit,
+    SearchResult,
+    WithheldEntry,
+)
 from .protocols import CryptoEnvelopeProvider, EncryptionRequiredError, LeaseConflictError, LeaseCoordinator, MemoryVault
+from ._vault_audit import (  # noqa: F401  (re-exported: every name stays importable from kibisis.vault)
+    DEFAULT_ARGUS_LEDGER_PATH,
+    JOURNAL_FORMAT,
+    AuditJournalMixin,
+    _argus_append,
+    _argus_ledger_path,
+    _event_hash,
+    _head_mac,
+)
+from ._vault_crypto import (  # noqa: F401  (re-exported)
+    INTEGRITY_FORMAT,
+    EntryIntegrityError,
+    EntryIntegrityMixin,
+    _rekey_metadata,
+    canonicalize_text,
+    value_digests,
+)
+from ._vault_review import (  # noqa: F401  (re-exported)
+    ORIGIN_CLASSES,
+    ORIGINS,
+    AdmissionRefused,
+    AdmissionReviewMixin,
+    Probe,
+    _ORIGIN_TO_CLASS,
+    _class_rank,
+    _entry_ref,
+    _row_origin_class,
+    _validate_origin,
+    origin_class_of,
+    row_origin,
+)
+from ._vault_search import (  # noqa: F401  (re-exported)
+    DEFAULT_MIN_COVERAGE_BP,
+    DEFAULT_Z_MAX_BP,
+    SEARCH_INDEX_FORMAT,
+    TERM_INDEX_FORMAT,
+    SearchRecallMixin,
+    _EDGE_PUNCTUATION,
+    _ENTITY_COLUMNS,
+    _HIT_COLUMNS,
+    _OPERATIONAL_ERRORS,
+    _SEARCH_STOPWORDS,
+    _WORD,
+    _bounded,
+    _search_terms,
+    _snippet,
+    _snippet_patterns,
+    _within_bounds,
+)
+from ._vault_snapshot import SnapshotMixin
+from ._vault_tombstone import TombstoneMixin
 
 logger = logging.getLogger(__name__)
 
-#: Integrity format this version writes (vault_meta 'integrity_format'). Format 2 binds sealed content
-#: to its entry, signs entries with a key derived by PBKDF2, keys the value digests kept in the journal
-#: and in tombstones, and refuses entries without a signature. A vault without the marker is upgraded
-#: the first time it is opened with its passphrase.
-INTEGRITY_FORMAT = 2
-
-#: Journal hash layout this version writes (``audit_journal.format``). Formats 1 and 2 hashed a
-#: ``':'``-joined string of eight fields and left ``metadata_json`` out, so a ``':'`` inside a category
-#: or key could alias another event and a rewritten reviewer or verdict passed verification. Format 3
-#: hashes a canonical JSON array (unambiguous field boundaries) that includes a digest of the metadata,
-#: and every append also signs the chain head into ``audit_head`` so a deleted tail is detected.
-#: Rows written under an older format keep verifying under their own layout.
-JOURNAL_FORMAT = 3
-
-#: Version of the entry index (``entities_search``) that a SQLCipher vault keeps for ranked search. A vault
-#: whose index has another version, or none, gets one built from its entries when opened with its passphrase.
-SEARCH_INDEX_FORMAT = 1
-
-# sqlcipher3 raises its own OperationalError, which is not sqlite3's.
-_OPERATIONAL_ERRORS = (sqlite3.OperationalError, sqlcipher3.OperationalError)
-_ENTITY_COLUMNS = (
-    "e.id, e.category, e.key, e.content, e.metadata_json, e.version, e.archived, e.created_at, e.updated_at, "
-    "e.is_encrypted, e.encrypted_envelope_json, e.scope, e.epistemic_state, e.valid_from, e.valid_until, "
-    "e.tenant_sig, e.supersedes, e.superseded_by, e.origin, e.source_ref, e.confidence"
-)
-
-# Where an entry came from. "model" writes are capped at candidate and cannot promote themselves.
-ORIGINS = ("user", "model", "tool", "import", "unknown")
 
 #: Metadata keys the vault writes itself and reads back as facts about trust and ownership. A caller's
 #: ``metadata`` argument cannot set them: ``_put`` drops them (and logs the drop) unless the write
 #: comes from an internal path whose metadata the vault produced (``review_entity``, ``import_snapshot``).
 #: ``human_reviews`` is what ``_is_reviewed`` consults, so a caller-supplied value would forge a
 #: person's review; ``tenant_id`` and ``principal_id`` bound recall; ``lineage_*`` is reserved.
-RESERVED_METADATA_KEYS = frozenset({"human_reviews", "tenant_id", "principal_id"})
+RESERVED_METADATA_KEYS = frozenset({
+    "human_reviews", "tenant_id", "principal_id",
+    # K-R1 origin-bound admission: set by the vault from the write path, never from the payload.
+    "origin_class", "act_class", "act_class_capped_from", "attestations", "verification_pending",
+    "trust_inherited_from", "conflicts_with", "contrasts_with",
+})
 RESERVED_METADATA_PREFIX = "lineage_"
+
+#: ``inform`` entries may be shown to a model; only ``act`` entries may drive an action (conventions,
+#: standing instructions). Agent and external writers are capped at ``inform``.
+ACT_CLASSES = ("inform", "act")
+#: Distinct principals who must attest before an entry is ``verified`` (K-R1); ``KIBISIS_VERIFICATION_QUORUM``
+#: overrides the default for a deployment.
+DEFAULT_VERIFICATION_QUORUM = 2
 
 
 def _reserved_metadata_keys(meta: Dict[str, Any]) -> List[str]:
     return sorted(k for k in meta if k in RESERVED_METADATA_KEYS or str(k).startswith(RESERVED_METADATA_PREFIX))
 _ORIGIN_CHECK = "CHECK (origin IN ('user','model','tool','import','unknown'))"
-DEFAULT_ARGUS_LEDGER_PATH = "/opt/data/runtime/argus/audit.jsonl"
 
 
-def _validate_origin(origin: Optional[str], what: str = "origin") -> Optional[str]:
-    if origin is None:
-        return None
-    if origin not in ORIGINS:
-        raise ValueError(f"{what} must be one of {ORIGINS}, got {origin!r}")
-    return origin
-
-
-def _argus_ledger_path() -> Optional[str]:
-    """Argus ledger that state transitions are mirrored to; ARGUS_LEDGER_PATH="" turns it off."""
-    if "ARGUS_LEDGER_PATH" in os.environ:
-        return os.environ["ARGUS_LEDGER_PATH"] or None
-    return DEFAULT_ARGUS_LEDGER_PATH if os.path.exists(DEFAULT_ARGUS_LEDGER_PATH) else None
-
-
-def _argus_append(event_type: str, actor: str, payload: Dict[str, Any]) -> None:
-    """Append through the argus_ledger library only, so the hash chain stays valid. Never raises."""
-    path = _argus_ledger_path()
-    if not path:
-        return
-    try:
-        from argus_ledger import AppendOnlyLedger  # optional dependency
-        AppendOnlyLedger(path).append(event_type=event_type, actor=actor, payload=payload)
-    except Exception as exc:  # pragma: no cover - best effort mirror
-        logger.debug("argus mirror skipped (%s): %s", event_type, exc)
-# What keys-only search reads: no content, no sealed content.
-_HIT_COLUMNS = "e.id, e.category, e.key, e.scope, e.metadata_json"
-# Words that match="any" leaves out of a query while the query has other words.
-_SEARCH_STOPWORDS = frozenset(
-    "a an and are as at be been being but by can could did do does doing for from had has have having he her "
-    "hers him his how i if in into is it its me my no not of on or our ours she should so than that the their "
-    "theirs them then there these they this those to was we were what when where which who whom whose why will "
-    "with would you your yours".split()
-)
-_EDGE_PUNCTUATION = re.compile(r"^[\W_]+|[\W_]+$")
-_WORD = re.compile(r"[^\W_]+")
-
-
-def _search_terms(query: str, match: str) -> List[str]:
-    """Words of a search query, without surrounding punctuation and without words that have no letter or
-    digit. For ``match="any"`` also lowercased and without repeats, and without common function words and
-    single characters while other words remain."""
-    words = [w for w in (_EDGE_PUNCTUATION.sub("", raw) for raw in query.split()) if _WORD.search(w)]
-    if match != "any":
-        return words
-    unique: List[str] = []
-    for w in words:
-        if w.lower() not in unique:
-            unique.append(w.lower())
-    content = [w for w in unique if w not in _SEARCH_STOPWORDS] or unique
-    return [w for w in content if len(w) > 1] or content
-
-
-def _bounded(
-    tenant_id: Optional[str], principal_id: Optional[str], authorized_lineage_roots: Optional[List[str]]
-) -> bool:
-    """Whether a search names a tenant, a principal or authorized lineage roots to hold its results to."""
-    return bool(tenant_id or principal_id or authorized_lineage_roots is not None)
-
-
-def _within_bounds(
-    r: Any, tenant_id: Optional[str], principal_id: Optional[str], authorized_lineage_roots: Optional[List[str]]
-) -> bool:
-    """Hard post-retrieval governance gating (MemLeak arXiv:2610.04195 & Lineage AMU arXiv:2610.07258), on a
-    stored row's metadata, which is not sealed: entries outside these bounds are never opened."""
-    meta = json.loads(r["metadata_json"]) if r["metadata_json"] else {}
-    meta = meta or {}
-    # 1. Hard tenant boundary check
-    if tenant_id and meta.get("tenant_id") and meta.get("tenant_id") != tenant_id:
-        return False
-    # 2. Hard principal/user boundary check if specified
-    if principal_id and meta.get("principal_id") and meta.get("principal_id") != principal_id:
-        return False
-    # 3. Derivation-gated lineage check (AMU)
-    if authorized_lineage_roots is not None:
-        if any(root not in authorized_lineage_roots for root in meta.get("derived_from", [])):
-            return False
-    return True
-
-
-def _snippet_patterns(terms: Sequence[str]) -> Optional[Tuple[Any, Any]]:
-    """Patterns for :func:`_snippet`, built once per search: where a query term begins a word (as FTS5
-    prefix queries match), and the whole whitespace-separated word around such a place."""
-    prefixes = sorted({w.lower() for term in terms for w in _WORD.findall(term)}, key=len, reverse=True)
-    if not prefixes:
-        return None
-    alternatives = "|".join(map(re.escape, prefixes))
-    start = re.compile(r"(?<![^\W_])(?:" + alternatives + ")", re.IGNORECASE)
-    word = re.compile(r"\S*?(?<![^\W_])(?:" + alternatives + r")\S*", re.IGNORECASE)
-    return start, word
-
-
-def _snippet(text: str, patterns: Optional[Tuple[Any, Any]], width: int = 16) -> str:
-    """Up to ``width`` words of ``text`` from around the first word that a query term begins, each matching
-    word in <b>...</b>: the shape that FTS5's snippet() gives for entries stored in plaintext."""
-    words = text.split()
-    first = 0
-    m = patterns[0].search(text) if patterns is not None else None
-    if m is not None:
-        before = text[: m.start()]
-        first = len(before.split()) - (1 if before and not before[-1].isspace() else 0)
-    start = max(0, min(first - width // 4, len(words) - width))
-    body = " ".join(words[start : start + width])
-    if patterns is not None:
-        body = patterns[1].sub(lambda w: f"<b>{w.group(0)}</b>", body)
-    return ("..." if start > 0 else "") + body + ("..." if start + width < len(words) else "")
 
 
 def _sqlcipher_available() -> bool:
     """True when the real sqlcipher3 driver is loaded; the import above falls back to the standard sqlite3."""
     return sqlcipher3 is not sqlite3
-
-
-def canonicalize_text(text: str) -> str:
-    """Normalize text for evasion-resistant tombstone matching.
-
-    Transforms text by:
-    1. Unicode NFKC normalization (replaces lookalikes, fullwidth chars, compatibility ligatures)
-    2. Unicode case folding (.casefold())
-    3. Stripping invisible Unicode format/control characters (Cf/Cc, e.g., zero-width spaces/joiners, soft hyphens)
-    4. Stripping all Unicode punctuation and symbols (replacing with space separators)
-    5. Collapsing all whitespace runs into single spaces and trimming
-    """
-    if not text:
-        return ""
-    normalized = unicodedata.normalize("NFKC", text).casefold()
-    chars: List[str] = []
-    for ch in normalized:
-        if ch.isspace():
-            chars.append(" ")
-            continue
-        cat = unicodedata.category(ch)
-        if cat in ("Cf", "Cc"):
-            # Drop invisible format/control characters (e.g. \u200b, \u200c, \u200d, \ufeff, \u00ad)
-            continue
-        if cat.startswith(("P", "S")):
-            chars.append(" ")
-        else:
-            chars.append(ch)
-    return " ".join("".join(chars).split())
-
-
-def value_digests(content: str) -> Tuple[str, str]:
-    """Return the (exact, canonical) SHA-256 digests a tombstone records for a value.
-
-    The canonical digest is empty when the value canonicalizes to nothing (for example
-    punctuation only); such values are matched by their exact digest alone.
-    """
-    exact = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    can_text = canonicalize_text(content)
-    canonical = hashlib.sha256(can_text.encode("utf-8")).hexdigest() if can_text else ""
-    return exact, canonical
 
 
 class TombstonedValueError(ValueError):
@@ -264,14 +145,30 @@ class ReviewedEntryError(PermissionError):
     """Raised when a capped (model-originated) write targets an entry a person verified or reviewed."""
 
 
-class AdmissionRefused(PermissionError):
-    """Raised when a reviewer that is not a person tries to promote an entry to ``verified``."""
+class OriginClassError(PermissionError):
+    """Raised when a lower-trust writer (K-R1 ``origin_class``) tries to overwrite a higher-trust entry.
+
+    The entry's class is fixed by the vault at write time; a model or tool cannot change it by
+    re-writing the key. Write a new key with ``supersedes_key`` to propose a replacement instead.
+    """
+
+    def __init__(self, message: str, *, writer_class: str = "", stored_class: str = "") -> None:
+        super().__init__(message)
+        self.writer_class = writer_class
+        self.stored_class = stored_class
 
 
-class EntryIntegrityError(PermissionError):
-    """Raised when a stored entry fails its integrity check: it has no signature, its signature does
-    not verify, or its sealed content does not belong to it. ``get`` raises it; ``search`` and
-    ``list_entities`` leave such an entry out."""
+class SupersessionRefused(ValueError):
+    """Raised when a ``supersedes`` edge cannot be made: the target is missing in the scope, or it is
+    already superseded (a retired edge is not re-pointed; supersede the entry that replaced it)."""
+
+
+class SupersededEntryError(PermissionError):
+    """Raised when a write lands on a key that an explicit ``supersedes`` edge has closed (K-R2).
+
+    The closed interval stays closed. A principal may pass ``revive=True`` to open a new version with a
+    new ``valid_from``; nothing reopens the old one.
+    """
 
 
 def _require_aad_support(provider: Any) -> None:
@@ -288,71 +185,6 @@ def _require_aad_support(provider: Any) -> None:
             )
 
 
-def _event_hash(
-    sequence: int,
-    timestamp: float,
-    action: str,
-    category: str,
-    key: str,
-    scope: str,
-    value_sha256: str,
-    prev_hash: str,
-    author_id: Optional[str],
-    metadata: Optional[Dict[str, Any]] = None,
-    fmt: int = JOURNAL_FORMAT,
-) -> str:
-    """SHA-256 of one journal event, which links to the one before it through ``prev_hash``.
-
-    ``fmt`` selects the layout the row was written under (see :data:`JOURNAL_FORMAT`). Formats below 3
-    reproduce the legacy ``':'``-joined payload, metadata excluded, so older journals still verify.
-    """
-    if fmt < 3:
-        payload = f"{sequence}:{timestamp:.6f}:{action}:{category}:{key}:{scope}:{value_sha256}:{prev_hash}:{author_id or ''}"
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-    # A digest of the canonical metadata, not the metadata itself, keeps the payload bounded and makes
-    # the hash independent of how the stored JSON happens to be spaced.
-    meta_digest = hashlib.sha256(
-        json.dumps(metadata or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    ).hexdigest()
-    fields = [
-        int(sequence), f"{timestamp:.6f}", action, category, key, scope, value_sha256, prev_hash, author_id or "",
-        meta_digest,
-    ]
-    payload = json.dumps(fields, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _head_mac(signing_key: bytes, sequence: int, event_hash: str) -> str:
-    """HMAC over the chain head, so the last row cannot be removed or replaced without the signing key.
-
-    Without a passphrase the signing key is not secret (it is derived from the path), so the head
-    then catches accidental truncation only; with a passphrase it is derived from the passphrase.
-    """
-    payload = json.dumps([int(sequence), event_hash], separators=(",", ":")).encode("utf-8")
-    return hmac.new(signing_key, b"kibisis audit head v1:" + payload, hashlib.sha256).hexdigest()
-
-
-def _rekey_metadata(metadata: Dict[str, Any], digest_key: bytes) -> bool:
-    """Key the plain digest a format 1 journal event keeps in its metadata, and drop digest prefixes."""
-    changed = False
-    if metadata.get("canonical_sha256"):
-        metadata["canonical_sha256"] = keyed_value_digest(digest_key, str(metadata["canonical_sha256"]))
-        changed = True
-    detail = metadata.get("detail")
-    if isinstance(detail, dict) and "value_digest_prefix" in detail:
-        del detail["value_digest_prefix"]  # a prefix of a plain digest cannot be keyed, and still leaks
-        changed = True
-    return changed
-
-
-def row_origin(row: Any) -> str:
-    """Origin of a fetched row; 'unknown' for rows and cursors that predate the column."""
-    try:
-        return row["origin"] or "unknown"
-    except (IndexError, KeyError):
-        return "unknown"
-
-
 def _is_reviewed(row: Any) -> bool:
     """True for an entry in the verified state or one that carries a person's review."""
     if row["epistemic_state"] == EpistemicState.VERIFIED.value:
@@ -364,7 +196,15 @@ def _is_reviewed(row: Any) -> bool:
     return bool(meta.get("human_reviews"))
 
 
-class SQLiteMemoryVault(MemoryVault):
+class SQLiteMemoryVault(
+    AuditJournalMixin,
+    EntryIntegrityMixin,
+    AdmissionReviewMixin,
+    SearchRecallMixin,
+    TombstoneMixin,
+    SnapshotMixin,
+    MemoryVault,
+):
     """Local SQLite memory vault featuring FTS5 full-text search, WAL mode, entity versioning,
     AES-256-GCM envelope encryption, and evasion-resistant negative memory tombstones."""
 
@@ -380,8 +220,15 @@ class SQLiteMemoryVault(MemoryVault):
         auto_gate: bool = True,
         memory_security: bool = True,
         cache_mb: Optional[int] = None,
+        verification_quorum: Optional[int] = None,
+        term_index: bool = True,
     ) -> None:
         """Open a vault. Entry content is encrypted by default.
+
+        ``verification_quorum`` (K-R1) is how many distinct principals must attest to an entry before
+        it is stored as ``verified``: the author of a ``origin="user"`` write that asked for
+        ``verified`` counts as one, each person reviewing it as ``verified`` counts as one more. It
+        defaults to ``KIBISIS_VERIFICATION_QUORUM`` or :data:`DEFAULT_VERIFICATION_QUORUM`.
 
         The passphrase comes from the argument, then KIBISIS_PASSPHRASE_FILE, then KIBISIS_PASSPHRASE.
         With no passphrase the vault refuses to open (EncryptionRequiredError) unless ``allow_plaintext=True``.
@@ -403,6 +250,11 @@ class SQLiteMemoryVault(MemoryVault):
         Under SQLCipher a page read from outside the cache is decrypted again, so search over a vault larger
         than the cache slows down; a cache that holds the vault's pages removes that cost. The cache holds
         decrypted pages in this process's memory.
+
+        Without SQLCipher, a vault with a passphrase keeps a keyed term index in its file so that search
+        does not open every entry (:meth:`_ensure_term_index`; SECURITY.md states what the tokens show).
+        ``term_index=False`` keeps no such index, removes one the file has, and searches as before: by
+        opening every entry into an index in memory, at a cost that grows with the vault.
         """
         self.db_path = str(db_path)
         if cache_mb is not None and int(cache_mb) <= 0:
@@ -412,6 +264,11 @@ class SQLiteMemoryVault(MemoryVault):
         self.coordinator = coordinator
         self.enforce_fencing = enforce_fencing
         self.auto_gate = auto_gate
+        if verification_quorum is None:
+            verification_quorum = int(os.environ.get("KIBISIS_VERIFICATION_QUORUM", DEFAULT_VERIFICATION_QUORUM))
+        if verification_quorum < 1:
+            raise ValueError("verification_quorum must be at least 1")
+        self.verification_quorum = int(verification_quorum)
         if enforce_fencing and coordinator is None:
             raise ValueError("enforce_fencing=True needs a lease coordinator: pass coordinator=")
         self._fallback_search_warned = False
@@ -435,6 +292,7 @@ class SQLiteMemoryVault(MemoryVault):
         self._legacy_signing_key = hashlib.sha256(f"kibisis-tenant-sig:{sig_seed}".encode("utf-8")).digest()
         self._signing_key = self._legacy_signing_key
         self._digest_key: Optional[bytes] = None
+        self._term_key: Optional[bytes] = None
         self._keyed = False
         self._integrity_format = 1
         self._converted_to_sqlcipher = False
@@ -465,7 +323,11 @@ class SQLiteMemoryVault(MemoryVault):
                 self._converted_to_sqlcipher = True
 
         self._search_index = False  # True once a SQLCipher vault's entry index is in use
+        self._term_index = False  # True once the keyed term index of a vault without SQLCipher is in use
         self._scan_cache: Optional[Tuple[Tuple[int, int], Any]] = None  # in-memory index without SQLCipher
+        self._recent_recalls: Deque[Dict[str, Any]] = deque(maxlen=1000)  # K-R5 in-process recall log
+        self._tokenizer: Optional[sqlite3.Connection] = None  # FTS5's tokenizer, for the term index
+        self._tokenizer_lock = threading.Lock()
         self._conn = sqlcipher3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         self._conn.row_factory = sqlcipher3.Row
         self._sqlcipher_active = False
@@ -494,12 +356,20 @@ class SQLiteMemoryVault(MemoryVault):
             salt = self._vault_salt()
             if crypto_provider is None:
                 self.crypto_provider = AESGCMCryptoEnvelopeProvider(salt=salt)
-            self._signing_key, self._digest_key = derive_integrity_keys(passphrase, salt)
+            self._signing_key, self._digest_key, self._term_key = derive_vault_keys(passphrase, salt)
             self._keyed = True
             try:
                 self._upgrade_integrity()
                 if self._sqlcipher_active:
                     self._ensure_search_index()
+                elif term_index:
+                    self._ensure_term_index()
+                elif self._has_meta_key("term_index_format"):
+                    with self._write_tx() as cursor:  # opened with term_index=False: leave no tokens behind
+                        for trigger in ("entities_search_ai", "entities_search_au", "entities_search_ad"):
+                            cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                        cursor.execute("DROP TABLE IF EXISTS entities_search_dirty")
+                        self._drop_term_index(cursor)
             except BaseException:
                 self._conn.close()
                 raise
@@ -610,18 +480,6 @@ class SQLiteMemoryVault(MemoryVault):
                     pass
         os.replace(temp_enc, path)
 
-    def _vault_salt(self) -> bytes:
-        """One random KDF salt per vault, stored beside the data. A salt is not a secret."""
-        # Locked before the read so two processes opening a new vault together agree on one salt.
-        with self._write_tx() as cursor:
-            cursor.execute("CREATE TABLE IF NOT EXISTS vault_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL)")
-            row = cursor.execute("SELECT value FROM vault_meta WHERE key = 'kdf_salt'").fetchone()
-            if row is not None:
-                return bytes(row[0])
-            salt = os.urandom(16)
-            cursor.execute("INSERT INTO vault_meta (key, value) VALUES ('kdf_salt', ?)", (salt,))
-            return salt
-
     def _restrict_permissions(self) -> None:
         for suffix in ("", "-wal", "-shm"):
             path = self.db_path + suffix
@@ -630,34 +488,6 @@ class SQLiteMemoryVault(MemoryVault):
                     os.chmod(path, 0o600)
             except OSError:
                 pass
-
-    def encryption_status(self) -> Dict[str, int]:
-        """Counts of live entries by storage form. ``plaintext`` should be 0 on an encrypted vault."""
-        row = self._conn.execute(
-            "SELECT COALESCE(SUM(is_encrypted = 1), 0) AS enc, COALESCE(SUM(is_encrypted = 0), 0) AS plain FROM entities"
-        ).fetchone()
-        return {"encrypted": int(row["enc"]), "plaintext": int(row["plain"])}
-
-    def migrate_plaintext(self) -> Dict[str, int]:
-        """Encrypt every plaintext entry in place, then remove the old plaintext from the search index,
-        the write-ahead log and free pages. Returns {"migrated": n, "remaining_plaintext": m}."""
-        if self.crypto_provider is None or not self.passphrase:
-            raise EncryptionRequiredError("migrate_plaintext needs a passphrase.")
-        rows = self._conn.execute(
-            "SELECT id, category, key, scope, content, is_encrypted, encrypted_envelope_json, tenant_sig "
-            "FROM entities WHERE is_encrypted = 0"
-        ).fetchall()
-        refused = 0
-        with self._write_tx() as cursor:
-            for r in rows:
-                try:
-                    content = self._open_entry(r)  # never seal content that fails its signature check
-                except EntryIntegrityError:
-                    refused += 1
-                    continue
-                self._write_sealed(cursor, r, content, encrypt=True)
-        self.scrub()
-        return {"migrated": len(rows) - refused, "remaining_plaintext": self.encryption_status()["plaintext"]}
 
     def _configure_db(self) -> None:
         if self.db_path != ":memory:":
@@ -874,207 +704,11 @@ class SQLiteMemoryVault(MemoryVault):
                 """
             )
 
-    def _record_audit_event(
-        self,
-        cursor: sqlite3.Cursor,
-        action: str,
-        category: str,
-        key: str,
-        scope: str,
-        value_sha256: str,
-        author_id: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> AuditEvent:
-        """Append a tamper-evident audit record chaining from the previous event's hash."""
-        now = time.time()
-        meta_dict = metadata or {}
-
-        # Read the head inside the caller's write transaction, never from a per-instance cache: other
-        # processes append to the same journal, so a cached head goes stale and every later insert
-        # reuses an existing sequence. BEGIN IMMEDIATE covers a caller that has not written yet.
-        if not self._conn.in_transaction:
-            cursor.execute("BEGIN IMMEDIATE")
-        cursor.execute("SELECT sequence, event_hash FROM audit_journal ORDER BY sequence DESC LIMIT 1")
-        last_row = cursor.fetchone()
-        seq, prev_hash = (last_row["sequence"] + 1, last_row["event_hash"]) if last_row else (1, "0" * 64)
-
-        event_hash = _event_hash(
-            seq, now, action, category, key, scope, value_sha256, prev_hash, author_id, meta_dict, fmt=JOURNAL_FORMAT
-        )
-        meta_json = json.dumps(meta_dict, sort_keys=True)
-
-        cursor.execute(
-            """
-            INSERT INTO audit_journal (
-                sequence, timestamp, action, category, key, scope, value_sha256,
-                prev_hash, event_hash, author_id, metadata_json, format
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (seq, now, action, category, key, scope, value_sha256, prev_hash, event_hash, author_id, meta_json,
-             JOURNAL_FORMAT),
-        )
-        self._write_audit_head(cursor, seq, event_hash)
-        return AuditEvent(
-            sequence=seq,
-            timestamp=now,
-            action=action,
-            category=category,
-            key=key,
-            scope=scope,
-            value_sha256=value_sha256,
-            prev_hash=prev_hash,
-            event_hash=event_hash,
-            author_id=author_id,
-            metadata=meta_dict,
-            format=JOURNAL_FORMAT,
-        )
-
-    def _write_audit_head(self, cursor: Any, sequence: int, event_hash: str) -> None:
-        """Sign the chain head, in the same transaction as the append it describes."""
-        cursor.execute(
-            "INSERT OR REPLACE INTO audit_head (id, sequence, event_hash, mac) VALUES (1, ?, ?, ?)",
-            (sequence, event_hash, _head_mac(self._signing_key, sequence, event_hash)),
-        )
-
-    # Integrity: sealing, signing and checking entries, keyed digests, and the format 2 upgrade.
-
-    def _sign(self, scope: str, category: str, key: str, content: str) -> str:
-        if self._keyed:
-            return sign_entry(self._signing_key, scope, category, key, content)
-        return sign_tenant_payload(self._signing_key, scope, f"{category}:{key}", content)
-
-    def _seal(
-        self, scope: str, category: str, key: str, content: str, *, encrypt: bool
-    ) -> Tuple[str, int, Optional[str], str]:
-        """(stored content, is_encrypted, envelope JSON, signature) for an entry. Sealed content is bound
-        to the entry's scope, category and key, and its plaintext column is left empty."""
-        signature = self._sign(scope, category, key, content)
-        if not encrypt:
-            return content, 0, None, signature
-        if self.crypto_provider is None or not self.passphrase:
-            raise EncryptionRequiredError("Sealing an entry needs a crypto provider and a passphrase.")
-        envelope = self.crypto_provider.encrypt(
-            content.encode("utf-8"), self.passphrase, aad=entry_aad(scope, category, key)
-        )
-        return "", 1, envelope.model_copy(update={"binding": ENTRY_BINDING}).model_dump_json(), signature
-
-    def _write_sealed(self, cursor: Any, r: Any, content: str, *, encrypt: bool) -> None:
-        """Re-seal and re-sign stored row ``r`` (with id, scope, category and key) to hold ``content``."""
-        stored, is_encrypted, envelope_json, signature = self._seal(
-            r["scope"], r["category"], r["key"], content, encrypt=encrypt
-        )
-        cursor.execute(
-            "UPDATE entities SET content = ?, is_encrypted = ?, encrypted_envelope_json = ?, tenant_sig = ? WHERE id = ?",
-            (stored, is_encrypted, envelope_json, signature, r["id"]),
-        )
-        if self._search_index:
-            self._index_entry(cursor, r["id"], r["category"], r["key"], content, r["scope"])
-
-    def _open_entry(self, r: Any) -> str:
-        """Content of a stored row, after its integrity checks.
-
-        Raises :class:`EntryIntegrityError` when the row lacks a valid signature (a vault with a
-        passphrase refuses unsigned rows) or its sealed content was not sealed for this entry, and a
-        plain ``PermissionError`` when the row is sealed and this vault has no key.
-        """
-        scope, category, key = r["scope"], r["category"], r["key"]
-        where = f"'{category}:{key}' [scope={scope}]"
-        if r["is_encrypted"] == 1:
-            if self.crypto_provider is None or not self.passphrase:
-                raise PermissionError("Entity is encrypted, but vault has no crypto provider or passphrase configured.")
-            try:
-                envelope = EncryptedEnvelope.model_validate_json(r["encrypted_envelope_json"] or "")
-            except ValueError as exc:
-                raise EntryIntegrityError(f"Integrity check failed: {where} has no readable sealed content") from exc
-            if envelope.binding != ENTRY_BINDING:
-                raise EntryIntegrityError(f"Integrity check failed: the sealed content of {where} is not bound to it")
-            try:
-                content = self.crypto_provider.decrypt(
-                    envelope, self.passphrase, aad=entry_aad(scope, category, key)
-                ).decode("utf-8")
-            except Exception as exc:
-                raise EntryIntegrityError(
-                    f"Integrity check failed: the sealed content of {where} was not sealed for it, or is damaged"
-                ) from exc
-        else:
-            content = r["content"]
-        signature = r["tenant_sig"]
-        if self._keyed:
-            if not verify_entry(self._signing_key, scope, category, key, content, signature):
-                problem = "has no signature" if not signature else "has an invalid signature"
-                raise EntryIntegrityError(f"Integrity check failed: {where} {problem}")
-        elif signature and not verify_tenant_payload(self._signing_key, scope, f"{category}:{key}", content, signature):
-            raise EntryIntegrityError(f"Integrity check failed: {where} has an invalid signature")
-        return content
-
-    def _readable_content(self, r: Any) -> Optional[str]:
-        """Content for search and listing: None when the row fails its integrity check (leave it out),
-        "[ENCRYPTED]" when it is sealed and this vault has no key to open it."""
-        try:
-            return self._open_entry(r)
-        except EntryIntegrityError:
-            return None
-        except PermissionError:
-            return "[ENCRYPTED]"
-
-    def _open_legacy(self, r: Any) -> str:
-        """Content of a row as integrity format 1 stored it (sealed without binding). Upgrade use only."""
-        if r["is_encrypted"] != 1:
-            return r["content"]
-        envelope = EncryptedEnvelope.model_validate_json(r["encrypted_envelope_json"] or "")
-        aad = entry_aad(r["scope"], r["category"], r["key"]) if envelope.binding == ENTRY_BINDING else None
-        assert self.crypto_provider is not None and self.passphrase
-        return self.crypto_provider.decrypt(envelope, self.passphrase, aad=aad).decode("utf-8")
-
-    def _digests(self, value: str) -> Tuple[str, str]:
-        """(exact, canonical) digests of a value as this vault stores them: keyed when it has a passphrase."""
-        return self._stored_digests(*value_digests(value))
-
-    def _digest_key_id(self) -> Optional[str]:
-        """Short public identifier of the digest key, so snapshot digests can be matched to their vault."""
-        if self._digest_key is None:
-            return None
-        return hmac.new(self._digest_key, b"kibisis digest key id", hashlib.sha256).hexdigest()[:16]
-
-    def stored_digest(self, sha256_hex: str) -> str:
-        """The form in which this vault stores a value's SHA-256 hex digest in its journal and tombstones:
-        keyed when the vault has a passphrase, unchanged otherwise."""
-        return keyed_value_digest(self._digest_key, sha256_hex) if self._digest_key is not None else sha256_hex
-
-    def _stored_digests(self, exact: str, canonical: str) -> Tuple[str, str]:
-        return self.stored_digest(exact), self.stored_digest(canonical)
-
-    def _seal_digests(self, scope: str, category: str, key: str, exact: str, canonical: str) -> Optional[str]:
-        """A tombstone's plain digests, sealed and bound to the tombstone, so a snapshot can carry them to
-        another vault with the same passphrase. None in a vault without a passphrase."""
-        if not self._keyed or self.crypto_provider is None or not self.passphrase:
-            return None
-        envelope = self.crypto_provider.encrypt(
-            json.dumps([exact, canonical]).encode("utf-8"), self.passphrase, aad=tombstone_aad(scope, category, key)
-        )
-        return envelope.model_copy(update={"binding": TOMBSTONE_BINDING}).model_dump_json()
-
-    def _unseal_digests(self, scope: str, category: str, key: str, sealed: str) -> Optional[Tuple[str, str]]:
-        """Plain digests of a sealed tombstone (this vault's, or another's with the same passphrase), or None."""
-        if self.crypto_provider is None or not self.passphrase:
-            return None
-        try:
-            envelope = EncryptedEnvelope.model_validate_json(sealed)
-            plain = self.crypto_provider.decrypt(envelope, self.passphrase, aad=tombstone_aad(scope, category, key))
-            exact, canonical = json.loads(plain)
-            return str(exact), str(canonical)
-        except Exception:
-            return None
-
     def _has_meta_key(self, key: str) -> bool:
         try:
             return self._meta(key) is not None
         except sqlcipher3.OperationalError:
             return False  # no vault_meta table: the vault was never opened with a passphrase
-
-    def _key_check_value(self) -> str:
-        return hmac.new(self._signing_key, b"kibisis key check v2", hashlib.sha256).hexdigest()
 
     def _meta(self, key: str) -> Any:
         row = self._conn.execute("SELECT value FROM vault_meta WHERE key = ?", (key,)).fetchone()
@@ -1083,238 +717,6 @@ class SQLiteMemoryVault(MemoryVault):
     @staticmethod
     def _set_meta(cursor: Any, key: str, value: Any) -> None:
         cursor.execute("INSERT OR REPLACE INTO vault_meta (key, value) VALUES (?, ?)", (key, value))
-
-    def _upgrade_integrity(self) -> None:
-        """Bring an older vault up to INTEGRITY_FORMAT, then check the passphrase against the key check."""
-        if int(self._meta("integrity_format") or 0) < INTEGRITY_FORMAT:
-            self.integrity_upgrade = self._migrate_integrity()
-        stored = self._meta("key_check")
-        if stored is not None and not hmac.compare_digest(str(stored), self._key_check_value()):
-            raise ValueError("Failed to authenticate or decrypt vault database with provided passphrase")
-        self._integrity_format = INTEGRITY_FORMAT
-
-    def _migrate_integrity(self) -> Optional[Dict[str, Any]]:
-        """Upgrade a vault written by Kibisis 0.1.0a5 or earlier to integrity format 2, in one transaction.
-
-        Entries: each entry whose format 1 signature verifies is re-sealed with its scope, category and
-        key bound to the ciphertext and signed with the PBKDF2-derived key. An entry without a signature
-        is adopted only when the file was SQLCipher-encrypted before this open, because then nothing
-        without the passphrase could have removed a signature; otherwise it stays as it is and reads
-        refuse it until :meth:`adopt_unsigned_entries`. Entries whose signature fails, or whose content
-        does not decrypt, are left untouched and refused. Journal and tombstones: every plain SHA-256
-        value digest becomes its keyed form, the journal's hashes are recomputed in order, and digest
-        prefixes in refusal records are dropped. A ``migrate`` event records the counts, the old chain
-        head and whether the old chain verified. Returns the counts, or None for an empty vault.
-        """
-        counts: Dict[str, Any] = {
-            "entries_resealed": 0,
-            "entries_adopted_unsigned": 0,
-            "entries_left_unsigned": 0,
-            "entries_failed_signature": 0,
-            "entries_undecryptable": 0,
-            "tombstones_rekeyed": 0,
-            "journal_events_rekeyed": 0,
-        }
-        digest_key = self._digest_key
-        assert digest_key is not None
-        trust_unsigned = self._sqlcipher_active and not self._converted_to_sqlcipher
-        with self._write_tx() as cursor:
-            if int(self._meta("integrity_format") or 0) >= INTEGRITY_FORMAT:
-                return None  # another process upgraded it first
-            rows = cursor.execute(
-                "SELECT id, category, key, scope, content, is_encrypted, encrypted_envelope_json, tenant_sig FROM entities"
-            ).fetchall()
-            tombstones = cursor.execute(
-                "SELECT id, category, key, scope, value_sha256, canonical_sha256 FROM rejected_value_tombstones"
-            ).fetchall()
-            events = cursor.execute(
-                "SELECT sequence, timestamp, action, category, key, scope, value_sha256, prev_hash, event_hash, "
-                "author_id, metadata_json, format FROM audit_journal ORDER BY sequence ASC"
-            ).fetchall()
-            if not (rows or tombstones or events):
-                self._set_meta(cursor, "integrity_format", INTEGRITY_FORMAT)
-                self._set_meta(cursor, "key_check", self._key_check_value())
-                return None
-
-            # A vault that never had a passphrase holds only plaintext entries, signed (if at all) with a key
-            # anyone can compute, so its first open with a passphrase is where trust starts: adopt them.
-            # Otherwise decide every entry before changing anything, and stop under a wrong passphrase: an
-            # upgrade under the wrong key would re-key the tombstones and the journal beyond repair.
-            was_keyed = self._was_keyed or any(r["is_encrypted"] == 1 for r in rows)
-            if not was_keyed:
-                counts["entries_adopted_from_keyless_vault"] = 0
-            reseal: List[Tuple[Any, str]] = []
-            opened = verified = 0
-            for r in rows:
-                try:
-                    content = self._open_legacy(r)
-                except Exception:
-                    counts["entries_undecryptable"] += 1
-                    continue
-                if not was_keyed:
-                    counts["entries_adopted_from_keyless_vault"] += 1
-                    reseal.append((r, content))
-                    continue
-                opened += int(r["is_encrypted"] == 1)
-                signature = r["tenant_sig"]
-                if signature:
-                    entity_id = f"{r['category']}:{r['key']}"
-                    if not verify_tenant_payload(self._legacy_signing_key, r["scope"], entity_id, content, signature):
-                        counts["entries_failed_signature"] += 1
-                        continue
-                    verified += 1
-                elif trust_unsigned:
-                    counts["entries_adopted_unsigned"] += 1
-                else:
-                    counts["entries_left_unsigned"] += 1
-                    continue
-                reseal.append((r, content))
-            sealed_rows = sum(1 for r in rows if r["is_encrypted"] == 1)
-            signed_rows = sum(1 for r in rows if r["tenant_sig"])
-            if was_keyed and ((sealed_rows and not opened) or (signed_rows and not verified)):
-                raise ValueError("Failed to authenticate or decrypt vault database with provided passphrase")
-
-            for r, content in reseal:
-                self._write_sealed(cursor, r, content, encrypt=r["is_encrypted"] == 1)
-                counts["entries_resealed"] += 1
-
-            for t in tombstones:
-                exact, canonical = t["value_sha256"], t["canonical_sha256"] or ""
-                cursor.execute(
-                    "UPDATE rejected_value_tombstones SET value_sha256 = ?, canonical_sha256 = ?, sealed_digests = ? "
-                    "WHERE id = ?",
-                    (
-                        keyed_value_digest(digest_key, exact),
-                        keyed_value_digest(digest_key, canonical),
-                        self._seal_digests(t["scope"], t["category"], t["key"], exact, canonical),
-                        t["id"],
-                    ),
-                )
-                counts["tombstones_rekeyed"] += 1
-
-            old_head = events[-1]["event_hash"] if events else "0" * 64
-            chain_was_valid = self.verify_audit_chain()
-            prev_hash = "0" * 64
-            for ev in events:
-                value = keyed_value_digest(digest_key, ev["value_sha256"])
-                metadata = json.loads(ev["metadata_json"] or "{}")
-                if _rekey_metadata(metadata, digest_key) or value != ev["value_sha256"]:
-                    counts["journal_events_rekeyed"] += 1
-                event_hash = _event_hash(
-                    ev["sequence"], ev["timestamp"], ev["action"], ev["category"], ev["key"], ev["scope"],
-                    value, prev_hash, ev["author_id"], metadata, fmt=ev["format"],
-                )
-                cursor.execute(
-                    "UPDATE audit_journal SET value_sha256 = ?, prev_hash = ?, event_hash = ?, metadata_json = ? "
-                    "WHERE sequence = ?",
-                    (value, prev_hash, event_hash, json.dumps(metadata, sort_keys=True), ev["sequence"]),
-                )
-                prev_hash = event_hash
-            if not chain_was_valid:
-                logger.warning(
-                    "%s: the audit journal did not verify before the integrity upgrade; the upgrade's "
-                    "migrate event records this and the old chain head",
-                    self.db_path,
-                )
-            self._record_audit_event(
-                cursor=cursor,
-                action="migrate",
-                category="",
-                key="",
-                scope="*",
-                value_sha256="",
-                metadata={
-                    "integrity_format": INTEGRITY_FORMAT,
-                    "previous_head": old_head,
-                    "previous_chain_valid": chain_was_valid,
-                    **counts,
-                },
-            )
-            self._set_meta(cursor, "integrity_format", INTEGRITY_FORMAT)
-            if opened or verified or self._sqlcipher_active or not was_keyed:
-                self._set_meta(cursor, "key_check", self._key_check_value())
-        if counts["entries_left_unsigned"]:
-            logger.warning(
-                "%s: %d entries have no signature and the file had no whole-file encryption, so they cannot "
-                "be told apart from tampered entries; reads refuse them until adopt_unsigned_entries() "
-                "accepts them",
-                self.db_path,
-                counts["entries_left_unsigned"],
-            )
-        if self.db_path != ":memory:":
-            self.scrub()  # drop the replaced digests and envelopes from free pages and the write-ahead log
-        return counts
-
-    def integrity_status(self) -> Dict[str, int]:
-        """Counts of stored entries that reads refuse, found without decrypting anything (for a vault
-        opened with its passphrase): ``unsigned`` (no signature), ``legacy_signature`` (a format 1
-        signature) and ``unbound`` (sealed before format 2)."""
-        rows = self._conn.execute("SELECT tenant_sig, is_encrypted, encrypted_envelope_json FROM entities").fetchall()
-
-        def unbound(r: Any) -> bool:
-            try:
-                return json.loads(r["encrypted_envelope_json"] or "{}").get("binding") != ENTRY_BINDING
-            except ValueError:
-                return True
-
-        return {
-            "integrity_format": self._integrity_format,
-            "entries": len(rows),
-            "unsigned": sum(1 for r in rows if not r["tenant_sig"]),
-            "legacy_signature": sum(
-                1 for r in rows if r["tenant_sig"] and not str(r["tenant_sig"]).startswith(ENTRY_SIGNATURE_PREFIX)
-            ),
-            "unbound": sum(1 for r in rows if r["is_encrypted"] == 1 and unbound(r)),
-        }
-
-    def adopt_unsigned_entries(self, scope: Optional[str] = None, author_id: Optional[str] = None) -> int:
-        """Sign, and bind to their entries, stored entries that carry no signature, after a person has
-        checked them. Returns how many were adopted; each is journaled as an ``adopt`` event.
-
-        Needed only for a vault upgraded from Kibisis 0.1.0a5 or earlier that ran without SQLCipher and
-        holds entries written before signatures existed, or plaintext entries written while it had no
-        passphrase. Kibisis cannot tell such an entry from one whose signature was removed or forged, so
-        reads refuse it until it is adopted. Entries whose format 1 signature verifies under no key are
-        damaged or tampered and are never adopted. ``scope`` limits adoption to one scope (``None`` or
-        ``"*"``: every scope).
-        """
-        if not self._keyed:
-            raise EncryptionRequiredError("adopt_unsigned_entries needs a vault opened with its passphrase.")
-        keyless_key = hashlib.sha256(f"kibisis-tenant-sig:{self.db_path}".encode("utf-8")).digest()
-        sql = (
-            "SELECT id, category, key, scope, content, is_encrypted, encrypted_envelope_json, tenant_sig "
-            "FROM entities WHERE (tenant_sig IS NULL OR tenant_sig = '' OR tenant_sig NOT LIKE 'v2:%')"
-        )
-        params: List[Any] = []
-        if scope not in (None, "*"):
-            sql += " AND scope = ?"
-            params.append(scope)
-        adopted = 0
-        with self._write_tx() as cursor:
-            for r in cursor.execute(sql, params).fetchall():
-                try:
-                    content = self._open_legacy(r)
-                except Exception:
-                    continue  # does not decrypt under this passphrase: nothing to adopt
-                signature, entity_id = r["tenant_sig"], f"{r['category']}:{r['key']}"
-                if signature and not any(
-                    verify_tenant_payload(k, r["scope"], entity_id, content, signature)
-                    for k in (keyless_key, self._legacy_signing_key)
-                ):
-                    continue
-                self._write_sealed(cursor, r, content, encrypt=r["is_encrypted"] == 1)
-                self._record_audit_event(
-                    cursor=cursor,
-                    action="adopt",
-                    category=r["category"],
-                    key=r["key"],
-                    scope=r["scope"],
-                    value_sha256=self._digests(content)[0],
-                    author_id=author_id,
-                    metadata={"reason": "unsigned entry accepted by a person"},
-                )
-                adopted += 1
-        return adopted
 
     def _put(
         self,
@@ -1340,9 +742,17 @@ class SQLiteMemoryVault(MemoryVault):
         origin: Optional[str] = None,
         source_ref: Optional[str] = None,
         confidence: Optional[float] = None,
+        act_class: Optional[str] = None,
+        revive: bool = False,
+        conflicts_with: Optional[List[str]] = None,
+        contrasts_with: Optional[List[str]] = None,
         _trusted_metadata: bool = False,
+        _review_verdict: bool = False,
     ) -> MemoryEntity:
         """Write path behind :meth:`put`, which journals the tombstone refusals this raises.
+
+        ``_review_verdict`` is set by :meth:`review_entity` only: the state it passes was decided
+        under the quorum rule there, with ``attestations`` already in ``metadata``.
 
         ``_trusted_metadata`` is set only by internal callers whose ``metadata`` the vault itself
         produced; a caller's reserved keys (:data:`RESERVED_METADATA_KEYS`) are dropped otherwise.
@@ -1352,6 +762,8 @@ class SQLiteMemoryVault(MemoryVault):
         _validate_origin(origin)
         if confidence is not None and not (0.0 <= float(confidence) <= 1.0):
             raise ValueError("confidence must be within [0, 1]")
+        if act_class is not None and act_class not in ACT_CLASSES:
+            raise ValueError(f"act_class must be one of {ACT_CLASSES}, got {act_class!r}")
         if origin == "model":
             # Trust comes from where the write came from, not from what it says about itself.
             trust_ceiling = EpistemicState.CANDIDATE.value
@@ -1389,12 +801,27 @@ class SQLiteMemoryVault(MemoryVault):
             if decision.disposition == FactDisposition.TRANSIENT and valid_until is None:
                 valid_until = now + 86400.0  # Default 24h validity for transient states
         else:
-            ep_state = EpistemicState(epistemic_state) if epistemic_state else EpistemicState.VERIFIED
+            # K-E: a write that states no epistemic state is a candidate. Nothing but a person's
+            # review (and the quorum below) mints verified.
+            ep_state = EpistemicState(epistemic_state) if epistemic_state else EpistemicState.CANDIDATE
 
         if trust_ceiling is not None and ep_state in (EpistemicState.VERIFIED, EpistemicState.DISPUTED):
             # Default recall returns verified and disputed entries; a capped write is neither.
             meta["trust_capped_from"] = ep_state.value
             ep_state = EpistemicState.CANDIDATE
+
+        # K-R1: the trust class of this write. A re-write that states no origin keeps the entry's
+        # stored origin (and class); that is resolved against the stored row inside the transaction.
+        writer_class: Optional[str] = origin_class_of(origin) if origin is not None else None
+        requested_verified = ep_state == EpistemicState.VERIFIED and not _review_verdict
+        if requested_verified:
+            # An explicit "verified" from a principal is that principal's attestation, counted toward
+            # the quorum; from anyone else it is a claim and the entry stays a candidate.
+            if writer_class != "principal":
+                meta["trust_capped_from"] = ep_state.value
+                ep_state = EpistemicState.CANDIDATE
+            else:
+                ep_state = EpistemicState.CANDIDATE  # settled against the quorum below
 
         # Check explicit superseding target
         supersedes_ref: Optional[str] = None
@@ -1410,38 +837,197 @@ class SQLiteMemoryVault(MemoryVault):
 
         with self._write_tx() as cursor:
             self._fence(cursor, fencing_token, resource, holder_id)
+            cursor.execute(
+                "SELECT epistemic_state, metadata_json, origin, superseded_by, valid_until, version "
+                "FROM entities WHERE category = ? AND key = ? AND scope = ?",
+                (category, key, scope),
+            )
+            existing = cursor.fetchone()
+
+            # K-R2 bitemporal non-revival: a key closed by a supersedes edge stays closed. Only a
+            # principal may revive it, and only forward in time: the new version's valid_from is at or
+            # after the closed interval's valid_until, so the old interval is never reopened.
+            if existing is not None and existing["superseded_by"]:
+                if not revive or origin_class_of(origin) != "principal":
+                    raise SupersededEntryError(
+                        f"'{category}:{key}' [scope={scope}] was superseded by {existing['superseded_by']}; "
+                        "the closed interval is not rewritten. A principal may pass revive=True to open a new one."
+                    )
+                closed_at = existing["valid_until"] or now
+                if valid_from is not None and valid_from < closed_at:
+                    raise ValueError("revive cannot backdate valid_from into the closed interval")
+                if valid_from is None:
+                    valid_from = max(now, closed_at)
+                meta["revived_from"] = {"version": int(existing["version"]), "superseded_by": existing["superseded_by"]}
+
+            # K-R5: contradiction check before anything else happens to the write. An explicit
+            # ``conflicts_with`` edge is recorded on both sides and journaled; recall withholds a pair of
+            # verified entries that conflict until a person resolves it (K-R3).
+            existing_meta: Dict[str, Any] = {}
+            if existing is not None:
+                try:
+                    existing_meta = json.loads(existing["metadata_json"] or "{}")
+                except (TypeError, ValueError):
+                    existing_meta = {}
+            conflict_refs = self._record_edges(
+                cursor, "conflicts_with", conflicts_with, category, key, scope, now, existing_meta, _trusted_metadata
+            )
+            if conflicts_with:
+                self._record_audit_event(
+                    cursor=cursor, action="contradiction", category=category, key=key, scope=scope,
+                    value_sha256=val_hash, author_id=author_id, metadata={"with": list(conflicts_with)},
+                )
+            if conflict_refs:
+                meta["conflicts_with"] = conflict_refs
+            # Contrast edges name confusables: entries a reader could mistake for each other. Both are
+            # returned; the receipt carries the edge so the scaffold can show the distinction.
+            contrast_refs = self._record_edges(
+                cursor, "contrasts_with", contrasts_with, category, key, scope, now, existing_meta, _trusted_metadata
+            )
+            if contrast_refs:
+                meta["contrasts_with"] = contrast_refs
+
+            # K-R1: origin_class is immutable from below. The stored class is what a lower-trust
+            # writer must not change; an equal class keeps it; a principal may raise it.
+            stored_class = _row_origin_class(existing) if existing is not None else None
+            if writer_class is None:
+                writer_class = stored_class or origin_class_of(origin)
+            if stored_class is not None and _class_rank(writer_class) < _class_rank(stored_class):
+                raise OriginClassError(
+                    f"'{category}:{key}' [scope={scope}] is {stored_class}-class; a {writer_class}-class write "
+                    "cannot replace it. Write a new key with supersedes_key to propose a replacement.",
+                    writer_class=writer_class, stored_class=stored_class,
+                )
+            entry_class = writer_class
+            # Max-untrust along supersedes and derived_from: a non-principal entry is no more trusted
+            # than what it replaces or draws on, so trust cannot be laundered through a rewrite.
+            if entry_class != "principal":
+                inherited: List[str] = []
+                links: List[Tuple[str, str]] = []
+                if supersedes_key:
+                    links.append((supersedes_category or category, supersedes_key))
+                for ref in derived_from or []:
+                    if ":" in ref:
+                        c, k = ref.split(":", 1)
+                        links.append((c, k))
+                for c, k in links:
+                    cursor.execute(
+                        "SELECT metadata_json, origin FROM entities WHERE category = ? AND key = ? AND scope = ?",
+                        (c, k, scope),
+                    )
+                    link_row = cursor.fetchone()
+                    if link_row is None:
+                        continue
+                    link_class = _row_origin_class(link_row)
+                    if _class_rank(link_class) < _class_rank(entry_class):
+                        entry_class = link_class
+                        inherited.append(f"{c}:{k}")
+                if inherited:
+                    meta["trust_inherited_from"] = inherited
+            meta["origin_class"] = entry_class
+            # act_class: only a principal may mark an entry as one that drives actions.
+            wanted_act = act_class or (meta.get("act_class") if _trusted_metadata else None) or "inform"
+            if wanted_act == "act" and entry_class != "principal":
+                meta["act_class_capped_from"] = "act"
+                wanted_act = "inform"
+            meta["act_class"] = wanted_act
+
+            # Verification quorum: distinct principals who attested. The author of a principal write
+            # that asked for verified is one; review_entity adds reviewers. Below quorum stays candidate.
+            if not _review_verdict:
+                prior_meta: Dict[str, Any] = {}
+                if existing is not None:
+                    try:
+                        prior_meta = json.loads(existing["metadata_json"] or "{}")
+                    except (TypeError, ValueError):
+                        prior_meta = {}
+                attested = list(prior_meta.get("attestations") or []) if existing is not None else []
+                if requested_verified and entry_class == "principal":
+                    signer = author_id or principal_id or "principal"
+                    if signer not in attested:
+                        attested.append(signer)
+                if attested:
+                    meta["attestations"] = attested
+                if requested_verified and entry_class == "principal":
+                    if len(attested) >= self.verification_quorum:
+                        ep_state = EpistemicState.VERIFIED
+                        meta.pop("verification_pending", None)
+                    else:
+                        meta["verification_pending"] = {"have": len(attested), "need": self.verification_quorum}
+            meta_str = json.dumps(meta, sort_keys=True)
+
             if trust_ceiling is not None:
                 # A capped write cannot replace an entry a person verified or reviewed.
-                cursor.execute(
-                    "SELECT epistemic_state, metadata_json FROM entities WHERE category = ? AND key = ? AND scope = ?",
-                    (category, key, scope),
-                )
-                existing = cursor.fetchone()
                 if existing is not None and _is_reviewed(existing):
                     raise ReviewedEntryError(
                         f"'{category}:{key}' [scope={scope}] is verified or reviewed by a person; a capped write "
                         "cannot replace it. Write a new key with supersedes_key to propose a replacement."
                     )
 
-            # Invalidate older entity if superseding is declared
+            # K-R2 three-way supersession. Retirement happens only through this explicit edge.
             if supersedes_key:
                 target_cat = supersedes_category or category
                 cursor.execute(
-                    "SELECT id, metadata_json, epistemic_state, origin FROM entities WHERE category = ? AND key = ? AND scope = ? AND archived = 0",
+                    "SELECT id, metadata_json, epistemic_state, origin, superseded_by FROM entities "
+                    "WHERE category = ? AND key = ? AND scope = ? AND archived = 0",
                     (target_cat, supersedes_key, scope),
                 )
                 target_row = cursor.fetchone()
-                if target_row is not None and trust_ceiling is not None and _is_reviewed(target_row):
-                    # A capped write cannot retire a reviewed entry. Record the proposal instead;
-                    # review_entity applies it when a person approves this entry.
+                target_ref = f"{target_cat}:{supersedes_key}"
+                if target_row is None:
+                    raise SupersessionRefused(f"supersedes target '{target_ref}' [scope={scope}] does not exist")
+                if target_row["superseded_by"]:
+                    raise SupersessionRefused(
+                        f"supersedes target '{target_ref}' [scope={scope}] is already superseded by "
+                        f"{target_row['superseded_by']}; supersede that entry instead"
+                    )
+                target_class = _row_origin_class(target_row)
+                confirmed_by = meta.get("supersession_approved_by") if _review_verdict else None
+                # Applied when the writer outranks or equals the target's class and the target is not a
+                # reviewed entry a non-principal may not retire; a person's approval of a proposal applies it.
+                applies = bool(confirmed_by) or entry_class == "principal" or (
+                    _class_rank(entry_class) >= _class_rank(target_class) and not _is_reviewed(target_row)
+                )
+                if not applies:
+                    # needs_confirmation: store this entry as a proposal; the target stays active and
+                    # carries the pending mark. review_entity applies or clears it.
                     meta.pop("supersedes", None)
                     meta["proposed_supersedes"] = {"category": target_cat, "key": supersedes_key}
-                    meta_str = json.dumps(meta, sort_keys=True)
+                    meta["supersession"] = {"outcome": "needs_confirmation", "target": target_ref}
+                    target_meta = json.loads(target_row["metadata_json"] or "{}")
+                    pending = list(target_meta.get("pending_supersession_by") or [])
+                    if f"{category}:{key}" not in pending:
+                        pending.append(f"{category}:{key}")
+                    target_meta["pending_supersession_by"] = pending
+                    cursor.execute(
+                        "UPDATE entities SET metadata_json = ?, updated_at = ? WHERE id = ?",
+                        (json.dumps(target_meta, sort_keys=True), now, target_row["id"]),
+                    )
+                    self._record_audit_event(
+                        cursor=cursor, action="supersession", category=target_cat, key=supersedes_key, scope=scope,
+                        value_sha256="", author_id=author_id,
+                        metadata={"outcome": "needs_confirmation", "proposed_by": f"{category}:{key}",
+                                  "writer_class": entry_class, "target_class": target_class},
+                    )
                     supersedes_ref = None
                     target_row = None
+                else:
+                    meta.pop("proposed_supersedes", None)
+                    meta["supersession"] = {"outcome": "applied", "target": target_ref}
+                    if confirmed_by:
+                        meta["supersession"]["confirmed_by"] = confirmed_by
+                    self._record_audit_event(
+                        cursor=cursor, action="supersession", category=target_cat, key=supersedes_key, scope=scope,
+                        value_sha256="", author_id=author_id,
+                        metadata={"outcome": "applied", "superseded_by": f"{category}:{key}",
+                                  "writer_class": entry_class, "target_class": target_class,
+                                  **({"confirmed_by": confirmed_by} if confirmed_by else {})},
+                    )
+                meta_str = json.dumps(meta, sort_keys=True)
                 if target_row is not None:
                     target_meta = json.loads(target_row["metadata_json"] or "{}")
                     target_meta["superseded_by"] = f"{category}:{key}"
+                    target_meta.pop("pending_supersession_by", None)
                     cursor.execute(
                         """
                         UPDATE entities
@@ -1470,8 +1056,9 @@ class SQLiteMemoryVault(MemoryVault):
                     if target_row["epistemic_state"] != EpistemicState.REVOKED.value:
                         self._record_state_transition(
                             cursor, target_cat, supersedes_key, scope, target_row["epistemic_state"],
-                            EpistemicState.REVOKED.value, row_origin(target_row), author_id,
+                            EpistemicState.REVOKED.value, row_origin(target_row), author_id, cause="supersede",
                         )
+                    self._cascade_invalidate(cursor, scope, target_ref, author_id, now)
 
             # Skip canonicalization when the vault has no tombstones. Asked of the database on every
             # write: a flag cached at open misses tombstones that other processes add later.
@@ -1542,16 +1129,18 @@ class SQLiteMemoryVault(MemoryVault):
                         is_encrypted = ?, encrypted_envelope_json = ?, epistemic_state = ?,
                         valid_from = ?, valid_until = ?, tenant_sig = ?,
                         supersedes = COALESCE(?, supersedes),
+                        superseded_by = CASE WHEN ? THEN NULL ELSE superseded_by END,
                         origin = ?, source_ref = ?, confidence = ?
                     WHERE id = ?
                     """,
                     (
                         stored_content, meta_str, version, now, is_encrypted, envelope_json,
                         ep_state.value, valid_from, valid_until, tenant_sig, supersedes_ref,
+                        1 if "revived_from" in meta else 0,
                         stored_origin, stored_source_ref, stored_confidence, entity_id
                     ),
                 )
-            if self._search_index:
+            if self._search_index or self._term_index:
                 self._index_entry(cursor, entity_id, category, key, content, scope)
 
             # Record hash-chained mutation audit event
@@ -1567,49 +1156,17 @@ class SQLiteMemoryVault(MemoryVault):
             )
             if previous_state is not None and previous_state != ep_state.value:
                 self._record_state_transition(
-                    cursor, category, key, scope, previous_state, ep_state.value, stored_origin, author_id
+                    cursor, category, key, scope, previous_state, ep_state.value, stored_origin, author_id,
+                    cause="review" if _review_verdict else "write",
                 )
+                if ep_state == EpistemicState.REVOKED:
+                    self._cascade_invalidate(cursor, scope, f"{category}:{key}", author_id, now)
             # Return what was stored, through the same constructor the read paths use, so the write
             # path cannot report a field differently from a later get() or search().
             cursor.execute(f"SELECT {_ENTITY_COLUMNS} FROM entities e WHERE e.id = ?", (entity_id,))
             written = cursor.fetchone()
 
         return self._entity(written, content)
-
-    def _record_state_transition(
-        self,
-        cursor: sqlite3.Cursor,
-        category: str,
-        key: str,
-        scope: str,
-        previous: str,
-        new: str,
-        origin: str,
-        reviewer: Optional[str],
-    ) -> None:
-        """Journal an epistemic-state change and mirror it to the Argus ledger when one is configured."""
-        payload = {
-            "event": "state_transition",
-            "from": previous,
-            "to": new,
-            "origin": origin,
-            "reviewer": reviewer,
-        }
-        self._record_audit_event(
-            cursor=cursor,
-            action="state_transition",
-            category=category,
-            key=key,
-            scope=scope,
-            value_sha256="",
-            author_id=reviewer,
-            metadata=payload,
-        )
-        _argus_append(
-            "kibisis.state_transition",
-            reviewer or "kibisis",
-            {**payload, "category": category, "key": key, "scope": scope},
-        )
 
     def put(
         self,
@@ -1635,9 +1192,34 @@ class SQLiteMemoryVault(MemoryVault):
         origin: Optional[str] = None,
         source_ref: Optional[str] = None,
         confidence: Optional[float] = None,
+        act_class: Optional[str] = None,
+        revive: bool = False,
+        conflicts_with: Optional[List[str]] = None,
+        contrasts_with: Optional[List[str]] = None,
         _trusted_metadata: bool = False,
+        _review_verdict: bool = False,
     ) -> MemoryEntity:
         """Insert or update an entity. See ``__init__`` for ``fencing_token``, ``resource`` and ``holder_id``.
+
+        K-R3/K-R5: ``conflicts_with`` names existing entries this one contradicts; the edge is recorded on
+        both sides and journaled as a ``contradiction`` before the write. :meth:`recall` withholds two
+        verified entries that conflict until a person resolves it.
+
+        K-R2: ``supersedes_key`` is the only way an entry retires another. The outcome is reported in
+        ``metadata["supersession"]``: ``applied`` (target revoked and closed), or ``needs_confirmation``
+        (this entry is a proposal; a person's ``verified`` review applies it). A missing or already
+        superseded target raises :class:`SupersessionRefused`. Retiring an entry marks everything that
+        ``derived_from`` it ``disputed`` (cascade). A key closed by supersession refuses writes
+        (:class:`SupersededEntryError`) unless a principal passes ``revive=True``.
+
+        K-E/K-R1: a write that states no ``epistemic_state`` is stored as ``candidate``. ``verified``
+        is minted only when ``verification_quorum`` distinct principals have attested: a
+        ``origin="user"``/``"import"`` write that asks for ``verified`` is its author's attestation,
+        :meth:`review_entity` adds a reviewer's. The vault sets ``origin_class`` (``principal``,
+        ``agent``, ``external``) from ``origin``; a lower-class writer cannot overwrite a higher-class
+        entry (:class:`OriginClassError`), and a non-principal entry inherits the lowest class along
+        ``supersedes_key`` and ``derived_from``. ``act_class`` (``inform``/``act``) is capped at
+        ``inform`` unless the writer is a principal.
 
         ``origin`` records where the write came from (:data:`ORIGINS`); ``origin="model"`` implies
         ``trust_ceiling="candidate"``. A re-write that gives no origin keeps the entry's existing one.
@@ -1681,6 +1263,11 @@ class SQLiteMemoryVault(MemoryVault):
                 source_ref=source_ref,
                 confidence=confidence,
                 _trusted_metadata=_trusted_metadata,
+                act_class=act_class,
+                revive=revive,
+                conflicts_with=conflicts_with,
+                contrasts_with=contrasts_with,
+                _review_verdict=_review_verdict,
             )
         except TombstonedValueError as exc:
             # The write's transaction rolled back; journal the refusal in its own transaction.
@@ -1692,6 +1279,24 @@ class SQLiteMemoryVault(MemoryVault):
                 key=exc.key,
                 author_id=exc.author_id,
                 detail={"value_digest_prefix": exc.digest[:12]},
+            )
+            raise
+        except OriginClassError as exc:
+            # Same: the transaction rolled back, so the refusal is journaled on its own.
+            self.record_refusal(
+                path="put",
+                reason="origin_class_refused",
+                scope=scope,
+                category=category,
+                key=key,
+                author_id=author_id,
+                detail={"writer_class": exc.writer_class, "stored_class": exc.stored_class, "origin": origin or ""},
+            )
+            raise
+        except SupersededEntryError:
+            self.record_refusal(
+                path="put", reason="superseded_entry", scope=scope, category=category, key=key,
+                author_id=author_id, detail={"origin": origin or "", "revive": "yes" if revive else "no"},
             )
             raise
 
@@ -1790,8 +1395,14 @@ class SQLiteMemoryVault(MemoryVault):
         fencing_token: Optional[int] = None,
         resource: Optional[str] = None,
         holder_id: Optional[str] = None,
+        origin: Optional[str] = None,
     ) -> MemoryEntity:
-        """Atomically revoke old_key and record new_key as its superseding replacement."""
+        """Atomically revoke old_key and record new_key as its superseding replacement.
+
+        ``origin`` is passed through to :meth:`put`: the replacement asks for ``verified``, which
+        under K-R1 is the author's attestation only when the origin is a principal (``user`` or
+        ``import``) and is minted once ``verification_quorum`` is met.
+        """
         return self.put(
             category=category,
             key=new_key,
@@ -1807,6 +1418,7 @@ class SQLiteMemoryVault(MemoryVault):
             supersedes_key=old_key,
             supersedes_category=category,
             epistemic_state=EpistemicState.VERIFIED.value,
+            origin=origin,
         )
 
     def put_batch(
@@ -1900,391 +1512,8 @@ class SQLiteMemoryVault(MemoryVault):
                     value_sha256="",
                     author_id=author_id,
                 )
+                self._cascade_invalidate(cursor, scope, f"{category}:{key}", author_id, now)
             return archived
-
-    def purge(
-        self,
-        category: str,
-        key: str,
-        scope: str = "default",
-        author_id: Optional[str] = None,
-        fencing_token: Optional[int] = None,
-        resource: Optional[str] = None,
-        holder_id: Optional[str] = None,
-    ) -> bool:
-        with self._write_tx() as cursor:
-            self._fence(cursor, fencing_token, resource, holder_id)
-            cursor.execute(
-                "DELETE FROM entities WHERE category = ? AND key = ? AND scope = ?",
-                (category, key, scope),
-            )
-            purged = cursor.rowcount > 0
-            if purged:
-                self._record_audit_event(
-                    cursor=cursor,
-                    action="purge",
-                    category=category,
-                    key=key,
-                    scope=scope,
-                    value_sha256="",
-                    author_id=author_id,
-                )
-            return purged
-
-    def search(
-        self,
-        query: str,
-        category: Optional[str] = None,
-        limit: int = 10,
-        scope: Optional[str] = "default",
-        epistemic_state: Optional[str] = None,
-        as_of_valid_time: Optional[float] = None,
-        include_unverified: bool = False,
-        active_only: bool = True,
-        tenant_id: Optional[str] = None,
-        principal_id: Optional[str] = None,
-        authorized_lineage_roots: Optional[List[str]] = None,
-        match: str = "all",
-    ) -> List[SearchResult]:
-        """Entries that match ``query``, best first by BM25 (``rank_score``: lower is better).
-
-        ``match="all"`` (the default) wants every word of the query. ``match="any"`` wants at least one and
-        leaves out common words such as "what" and "the": use it for questions in natural language. A word
-        also matches longer words that start with it.
-
-        A vault with a passphrase ranks its sealed entries with the scores a plaintext vault would give
-        them. With SQLCipher it searches an index of entry terms kept inside the encrypted file. Without
-        SQLCipher no entry terms are written to disk: it builds an index in memory by opening every entry,
-        and builds it again after the vault changes.
-        """
-        terms, rows = self._ranked_rows(
-            query, category, limit, scope, epistemic_state, as_of_valid_time, include_unverified, active_only,
-            match, _ENTITY_COLUMNS, snippets=True,
-        )
-        bounded = _bounded(tenant_id, principal_id, authorized_lineage_roots)
-        results: List[SearchResult] = []
-        patterns = _snippet_patterns(terms) if any(snip is None for _, _, snip in rows) else None
-        for r, score, snip in rows:
-            if bounded and not _within_bounds(r, tenant_id, principal_id, authorized_lineage_roots):
-                continue  # outside the caller's tenant, principal or lineage: never opened
-            content = self._readable_content(r)
-            if content is None:
-                continue  # failed its integrity check: tampered, damaged, or moved from another entry
-            if snip is None:
-                snip = _snippet(content, patterns)
-            results.append(SearchResult(entity=self._entity(r, content), rank_score=float(score), snippet=str(snip)))
-        return results
-
-    def search_keys(
-        self,
-        query: str,
-        category: Optional[str] = None,
-        limit: int = 10,
-        scope: Optional[str] = "default",
-        epistemic_state: Optional[str] = None,
-        as_of_valid_time: Optional[float] = None,
-        include_unverified: bool = False,
-        active_only: bool = True,
-        tenant_id: Optional[str] = None,
-        principal_id: Optional[str] = None,
-        authorized_lineage_roots: Optional[List[str]] = None,
-        match: str = "all",
-    ) -> List[SearchHit]:
-        """Keys and scores of the entries :meth:`search` returns, best first, without opening any entry.
-
-        Takes the arguments of :meth:`search` and applies its matching, filters, ranking and tenant,
-        principal and lineage boundaries, but reads no entry content: nothing is decrypted and no snippet
-        is built. Use it when the caller needs only which entries match, such as a retriever that holds
-        the text elsewhere or fetches a few entries with :meth:`get`.
-
-        Because it opens no entry, it checks no entry's integrity: an entry that fails its integrity check
-        is left out of :meth:`search` but listed here, and :meth:`get` refuses it.
-        """
-        _, rows = self._ranked_rows(
-            query, category, limit, scope, epistemic_state, as_of_valid_time, include_unverified, active_only,
-            match, _HIT_COLUMNS, snippets=False,
-        )
-        bounded = _bounded(tenant_id, principal_id, authorized_lineage_roots)
-        return [
-            SearchHit(id=r["id"], category=r["category"], key=r["key"], scope=r["scope"], rank_score=float(score))
-            for r, score, _ in rows
-            if not bounded or _within_bounds(r, tenant_id, principal_id, authorized_lineage_roots)
-        ]
-
-    def _ranked_rows(
-        self,
-        query: str,
-        category: Optional[str],
-        limit: int,
-        scope: Optional[str],
-        epistemic_state: Optional[str],
-        as_of_valid_time: Optional[float],
-        include_unverified: bool,
-        active_only: bool,
-        match: str,
-        columns: str,
-        snippets: bool,
-    ) -> Tuple[List[str], List[Tuple[Any, float, Optional[str]]]]:
-        """Query words and ranked ``(row, score, snippet)`` rows for search, reading ``columns`` of each row."""
-        if match not in ("all", "any"):
-            raise ValueError("match must be 'all' or 'any'")
-        terms = _search_terms(query, match)
-        if not terms:
-            return terms, []
-        fts_query = (" OR " if match == "any" else " ").join('"' + t.replace('"', '""') + '"*' for t in terms)
-        # Normalize scope: None or empty string defaults to "default"
-        target_scope = "default" if scope is None or scope == "" else scope
-        filter_sql, filter_params = self._search_filters(
-            target_scope, category, epistemic_state, as_of_valid_time, include_unverified, active_only
-        )
-        if self._search_index:
-            rows = self._indexed_rows(fts_query, filter_sql, filter_params, limit, columns)
-        elif self.crypto_provider is not None and self.passphrase:
-            rows = self._scanned_rows(fts_query, filter_sql, filter_params, limit, columns)
-        else:
-            rows = self._plaintext_rows(query, fts_query, filter_sql, filter_params, limit, columns, snippets)
-        return terms, rows
-
-    @staticmethod
-    def _search_filters(
-        target_scope: str,
-        category: Optional[str],
-        epistemic_state: Optional[str],
-        as_of_valid_time: Optional[float],
-        include_unverified: bool,
-        active_only: bool,
-    ) -> Tuple[str, List[Any]]:
-        """SQL conditions on entities ``e`` for a search's scope, category, epistemic state and valid time.
-
-        Search queries join with ``CROSS JOIN`` so that the full-text index drives the join: given a plain
-        join, SQLite can start from the scope index on entities and run the full-text query once per row,
-        which costs hundreds of times more."""
-        clauses = ["e.archived = 0"]
-        params: List[Any] = []
-        if target_scope != "*":
-            clauses.append("e.scope = ?")
-            params.append(target_scope)
-        if category:
-            clauses.append("e.category = ?")
-            params.append(category)
-        if epistemic_state:
-            clauses.append("e.epistemic_state = ?")
-            params.append(epistemic_state)
-        elif not include_unverified:
-            # Epistemic polarity: unverified candidate/revoked memories withheld from active recall unless explicitly requested
-            clauses.append("e.epistemic_state IN ('verified', 'disputed')")
-        # Bi-temporal point-in-time filter: valid_from <= T and (valid_until IS NULL or valid_until > T)
-        at = as_of_valid_time if as_of_valid_time is not None else (time.time() if active_only else None)
-        if at is not None:
-            clauses.append("(e.valid_from IS NULL OR e.valid_from <= ?)")
-            clauses.append("(e.valid_until IS NULL OR e.valid_until > ?)")
-            params.extend([at, at])
-        return " AND ".join(clauses), params
-
-    def _plaintext_rows(
-        self,
-        query: str,
-        fts_query: str,
-        filter_sql: str,
-        params: List[Any],
-        limit: int,
-        columns: str = _ENTITY_COLUMNS,
-        snippets: bool = True,
-    ) -> List[Tuple[Any, float, Optional[str]]]:
-        """Ranked rows from the FTS5 index of the entities table, for entries stored in plaintext."""
-        snip_sql = "snippet(entities_fts, 2, '<b>', '</b>', '...', 16)" if snippets else "''"
-        try:
-            rows = self._conn.execute(
-                f"""
-                SELECT {columns},
-                       rank AS score, {snip_sql} AS snip
-                FROM entities_fts
-                CROSS JOIN entities e ON e.id = entities_fts.rowid
-                WHERE entities_fts MATCH ? AND {filter_sql}
-                ORDER BY score, e.id
-                LIMIT ?
-                """,
-                [fts_query, *params, limit],
-            ).fetchall()
-            return [(r, r["score"], r["snip"]) for r in rows]
-        except _OPERATIONAL_ERRORS:
-            # Fallback for environments where FTS query syntax or schema differs
-            pattern = f"%{query}%"
-            rows = self._conn.execute(
-                f"SELECT {columns} FROM entities e WHERE (e.content LIKE ? OR e.key LIKE ?) AND {filter_sql} LIMIT ?",
-                [pattern, pattern, *params, limit],
-            ).fetchall()
-            return [(r, 0.0, "") for r in rows]
-
-    def _indexed_rows(
-        self, fts_query: str, filter_sql: str, params: List[Any], limit: int, columns: str = _ENTITY_COLUMNS
-    ) -> List[Tuple[Any, float, Optional[str]]]:
-        """Ranked rows from the entry index of a SQLCipher vault."""
-        try:
-            self._drain_search_queue()
-        except _OPERATIONAL_ERRORS as exc:  # another connection holds the write lock: search what is indexed
-            logger.debug("kibisis: searching before queued entries were indexed: %s", exc)
-        rows = self._conn.execute(
-            f"""
-            SELECT {columns}, entities_search.rank AS score
-            FROM entities_search
-            CROSS JOIN entities e ON e.id = entities_search.rowid
-            WHERE entities_search MATCH ? AND {filter_sql}
-            ORDER BY score, e.id
-            LIMIT ?
-            """,
-            [fts_query, *params, limit],
-        ).fetchall()
-        return [(r, r["score"], None) for r in rows]
-
-    def _scanned_rows(
-        self, fts_query: str, filter_sql: str, params: List[Any], limit: int, columns: str = _ENTITY_COLUMNS
-    ) -> List[Tuple[Any, float, Optional[str]]]:
-        """Ranked rows from an in-memory index of the opened entries: a vault with a passphrase, without SQLCipher."""
-        index = self._scan_index()
-        ranked = index.execute(
-            f"""
-            SELECT e.id, m.rank FROM m CROSS JOIN e ON e.id = m.rowid
-            WHERE m MATCH ? AND {filter_sql}
-            ORDER BY m.rank, e.id
-            LIMIT ?
-            """,
-            [fts_query, *params, limit],
-        ).fetchall()
-        if not ranked:
-            return []
-        marks = ", ".join("?" for _ in ranked)
-        stored = {
-            r["id"]: r
-            for r in self._conn.execute(
-                f"SELECT {columns} FROM entities e WHERE e.id IN ({marks})", [row[0] for row in ranked]
-            ).fetchall()
-        }
-        return [(stored[i], score, None) for i, score in ranked if i in stored]
-
-    def _scan_index(self) -> Any:
-        """In-memory FTS5 index of every entry this vault can open, with the columns that search filters on.
-
-        Built again once the vault has changed: ``PRAGMA data_version`` moves when another connection
-        commits, and ``total_changes`` when this one writes."""
-        stamp = (self._conn.execute("PRAGMA data_version").fetchone()[0], self._conn.total_changes)
-        if self._scan_cache is not None and self._scan_cache[0] == stamp:
-            return self._scan_cache[1]
-        index = sqlite3.connect(":memory:", check_same_thread=False)
-        index.execute("CREATE VIRTUAL TABLE m USING fts5(category, key, content, scope, content='')")
-        index.execute(
-            "CREATE TABLE e (id INTEGER PRIMARY KEY, category TEXT, scope TEXT, archived INTEGER, "
-            "epistemic_state TEXT, valid_from REAL, valid_until REAL)"
-        )
-        rows = self._conn.execute(
-            "SELECT id, category, key, content, scope, archived, epistemic_state, valid_from, valid_until, "
-            "is_encrypted, encrypted_envelope_json, tenant_sig FROM entities ORDER BY id"
-        ).fetchall()
-        for r in rows:
-            content = self._readable_content(r)
-            if content is None:
-                continue  # failed its integrity check: tampered, damaged, or moved from another entry
-            index.execute(
-                "INSERT INTO m (rowid, category, key, content, scope) VALUES (?, ?, ?, ?, ?)",
-                (r["id"], r["category"], r["key"], content, r["scope"]),
-            )
-            index.execute(
-                "INSERT INTO e VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (r["id"], r["category"], r["scope"], r["archived"], r["epistemic_state"], r["valid_from"], r["valid_until"]),
-            )
-        if self._scan_cache is not None:
-            self._scan_cache[1].close()
-        self._scan_cache = (stamp, index)
-        return index
-
-    def _ensure_search_index(self) -> None:
-        """Keep an index of entry terms inside the SQLCipher file, so that search ranks sealed entries.
-
-        The index (``entities_search``, a contentless FTS5 table) holds each entry's words and their
-        positions, enough to rebuild its text without case or punctuation. SQLCipher's page encryption
-        protects it with the rest of the file; each entry also stays sealed on its own. Triggers queue every row whose text changes, so rows that a process running an
-        older kibisis writes without feeding the index are indexed before the next search. A vault without
-        the index, or with an index of another version, gets one built by opening each entry once.
-        """
-        current = self._meta("search_index_format")
-        if current is None or int(current) != SEARCH_INDEX_FORMAT:
-            try:
-                with self._write_tx() as cursor:
-                    for trigger in ("entities_search_ai", "entities_search_au", "entities_search_ad"):
-                        cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-                    cursor.execute("DROP TABLE IF EXISTS entities_search")
-                    cursor.execute(
-                        "CREATE VIRTUAL TABLE entities_search USING fts5("
-                        "category, key, content, scope, content='', contentless_delete=1)"
-                    )
-                    cursor.execute("CREATE TABLE IF NOT EXISTS entities_search_dirty (id INTEGER PRIMARY KEY)")
-                    cursor.execute(
-                        "CREATE TRIGGER entities_search_ai AFTER INSERT ON entities BEGIN "
-                        "INSERT OR IGNORE INTO entities_search_dirty (id) VALUES (new.id); END"
-                    )
-                    cursor.execute(
-                        "CREATE TRIGGER entities_search_au AFTER UPDATE OF category, key, content, scope, "
-                        "is_encrypted, encrypted_envelope_json, tenant_sig ON entities BEGIN "
-                        "INSERT OR IGNORE INTO entities_search_dirty (id) VALUES (new.id); END"
-                    )
-                    cursor.execute(
-                        "CREATE TRIGGER entities_search_ad AFTER DELETE ON entities BEGIN "
-                        "DELETE FROM entities_search WHERE rowid = old.id; "
-                        "DELETE FROM entities_search_dirty WHERE id = old.id; END"
-                    )
-                    cursor.execute("INSERT OR IGNORE INTO entities_search_dirty (id) SELECT id FROM entities")
-                    self._set_meta(cursor, "search_index_format", SEARCH_INDEX_FORMAT)
-            except _OPERATIONAL_ERRORS as exc:
-                text = str(exc).lower()
-                if not any(s in text for s in ("no such module", "unrecognized option", "contentless")):
-                    raise
-                # SQLite before 3.43 has no contentless-delete FTS5 tables: search opens the entries instead.
-                logger.warning("kibisis: sealed entries are searched without an index: %s", exc)
-                return
-        self._search_index = True
-        self._drain_search_queue()
-
-    def _index_entry(self, cursor: Any, entity_id: int, category: str, key: str, content: str, scope: str) -> None:
-        """Put an entry's terms in the entry index, in place of any it had there."""
-        cursor.execute(
-            "INSERT OR REPLACE INTO entities_search (rowid, category, key, content, scope) VALUES (?, ?, ?, ?, ?)",
-            (entity_id, category, key, content, scope),
-        )
-        cursor.execute("DELETE FROM entities_search_dirty WHERE id = ?", (entity_id,))
-
-    def _index_queued(self, cursor: Any) -> int:
-        """Index the rows the triggers queued, within the caller's write transaction. Returns how many."""
-        ids = [row[0] for row in cursor.execute("SELECT id FROM entities_search_dirty ORDER BY id").fetchall()]
-        for entity_id in ids:
-            r = cursor.execute(
-                "SELECT id, category, key, content, scope, is_encrypted, encrypted_envelope_json, tenant_sig "
-                "FROM entities WHERE id = ?",
-                (entity_id,),
-            ).fetchone()
-            content = None if r is None else self._readable_content(r)
-            if content is None:  # deleted, or failed its integrity check: keep it out of the index
-                cursor.execute("DELETE FROM entities_search WHERE rowid = ?", (entity_id,))
-                cursor.execute("DELETE FROM entities_search_dirty WHERE id = ?", (entity_id,))
-            else:
-                self._index_entry(cursor, entity_id, r["category"], r["key"], content, r["scope"])
-        return len(ids)
-
-    def _drain_search_queue(self) -> None:
-        """Index the rows written since the last search by a process that did not feed the index."""
-        if not self._search_index:
-            return
-        if not self._conn.execute("SELECT EXISTS (SELECT 1 FROM entities_search_dirty)").fetchone()[0]:
-            return
-        with self._write_tx() as cursor:
-            self._index_queued(cursor)
-
-    def _rebuild_search_index(self) -> None:
-        """Build the entry index again from the entries, so that no deleted or replaced terms stay in it."""
-        with self._write_tx() as cursor:
-            cursor.execute("INSERT INTO entities_search (entities_search) VALUES ('delete-all')")
-            cursor.execute("INSERT OR IGNORE INTO entities_search_dirty (id) SELECT id FROM entities")
-            self._index_queued(cursor)
-            cursor.execute("INSERT INTO entities_search (entities_search) VALUES ('optimize')")
 
     @staticmethod
     def _entity(r: Any, content: str) -> MemoryEntity:
@@ -2368,474 +1597,6 @@ class SQLiteMemoryVault(MemoryVault):
             items.append(self._entity(r, content))
         return items
 
-    @staticmethod
-    def _find_tombstone(cursor: Any, scope: str, val_hash: str, can_hash: str) -> Optional[Any]:
-        """Return the first tombstone in ``scope`` (or a ``'*'`` tombstone) that rejects this value.
-
-        Category and key play no part: a tombstone stops a value, not a key, so a rejected value
-        cannot come back under a new key or category. Scopes stay separate, so one tenant's
-        rejection neither blocks nor reveals another tenant's writes.
-        """
-        cursor.execute(
-            """
-            SELECT category, key, reason, author_id FROM rejected_value_tombstones
-            WHERE (scope = ? OR scope = '*')
-              AND (value_sha256 = ? OR (canonical_sha256 != '' AND canonical_sha256 = ?))
-            LIMIT 1
-            """,
-            (scope, val_hash, can_hash),
-        )
-        return cursor.fetchone()
-
-    def _purge_value_copies(
-        self,
-        cursor: Any,
-        scope: str,
-        val_hash: str,
-        can_hash: str,
-        author_id: Optional[str],
-        tombstoned: str,
-    ) -> int:
-        """Delete every stored copy of a tombstoned value in ``scope`` (every scope for ``'*'``).
-
-        Copies under other categories or keys, live or archived, would otherwise keep a rejected
-        value retrievable. Each deletion is journaled in the caller's transaction.
-        """
-        if scope == "*":
-            cursor.execute("SELECT id, category, key, scope, content, is_encrypted, encrypted_envelope_json, tenant_sig FROM entities")
-        else:
-            cursor.execute(
-                "SELECT id, category, key, scope, content, is_encrypted, encrypted_envelope_json, tenant_sig FROM entities WHERE scope = ?",
-                (scope,),
-            )
-        purged = 0
-        for row in cursor.fetchall():
-            try:
-                content = self._open_entry(row)
-            except PermissionError:
-                continue  # an entry that cannot be opened cannot be compared, and is never returned
-            exact, canonical = self._digests(content)
-            if exact != val_hash and not (can_hash and canonical == can_hash):
-                continue
-            cursor.execute("DELETE FROM entities WHERE id = ?", (row["id"],))
-            self._record_audit_event(
-                cursor=cursor,
-                action="purge",
-                category=row["category"],
-                key=row["key"],
-                scope=row["scope"],
-                value_sha256=exact,
-                author_id=author_id,
-                metadata={"reason": "copy of tombstoned value", "tombstone": tombstoned},
-            )
-            purged += 1
-        return purged
-
-    def tombstone(
-        self,
-        category: str,
-        key: str,
-        reason: str = "revocation",
-        author_id: Optional[str] = None,
-        content: Optional[str] = None,
-        scope: str = "default",
-        fencing_token: Optional[int] = None,
-        resource: Optional[str] = None,
-        holder_id: Optional[str] = None,
-    ) -> str:
-        """Tombstone a value by its exact and canonical SHA-256 digests within ``scope``.
-
-        Purges the entity at ``category:key`` and every other copy of the value in the scope
-        (all scopes when ``scope`` is ``'*'``). Later writes of the value, or of a look-alike that
-        canonicalizes to it, are refused under any category or key in the scope. Returns the value's
-        SHA-256 hex digest; a vault with a passphrase stores it keyed (see :meth:`stored_digest`).
-        """
-        now = time.time()
-        with self._write_tx() as cursor:
-            self._fence(cursor, fencing_token, resource, holder_id)
-            if content is None:
-                cursor.execute(
-                    "SELECT category, key, scope, content, is_encrypted, encrypted_envelope_json, tenant_sig FROM entities "
-                    "WHERE category = ? AND key = ? AND scope = ?",
-                    (category, key, scope),
-                )
-                row = cursor.fetchone()
-                if row is None:
-                    raise KeyError(f"Entity not found: {category}:{key} [scope={scope}]")
-                content = self._open_entry(row)
-
-            assert content is not None
-            plain_exact, plain_canonical = value_digests(content)
-            val_hash, can_hash = self._stored_digests(plain_exact, plain_canonical)
-
-            cursor.execute(
-                """
-                INSERT OR REPLACE INTO rejected_value_tombstones (
-                    category, key, value_sha256, canonical_sha256, reason, author_id, created_at, scope,
-                    sealed_digests
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    category, key, val_hash, can_hash, reason, author_id, now, scope,
-                    self._seal_digests(scope, category, key, plain_exact, plain_canonical),
-                ),
-            )
-            # Physical purge of the entity (the FTS index follows through triggers)
-            cursor.execute("DELETE FROM entities WHERE category = ? AND key = ? AND scope = ?", (category, key, scope))
-
-            # Record hash-chained mutation audit event
-            self._record_audit_event(
-                cursor=cursor,
-                action="tombstone",
-                category=category,
-                key=key,
-                scope=scope,
-                value_sha256=val_hash,
-                author_id=author_id,
-                metadata={"reason": reason, "canonical_sha256": can_hash},
-            )
-            self._purge_value_copies(cursor, scope, val_hash, can_hash, author_id, f"{category}:{key}")
-            return plain_exact
-
-    def is_tombstoned(
-        self,
-        category: str,
-        key: str,
-        content: str,
-        scope: str = "default",
-    ) -> bool:
-        """Check whether ``content`` is rejected in ``scope`` (exact or canonical digest).
-
-        ``category`` and ``key`` are accepted for compatibility but do not narrow the check: a
-        tombstoned value is rejected under every category and key in its scope.
-        """
-        val_hash, can_hash = self._digests(content)
-        return self._find_tombstone(self._conn.cursor(), scope, val_hash, can_hash) is not None
-
-    def list_tombstones(
-        self,
-        category: Optional[str] = None,
-        scope: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """List tombstone records containing only digests, reason, author, scope, and timestamp (never plaintext)."""
-        cursor = self._conn.cursor()
-        query_sql = "SELECT id, category, key, value_sha256, canonical_sha256, reason, author_id, created_at, scope FROM rejected_value_tombstones WHERE 1=1"
-        params: List[Any] = []
-        if category:
-            query_sql += " AND category = ?"
-            params.append(category)
-        if scope:
-            query_sql += " AND (scope = ? OR scope = '*')"
-            params.append(scope)
-        query_sql += " ORDER BY id"
-        cursor.execute(query_sql, params)
-        return [dict(r) for r in cursor.fetchall()]
-
-    def admit_candidate(
-        self,
-        category: str,
-        key: str,
-        content: str,
-        metadata: Optional[Dict[str, Any]] = None,
-        valid_from: Optional[float] = None,
-        valid_until: Optional[float] = None,
-        scope: str = "default",
-        author_id: Optional[str] = None,
-        tenant_id: Optional[str] = None,
-        principal_id: Optional[str] = None,
-        derived_from: Optional[List[str]] = None,
-        fencing_token: Optional[int] = None,
-        resource: Optional[str] = None,
-        holder_id: Optional[str] = None,
-    ) -> MemoryEntity:
-        """Stage an unverified memory candidate into the vault awaiting verification/human review."""
-        return self.put(
-            category=category,
-            key=key,
-            content=content,
-            metadata=metadata,
-            epistemic_state=EpistemicState.CANDIDATE.value,
-            valid_from=valid_from,
-            valid_until=valid_until,
-            scope=scope,
-            author_id=author_id,
-            tenant_id=tenant_id,
-            principal_id=principal_id,
-            derived_from=derived_from,
-            fencing_token=fencing_token,
-            resource=resource,
-            holder_id=holder_id,
-        )
-
-    def remember(
-        self,
-        category: str,
-        key: str,
-        content: str,
-        *,
-        origin: str,
-        source_ref: Optional[str] = None,
-        confidence: Optional[float] = None,
-        **kwargs: Any,
-    ) -> MemoryEntity:
-        """Store a fact with its provenance. ``origin`` is required and must be one of :data:`ORIGINS`.
-
-        A ``model`` write is stored as ``candidate`` whatever ``epistemic_state`` says, and cannot
-        replace an entry a person verified (:class:`ReviewedEntryError`). Other keyword arguments
-        are those of :meth:`put`.
-        """
-        _validate_origin(origin)
-        return self.put(
-            category=category, key=key, content=content, origin=origin, source_ref=source_ref,
-            confidence=confidence, **kwargs,
-        )
-
-    def admit(
-        self,
-        category: str,
-        key: str,
-        *,
-        reviewer: str,
-        reviewer_origin: str,
-        note: Optional[str] = None,
-        scope: str = "default",
-        fencing_token: Optional[int] = None,
-        resource: Optional[str] = None,
-        holder_id: Optional[str] = None,
-    ) -> MemoryEntity:
-        """Promote an entry to ``verified``. Only a person (``reviewer_origin="user"``) may do so.
-
-        A model or tool asking to verify raises :class:`AdmissionRefused`; the entry is left as it is.
-        The human path is ``python -m kibisis admit --category C --key K --by user``.
-        """
-        _validate_origin(reviewer_origin, "reviewer_origin")
-        if reviewer_origin != "user":
-            entity = self.get(category=category, key=key, scope=scope)
-            raise AdmissionRefused(
-                f"'{category}:{key}' [scope={scope}] cannot be promoted to verified by a {reviewer_origin} reviewer "
-                f"(entry origin={entity.origin if entity else 'missing'}). A person admits it with: "
-                f"python -m kibisis admit --category {category} --key {key} --scope {scope} --by user"
-            )
-        return self.review_entity(
-            category=category,
-            key=key,
-            verdict=EpistemicState.VERIFIED.value,
-            scope=scope,
-            reviewer_id=reviewer,
-            notes=note,
-            reviewer_origin=reviewer_origin,
-            fencing_token=fencing_token,
-            resource=resource,
-            holder_id=holder_id,
-        )
-
-    def review_entity(
-        self,
-        category: str,
-        key: str,
-        verdict: str,
-        scope: str = "default",
-        reviewer_id: Optional[str] = None,
-        notes: Optional[str] = None,
-        fencing_token: Optional[int] = None,
-        resource: Optional[str] = None,
-        holder_id: Optional[str] = None,
-        reviewer_origin: str = "user",
-    ) -> MemoryEntity:
-        """Human review gate: update epistemic state based on review decision (verified, disputed, revoked).
-
-        This is the person's API; callers that relay a model's request use :meth:`admit`, which refuses
-        anything but ``reviewer_origin="user"``. The verdict's origin is kept in ``human_reviews``.
-        """
-        valid_verdicts = {EpistemicState.VERIFIED.value, EpistemicState.DISPUTED.value, EpistemicState.REVOKED.value}
-        if verdict not in valid_verdicts:
-            raise ValueError(f"Verdict must be one of {valid_verdicts}, got '{verdict}'")
-        _validate_origin(reviewer_origin, "reviewer_origin")
-
-        # One write transaction from the read to the re-write: the entry a reviewer looked at is the
-        # entry the verdict lands on, and a concurrent write cannot slip in between the two.
-        with self._write_tx():
-            return self._review_locked(
-                category, key, verdict, scope, reviewer_id, notes, fencing_token, resource, holder_id, reviewer_origin
-            )
-
-    def _review_locked(
-        self,
-        category: str,
-        key: str,
-        verdict: str,
-        scope: str,
-        reviewer_id: Optional[str],
-        notes: Optional[str],
-        fencing_token: Optional[int],
-        resource: Optional[str],
-        holder_id: Optional[str],
-        reviewer_origin: str,
-    ) -> MemoryEntity:
-        """Body of :meth:`review_entity`; runs inside the caller's write transaction."""
-        entity = self.get(category=category, key=key, scope=scope)
-        if entity is None:
-            raise KeyError(f"Entity not found for review: {category}:{key} [scope={scope}]")
-
-        meta = dict(entity.metadata)
-        reviews = meta.get("human_reviews", [])
-        reviews.append({
-            "timestamp": time.time(),
-            "reviewer_id": reviewer_id,
-            "verdict": verdict,
-            "notes": notes or "",
-            "previous_state": entity.epistemic_state.value,
-            "reviewer_origin": reviewer_origin,
-        })
-        meta["human_reviews"] = reviews
-
-        if verdict == EpistemicState.REVOKED.value:
-            # Revocation initiates tombstone recording and purges plaintext
-            self.tombstone(
-                category=category,
-                key=key,
-                reason=f"Human review rejected: {notes or 'revoked'}",
-                author_id=reviewer_id,
-                scope=scope,
-                fencing_token=fencing_token,
-                resource=resource,
-                holder_id=holder_id,
-            )
-            if entity.epistemic_state != EpistemicState.REVOKED:
-                with self._write_tx() as cursor:
-                    self._record_state_transition(
-                        cursor, category, key, scope, entity.epistemic_state.value,
-                        EpistemicState.REVOKED.value, entity.origin, reviewer_id,
-                    )
-            entity.archived = True
-            entity.epistemic_state = EpistemicState.REVOKED
-            entity.metadata = meta
-            return entity
-
-        # Update entity with new epistemic status and review metadata. Approving an entry that proposed
-        # to supersede a reviewed entry applies the supersession now, under the reviewer's authority.
-        proposal = meta.pop("proposed_supersedes", None) if verdict == EpistemicState.VERIFIED.value else None
-        if proposal:
-            meta["supersession_approved_by"] = reviewer_id
-        return self.put(
-            category=category,
-            key=key,
-            content=entity.content,
-            metadata=meta,
-            epistemic_state=verdict,
-            valid_from=entity.valid_from,
-            valid_until=entity.valid_until,
-            scope=scope,
-            author_id=reviewer_id,
-            fencing_token=fencing_token,
-            resource=resource,
-            holder_id=holder_id,
-            supersedes_key=proposal["key"] if proposal else None,
-            supersedes_category=proposal["category"] if proposal else None,
-            _trusted_metadata=True,  # human_reviews was appended here, inside the write transaction
-        )
-
-    def scrub(self) -> None:
-        """Remove deleted or replaced content from the search indexes, the write-ahead log and free pages.
-
-        FTS5 'delete' leaves old terms in index segments until the index is rebuilt (a SQLCipher
-        vault's entry index is rebuilt from its decrypted entries), and the write-ahead log and free
-        pages keep old bytes until a checkpoint and VACUUM. Run after a delete (the MCP server's
-        forget does) or after migrating plaintext.
-        """
-        self._conn.execute("INSERT INTO entities_fts(entities_fts) VALUES ('rebuild')")
-        self._conn.execute("INSERT INTO entities_fts(entities_fts) VALUES ('optimize')")
-        self._conn.commit()
-        if self._search_index:
-            self._rebuild_search_index()
-        if self.db_path != ":memory:":
-            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            self._conn.execute("VACUUM")
-            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            self._restrict_permissions()
-
-    def list_audit_events(
-        self,
-        scope: Optional[str] = None,
-        category: Optional[str] = None,
-        limit: int = 100,
-        key: Optional[str] = None,
-    ) -> List[AuditEvent]:
-        """Fetch chronological audit records from the tamper-evident hash chain."""
-        cursor = self._conn.cursor()
-        query_sql = (
-            "SELECT sequence, timestamp, action, category, key, scope, value_sha256, "
-            "prev_hash, event_hash, author_id, metadata_json, format FROM audit_journal WHERE 1=1"
-        )
-        params: List[Any] = []
-        if scope:
-            query_sql += " AND scope = ?"
-            params.append(scope)
-        if category:
-            query_sql += " AND category = ?"
-            params.append(category)
-        if key:
-            query_sql += " AND key = ?"
-            params.append(key)
-        query_sql += " ORDER BY sequence ASC LIMIT ?"
-        params.append(limit)
-        cursor.execute(query_sql, params)
-
-        events: List[AuditEvent] = []
-        for r in cursor.fetchall():
-            events.append(
-                AuditEvent(
-                    sequence=r["sequence"],
-                    timestamp=r["timestamp"],
-                    action=r["action"],
-                    category=r["category"],
-                    key=r["key"],
-                    scope=r["scope"],
-                    value_sha256=r["value_sha256"],
-                    prev_hash=r["prev_hash"],
-                    event_hash=r["event_hash"],
-                    author_id=r["author_id"],
-                    metadata=json.loads(r["metadata_json"]),
-                    format=r["format"],
-                )
-            )
-        return events
-
-    def verify_audit_chain(self, scope: Optional[str] = None) -> bool:
-        """Verify the append-only mutation journal: every link, every row's hash, and the signed head.
-
-        Each row is recomputed under the layout it was written with (``format``), so journals from
-        older versions verify. Once the vault has written a format 3 row, ``audit_head`` must exist,
-        carry a valid MAC and name the last row: deleting rows from the tail, or the head itself,
-        then fails verification. A journal with only legacy rows and no head verifies on its links
-        alone, as it did before the head existed.
-        """
-        # Always verify the entire hash chain (or records up to limit), because prev_hash links consecutive global events
-        events = self.list_audit_events(scope=None, limit=1_000_000)
-
-        expected_prev = "0" * 64
-        for ev in events:
-            if ev.prev_hash != expected_prev:
-                return False
-            recomputed = _event_hash(
-                ev.sequence, ev.timestamp, ev.action, ev.category, ev.key, ev.scope, ev.value_sha256, ev.prev_hash,
-                ev.author_id, ev.metadata, fmt=ev.format,
-            )
-            if not hmac.compare_digest(recomputed, ev.event_hash):
-                return False
-            expected_prev = ev.event_hash
-
-        head = self._conn.execute("SELECT sequence, event_hash, mac FROM audit_head WHERE id = 1").fetchone()
-        anchored = any(ev.format >= 3 for ev in events)
-        if head is None:
-            return not anchored
-        if not hmac.compare_digest(_head_mac(self._signing_key, head["sequence"], head["event_hash"]), head["mac"]):
-            return False
-        if not events:
-            return False  # a signed head with no rows: the whole journal was removed
-        return head["sequence"] == events[-1].sequence and head["event_hash"] == events[-1].event_hash
-
     def set_persona_slot(
         self,
         content: str,
@@ -2845,8 +1606,14 @@ class SQLiteMemoryVault(MemoryVault):
         fencing_token: Optional[int] = None,
         resource: Optional[str] = None,
         holder_id: Optional[str] = None,
+        origin: Optional[str] = "user",
     ) -> MemoryEntity:
-        """Store or update the dedicated user persona / preference slot."""
+        """Store or update the dedicated user persona / preference slot.
+
+        The slot is the person's own profile, so ``origin`` defaults to ``"user"``: the write is its
+        author's attestation and the slot is ``verified`` once ``verification_quorum`` is met
+        (K-R1); below quorum it is stored as a candidate with ``verification_pending``.
+        """
         meta = metadata.copy() if metadata else {}
         meta["is_persona_slot"] = True
         return self.put(
@@ -2860,6 +1627,7 @@ class SQLiteMemoryVault(MemoryVault):
             fencing_token=fencing_token,
             resource=resource,
             holder_id=holder_id,
+            origin=origin,
         )
 
     def get_persona_slot(
@@ -2898,319 +1666,11 @@ class SQLiteMemoryVault(MemoryVault):
             entity.tenant_sig,
         )
 
-    def export_snapshot(
-        self,
-        path: Optional[Union[str, Path]] = None,
-        scope: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Export a deterministic, portable snapshot of entities, tombstones, and audit events.
-
-        Computes a SHA-256 integrity manifest over the exported payload.
-        If path is provided, writes the serialized JSON atomically to disk.
-        """
-        cursor = self._conn.cursor()
-
-        if scope and scope != "*":
-            cursor.execute(
-                """
-                SELECT category, key, content, metadata_json, version, archived,
-                       created_at, updated_at, is_encrypted, encrypted_envelope_json,
-                       scope, epistemic_state, valid_from, valid_until, tenant_sig
-                FROM entities
-                WHERE scope = ?
-                ORDER BY scope, category, key
-                """,
-                (scope,),
-            )
-        else:
-            cursor.execute(
-                """
-                SELECT category, key, content, metadata_json, version, archived,
-                       created_at, updated_at, is_encrypted, encrypted_envelope_json,
-                       scope, epistemic_state, valid_from, valid_until, tenant_sig
-                FROM entities
-                ORDER BY scope, category, key
-                """
-            )
-
-        raw_entities = cursor.fetchall()
-        entities_data = []
-        unreadable = 0
-        for r in raw_entities:
-            try:
-                content = self._open_entry(r)
-            except EntryIntegrityError:
-                unreadable += 1  # failed its integrity check; never exported
-                continue
-            entities_data.append({
-                "category": r["category"],
-                "key": r["key"],
-                "content": content,
-                "metadata": json.loads(r["metadata_json"]),
-                "version": r["version"],
-                "archived": bool(r["archived"]),
-                "created_at": r["created_at"],
-                "updated_at": r["updated_at"],
-                "scope": r["scope"],
-                "epistemic_state": r["epistemic_state"],
-                "valid_from": r["valid_from"],
-                "valid_until": r["valid_until"],
-            })
-
-        cursor.execute(
-            """
-            SELECT category, key, value_sha256, canonical_sha256, reason, author_id, created_at, scope,
-                   sealed_digests
-            FROM rejected_value_tombstones
-            ORDER BY category, key, scope
-            """
-        )
-        tombstones_data = [
-            {
-                "category": r["category"],
-                "key": r["key"],
-                "value_sha256": r["value_sha256"],
-                "canonical_sha256": r["canonical_sha256"],
-                "reason": r["reason"],
-                "author_id": r["author_id"],
-                "created_at": r["created_at"],
-                "scope": r["scope"],
-                "sealed_digests": r["sealed_digests"],
-            }
-            for r in cursor.fetchall()
-        ]
-
-        audit_events = self.list_audit_events(limit=1_000_000)
-        events_data = [ev.model_dump() for ev in audit_events]
-
-        snapshot: Dict[str, Any] = {
-            "format_version": "1.1",
-            "exported_at": time.time(),
-            "scope": scope or "*",
-            # Tombstone and journal digests: plain SHA-256 in a vault without a passphrase, otherwise keyed
-            # to this vault (digest_key_id). A tombstone's sealed_digests let a vault with the same
-            # passphrase re-key it on import.
-            "digest_scheme": "hmac-sha256" if self._digest_key is not None else "sha256",
-            "digest_key_id": self._digest_key_id(),
-            "unreadable_entity_count": unreadable,
-            "entity_count": len(entities_data),
-            "tombstone_count": len(tombstones_data),
-            "audit_event_count": len(events_data),
-            "entities": entities_data,
-            "tombstones": tombstones_data,
-            "audit_events": events_data,
-        }
-
-        canonical_bytes = json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        manifest_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
-        snapshot["manifest_sha256"] = manifest_sha256
-
-        if path is not None:
-            out_p = Path(path)
-            out_p.parent.mkdir(parents=True, exist_ok=True)
-            tmp_p = out_p.with_suffix(f".tmp.{os.getpid()}")
-            # The snapshot holds decrypted content. A plain open() inherited the umask (0644 on most
-            # hosts) and undid the vault's at-rest protection; create the file owner-only, refuse a
-            # pre-existing path, flush to disk, then rename so a reader sees all or nothing.
-            fd = os.open(tmp_p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(snapshot, f, indent=2, sort_keys=True)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp_p, out_p)
-            except BaseException:
-                with contextlib.suppress(OSError):
-                    os.unlink(tmp_p)
-                raise
-
-        return snapshot
-
-    def import_snapshot(
-        self,
-        snapshot_or_path: Union[str, Path, Dict[str, Any]],
-        *,
-        clear_existing: bool = False,
-        fencing_token: Optional[int] = None,
-        resource: Optional[str] = None,
-        holder_id: Optional[str] = None,
-    ) -> int:
-        """Import a snapshot into the vault.
-
-        Validates manifest hash integrity. Tombstones are imported first and existing tombstones
-        are never removed, so restoring a snapshot taken before a deletion cannot bring the
-        deleted value back: entities whose value is tombstoned in their scope are refused and not
-        counted. ``clear_existing`` purges current entities (journaled) but keeps tombstones and
-        the audit journal. Archived entities are restored archived.
-
-        Returns the number of restored entities.
-        """
-        if isinstance(snapshot_or_path, (str, Path)):
-            with open(snapshot_or_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        elif isinstance(snapshot_or_path, dict):
-            data = snapshot_or_path
-        else:
-            raise TypeError("Expected snapshot dict or path")
-
-        manifest_sha = data.get("manifest_sha256")
-        if manifest_sha:
-            check_data = {k: v for k, v in data.items() if k != "manifest_sha256"}
-            canonical_bytes = json.dumps(check_data, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            recomputed = hashlib.sha256(canonical_bytes).hexdigest()
-            if recomputed != manifest_sha:
-                raise ValueError(f"Snapshot integrity violation: manifest mismatch {recomputed} != {manifest_sha}")
-
-        imported_count = 0
-        foreign_tombstones = 0
-        scheme = data.get("digest_scheme", "sha256")
-        same_key = (
-            scheme == "hmac-sha256" and self._digest_key is not None and data.get("digest_key_id") == self._digest_key_id()
-        )
-        with self._write_tx() as cursor:
-            self._fence(cursor, fencing_token, resource, holder_id)
-            for ts in data.get("tombstones", []):
-                t_scope, t_category, t_key = ts.get("scope", "default"), ts["category"], ts["key"]
-                exact, canonical = ts["value_sha256"], ts.get("canonical_sha256", "")
-                sealed = ts.get("sealed_digests")
-                if not same_key:
-                    plain: Optional[Tuple[str, str]] = None
-                    if scheme == "sha256":
-                        plain = (exact, canonical)
-                    elif sealed and self._keyed:
-                        plain = self._unseal_digests(t_scope, t_category, t_key, sealed)
-                    if plain is None:
-                        foreign_tombstones += 1  # from a vault with another passphrase: it cannot match here
-                        continue
-                    exact, canonical = self._stored_digests(*plain)
-                    sealed = self._seal_digests(t_scope, t_category, t_key, *plain)
-                cursor.execute(
-                    """
-                    INSERT OR IGNORE INTO rejected_value_tombstones (
-                        category, key, value_sha256, canonical_sha256, reason, author_id, created_at, scope,
-                        sealed_digests
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        t_category,
-                        t_key,
-                        exact,
-                        canonical,
-                        ts.get("reason", "imported"),
-                        ts.get("author_id"),
-                        ts.get("created_at", time.time()),
-                        t_scope,
-                        sealed,
-                    ),
-                )
-            if clear_existing:
-                cursor.execute("SELECT category, key, scope FROM entities")
-                for row in cursor.fetchall():
-                    self._record_audit_event(
-                        cursor=cursor,
-                        action="purge",
-                        category=row["category"],
-                        key=row["key"],
-                        scope=row["scope"],
-                        value_sha256="",
-                        metadata={"reason": "import_snapshot clear_existing"},
-                    )
-                cursor.execute("DELETE FROM entities")
-                # entities_fts is an external-content index kept in step by triggers; rebuild it
-                # from the (now empty) content table rather than deleting index rows directly.
-                cursor.execute("INSERT INTO entities_fts(entities_fts) VALUES('rebuild')")
-
-        if foreign_tombstones:
-            logger.warning(
-                "import_snapshot: %d tombstones come from a vault with another passphrase and cannot apply here",
-                foreign_tombstones,
-            )
-            self.record_refusal(
-                path="import_snapshot",
-                reason="tombstones from a vault with another passphrase",
-                scope="*",
-                detail={"tombstones": foreign_tombstones},
-            )
-
-        for ent_data in data.get("entities", []):
-            scope = ent_data.get("scope", "default")
-            val_hash, can_hash = self._digests(ent_data["content"])
-            if self._find_tombstone(self._conn.cursor(), scope, val_hash, can_hash) is not None:
-                self.record_refusal(
-                    path="import_snapshot",
-                    reason="tombstoned value",
-                    scope=scope,
-                    category=ent_data.get("category", ""),
-                    key=ent_data.get("key", ""),
-                    detail={"value_digest_prefix": val_hash[:12]},
-                )
-                continue
-            self.put(
-                category=ent_data["category"],
-                key=ent_data["key"],
-                content=ent_data["content"],
-                metadata=ent_data.get("metadata"),
-                epistemic_state=ent_data.get("epistemic_state", "verified"),
-                valid_from=ent_data.get("valid_from"),
-                valid_until=ent_data.get("valid_until"),
-                scope=scope,
-                fencing_token=fencing_token,
-                resource=resource,
-                holder_id=holder_id,
-                # A restore keeps the exported review history and tenant bounds. The snapshot's
-                # epistemic_state is already trusted here, so this grants nothing it did not have.
-                _trusted_metadata=True,
-            )
-            if ent_data.get("archived"):
-                self.archive(
-                    category=ent_data["category"],
-                    key=ent_data["key"],
-                    scope=scope,
-                    fencing_token=fencing_token,
-                    resource=resource,
-                    holder_id=holder_id,
-                )
-            imported_count += 1
-
-        return imported_count
-
-    def evaluate_epistemic_abstention(
-        self,
-        negative_probes: List[str],
-        scope: str = "default",
-    ) -> Dict[str, Any]:
-        """Evaluate vault abstention on negative out-of-scope probes.
-
-        Ensures the vault does not return fabricated or false positive recall results
-        when probed with out-of-scope or non-existent topics.
-        """
-        total = len(negative_probes)
-        abstained = 0
-        false_positives = []
-
-        for probe in negative_probes:
-            res = self.search(probe, scope=scope)
-            if len(res) == 0:
-                abstained += 1
-            else:
-                false_positives.append({
-                    "probe": probe,
-                    "matched_keys": [r.entity.key for r in res],
-                })
-
-        abstention_rate = (abstained / total) if total > 0 else 1.0
-        return {
-            "total_probes": total,
-            "abstained_count": abstained,
-            "false_positive_count": len(false_positives),
-            "abstention_rate": abstention_rate,
-            "false_positives": false_positives,
-            "perfect_abstention": (abstained == total),
-        }
-
     def close(self) -> None:
         if self._scan_cache is not None:
             self._scan_cache[1].close()
             self._scan_cache = None
+        if self._tokenizer is not None:
+            self._tokenizer.close()
+            self._tokenizer = None
         self._conn.close()

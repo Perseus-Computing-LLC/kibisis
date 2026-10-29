@@ -5,7 +5,9 @@ from kibisis import EpistemicState, SQLiteMemoryVault
 
 
 def test_persona_slot_lifecycle():
-    vault = SQLiteMemoryVault(":memory:", allow_plaintext=True)
+    # The persona slot is the person's own profile (origin "user"); with a quorum of one the
+    # author's write verifies it (K-R1).
+    vault = SQLiteMemoryVault(":memory:", allow_plaintext=True, verification_quorum=1)
 
     # Initially empty
     assert vault.get_persona_slot() is None
@@ -20,6 +22,8 @@ def test_persona_slot_lifecycle():
     assert ent.key == "user_profile"
     assert ent.content == "User prefers high-compression responses and strict type hints."
     assert ent.epistemic_state == EpistemicState.VERIFIED
+    assert ent.origin == "user"
+    assert ent.metadata.get("origin_class") == "principal"
     assert ent.metadata.get("is_persona_slot") is True
     assert ent.metadata.get("user") == "alice"
 
@@ -56,14 +60,26 @@ def test_persona_slot_lifecycle():
     vault.close()
 
 
+def test_persona_slot_below_quorum_is_a_pending_candidate():
+    """Under the default quorum (2) the author's write is one attestation: stored, but not verified."""
+    vault = SQLiteMemoryVault(":memory:", allow_plaintext=True, verification_quorum=2)
+    ent = vault.set_persona_slot(content="User prefers terse answers.", author_id="alice")
+    assert ent.epistemic_state == EpistemicState.CANDIDATE
+    assert ent.metadata["attestations"] == ["alice"]
+    assert ent.metadata["verification_pending"] == {"have": 1, "need": 2}
+    assert vault.get_persona_slot() is not None
+    vault.close()
+
+
 def test_memory_entity_to_context_item():
-    vault = SQLiteMemoryVault(":memory:", allow_plaintext=True)
+    vault = SQLiteMemoryVault(":memory:", allow_plaintext=True, verification_quorum=1)
     ent = vault.put(
         category="insights",
         key="knapsack_pruning",
         content="Knapsack pruning achieves deterministic context limits.",
         metadata={"author": "harpe"},
         epistemic_state="verified",
+        origin="user",
     )
 
     ctx_item = ent.to_context_item(pinned=False, priority=10, role="context")

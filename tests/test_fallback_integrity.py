@@ -58,9 +58,9 @@ def _file_bytes(db):
 
 def test_sealed_content_moved_to_another_entry_is_refused(tmp_path, fallback):
     db = str(tmp_path / "v.db")
-    vault = SQLiteMemoryVault(db, passphrase=PASS)
-    vault.put("ops", "door_code", "4417", epistemic_state="verified")
-    vault.put("ops", "public_note", "The lobby opens at 0700", epistemic_state="verified")
+    vault = SQLiteMemoryVault(db, passphrase=PASS, verification_quorum=1)
+    vault.put("ops", "door_code", "4417", epistemic_state="verified", origin="user")
+    vault.put("ops", "public_note", "The lobby opens at 0700", epistemic_state="verified", origin="user")
     vault.close()
     con = _raw(db)
     envelope, signature = con.execute(

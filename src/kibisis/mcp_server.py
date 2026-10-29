@@ -5,7 +5,8 @@ clients such as Claude Desktop, Cursor, VS Code and Codex. Run it with ``python 
 
 The server, not the model, decides scope, identity and trust:
 
-- **Scope** is fixed when the server starts (``KIBISIS_SCOPE``, default ``default``). Tools take no
+- **Scope** is fixed when the server starts: ``KIBISIS_SCOPE`` if set (``global`` only this way), else
+  the project scope derived from the git checkout the server runs in, else ``default``. Tools take no
   scope argument. A call that names a different scope, a wildcard or an empty scope is refused, and
   the refusal is written to the audit journal.
 - **Trust.** Every write is recorded with author ``mcp-agent`` and stored as a ``candidate`` at most,
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 import sys
 import traceback
 from datetime import datetime, timezone
@@ -255,6 +257,18 @@ def fence_recall(scope: str, entries: List[MemoryEntity]) -> str:
         lines.append("</entry>")
     lines.append("</kibisis-recall>")
     return "\n".join(lines)
+
+
+_RECALLED_ENTRY = re.compile(r'^<entry category="([^"]*)" key="([^"]*)"', re.MULTILINE)
+
+
+def recalled_refs(text: str) -> List[str]:
+    """``category:key`` of each entry in a :func:`fence_recall` envelope, in the order recalled.
+
+    Lets an evaluator score the recall tool's output itself (``SQLiteMemoryVault.evaluate_abstention``
+    with ``search_fn``), rather than a library call that may not match what the tool does.
+    """
+    return [f"{html.unescape(category)}:{html.unescape(key)}" for category, key in _RECALLED_ENTRY.findall(text)]
 
 
 def _text(args: Mapping[str, Any], name: str) -> Optional[str]:
