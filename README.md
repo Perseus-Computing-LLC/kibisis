@@ -78,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```bash
 python -m kibisis.keys ~/.config/kibisis/kibisis.key     # once: creates a key file with mode 0600
 export KIBISIS_PASSPHRASE_FILE=~/.config/kibisis/kibisis.key
-export KIBISIS_SCOPE=project-a                            # optional; the default scope is "default"
+export KIBISIS_SCOPE=project-a                            # optional; unset, the scope is the git checkout's project scope, else "default"; "global" only when set here
 python -m kibisis.mcp_server                              # remember, recall, forget, verify-ledger and health over stdio
 ```
 
