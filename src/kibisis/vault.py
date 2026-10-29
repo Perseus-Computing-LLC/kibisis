@@ -36,7 +36,7 @@ from .crypto import (
     verify_tenant_payload,
 )
 from .keys import MIN_PASSPHRASE_LENGTH, resolve_passphrase
-from .models import AuditEvent, EncryptedEnvelope, EpistemicState, MemoryEntity, SearchHit, SearchResult
+from .models import AuditEvent, EncryptedEnvelope, EpistemicState, MemoryEntity, RecallResult, SearchHit, SearchResult, WithheldEntry
 from .protocols import CryptoEnvelopeProvider, EncryptionRequiredError, LeaseConflictError, LeaseCoordinator, MemoryVault
 
 logger = logging.getLogger(__name__)
@@ -79,7 +79,7 @@ RESERVED_METADATA_KEYS = frozenset({
     "human_reviews", "tenant_id", "principal_id",
     # K-R1 origin-bound admission: set by the vault from the write path, never from the payload.
     "origin_class", "act_class", "act_class_capped_from", "attestations", "verification_pending",
-    "trust_inherited_from",
+    "trust_inherited_from", "conflicts_with",
 })
 RESERVED_METADATA_PREFIX = "lineage_"
 
@@ -94,6 +94,10 @@ ACT_CLASSES = ("inform", "act")
 #: Distinct principals who must attest before an entry is ``verified`` (K-R1); ``KIBISIS_VERIFICATION_QUORUM``
 #: overrides the default for a deployment.
 DEFAULT_VERIFICATION_QUORUM = 2
+#: K-R4 recall gate defaults: a hit must contain at least this share of the query's words (basis points)
+#: and, with four or more matches, sit at or below this BM25 z-score (basis points; lower BM25 is better).
+DEFAULT_MIN_COVERAGE_BP = 5000
+DEFAULT_Z_MAX_BP = -5000
 
 
 def origin_class_of(origin: Optional[str]) -> str:
@@ -1417,6 +1421,7 @@ class SQLiteMemoryVault(MemoryVault):
         confidence: Optional[float] = None,
         act_class: Optional[str] = None,
         revive: bool = False,
+        conflicts_with: Optional[List[str]] = None,
         _trusted_metadata: bool = False,
         _review_verdict: bool = False,
     ) -> MemoryEntity:
@@ -1530,6 +1535,47 @@ class SQLiteMemoryVault(MemoryVault):
                 if valid_from is None:
                     valid_from = max(now, closed_at)
                 meta["revived_from"] = {"version": int(existing["version"]), "superseded_by": existing["superseded_by"]}
+
+            # K-R5: contradiction check before anything else happens to the write. An explicit
+            # ``conflicts_with`` edge is recorded on both sides and journaled; recall withholds a pair of
+            # verified entries that conflict until a person resolves it (K-R3).
+            conflict_refs: List[str] = []
+            if _trusted_metadata and existing is not None:
+                try:
+                    conflict_refs = list((json.loads(existing["metadata_json"] or "{}")).get("conflicts_with") or [])
+                except (TypeError, ValueError):
+                    conflict_refs = []
+            if conflicts_with:
+                self_ref = f"{category}:{key}"
+                for ref in conflicts_with:
+                    if ":" not in ref:
+                        raise ValueError(f"conflicts_with entries are 'category:key' refs, got {ref!r}")
+                    if ref == self_ref:
+                        raise ValueError("an entry cannot conflict with itself")
+                    c, k = ref.split(":", 1)
+                    cursor.execute(
+                        "SELECT id, metadata_json FROM entities WHERE category = ? AND key = ? AND scope = ?", (c, k, scope)
+                    )
+                    other = cursor.fetchone()
+                    if other is None:
+                        raise ValueError(f"conflicts_with target '{ref}' [scope={scope}] does not exist")
+                    other_meta = json.loads(other["metadata_json"] or "{}")
+                    back = list(other_meta.get("conflicts_with") or [])
+                    if self_ref not in back:
+                        back.append(self_ref)
+                        other_meta["conflicts_with"] = back
+                        cursor.execute(
+                            "UPDATE entities SET metadata_json = ?, updated_at = ? WHERE id = ?",
+                            (json.dumps(other_meta, sort_keys=True), now, other["id"]),
+                        )
+                    if ref not in conflict_refs:
+                        conflict_refs.append(ref)
+                self._record_audit_event(
+                    cursor=cursor, action="contradiction", category=category, key=key, scope=scope,
+                    value_sha256=val_hash, author_id=author_id, metadata={"with": list(conflicts_with)},
+                )
+            if conflict_refs:
+                meta["conflicts_with"] = conflict_refs
 
             # K-R1: origin_class is immutable from below. The stored class is what a lower-trust
             # writer must not change; an equal class keeps it; a principal may raise it.
@@ -1918,10 +1964,15 @@ class SQLiteMemoryVault(MemoryVault):
         confidence: Optional[float] = None,
         act_class: Optional[str] = None,
         revive: bool = False,
+        conflicts_with: Optional[List[str]] = None,
         _trusted_metadata: bool = False,
         _review_verdict: bool = False,
     ) -> MemoryEntity:
         """Insert or update an entity. See ``__init__`` for ``fencing_token``, ``resource`` and ``holder_id``.
+
+        K-R3/K-R5: ``conflicts_with`` names existing entries this one contradicts; the edge is recorded on
+        both sides and journaled as a ``contradiction`` before the write. :meth:`recall` withholds two
+        verified entries that conflict until a person resolves it.
 
         K-R2: ``supersedes_key`` is the only way an entry retires another. The outcome is reported in
         ``metadata["supersession"]``: ``applied`` (target revoked and closed), or ``needs_confirmation``
@@ -1983,6 +2034,7 @@ class SQLiteMemoryVault(MemoryVault):
                 _trusted_metadata=_trusted_metadata,
                 act_class=act_class,
                 revive=revive,
+                conflicts_with=conflicts_with,
                 _review_verdict=_review_verdict,
             )
         except TombstonedValueError as exc:
@@ -2303,6 +2355,162 @@ class SQLiteMemoryVault(MemoryVault):
                 snip = _snippet(content, patterns)
             results.append(SearchResult(entity=self._entity(r, content), rank_score=float(score), snippet=str(snip)))
         return results
+
+    def recall(
+        self,
+        query: str,
+        category: Optional[str] = None,
+        limit: int = 10,
+        scope: Optional[str] = "default",
+        epistemic_state: Optional[str] = None,
+        as_of_valid_time: Optional[float] = None,
+        active_only: bool = True,
+        tenant_id: Optional[str] = None,
+        principal_id: Optional[str] = None,
+        authorized_lineage_roots: Optional[List[str]] = None,
+        match: str = "all",
+        channel: str = "library",
+        min_coverage_bp: int = DEFAULT_MIN_COVERAGE_BP,
+        z_max_bp: int = DEFAULT_Z_MAX_BP,
+        ttl_seconds: Optional[Dict[str, float]] = None,
+        actor: Optional[str] = None,
+    ) -> RecallResult:
+        """Model-facing recall: :meth:`search` plus what was withheld and why, with a receipt (K-R3..K-R5).
+
+        K-R3: two verified entries that conflict (``conflicts_with`` edge, or the same ``slot`` with
+        different content) are both withheld as ``conflict_unresolved`` with each other's ids. K-R4: a hit
+        is returned only if the share of query words it contains is at least ``min_coverage_bp`` (basis
+        points) and, with four or more matches to compare against, its BM25 z-score among the matched set
+        is at most ``z_max_bp``; the receipt carries ``n_store`` and every hit's z-score and coverage.
+        ``ttl_seconds`` maps an origin class to a maximum age since ``last_verified_at`` (else
+        ``updated_at``); older entries are withheld as ``stale``. K-R5: every call is journaled as a
+        ``recall`` event and mirrored to Argus as ``kibisis.memory_recall`` (counts and withheld ids; the
+        query appears only as a digest).
+        """
+        if scope == "*":
+            raise ValueError("recall is bound to one scope; '*' is not available here")
+        # Over-fetch so the gate has a distribution to work with and withheld entries do not starve the limit.
+        pool = max(limit * 8, 64)
+        hits = self.search(
+            query, category=category, limit=pool, scope=scope, epistemic_state=epistemic_state,
+            as_of_valid_time=as_of_valid_time, include_unverified=True, active_only=active_only,
+            tenant_id=tenant_id, principal_id=principal_id, authorized_lineage_roots=authorized_lineage_roots,
+            match=match,
+        )
+        terms = [t.lower() for t in _search_terms(query, "any")]
+        cursor = self._conn.cursor()
+        if scope is None:
+            cursor.execute("SELECT COUNT(*) FROM entities WHERE archived = 0 AND epistemic_state != 'revoked'")
+        else:
+            cursor.execute(
+                "SELECT COUNT(*) FROM entities WHERE archived = 0 AND epistemic_state != 'revoked' AND scope = ?", (scope,)
+            )
+        n_store = int(cursor.fetchone()[0])
+        now = time.time()
+
+        scores = [h.rank_score for h in hits]
+        mean = sum(scores) / len(scores) if scores else 0.0
+        var = sum((x - mean) ** 2 for x in scores) / len(scores) if scores else 0.0
+        std = var ** 0.5
+        # With four or more matches the z-score is meaningful. A crowd of tied scores carries no
+        # evidence that any one of them answers the query: every z is 0 and the default gate drops them.
+        use_z = len(scores) >= 4
+
+        def _ref(e: MemoryEntity) -> str:
+            return f"{e.category}:{e.key}"
+
+        # K-R3: conflicts among the verified entries in the matched set and their declared partners.
+        by_ref = {_ref(h.entity): h for h in hits}
+        conflict_sources: Dict[str, List[str]] = {}
+        verified_hits = [h for h in hits if h.entity.epistemic_state == EpistemicState.VERIFIED]
+        for h in verified_hits:
+            for other_ref in h.entity.metadata.get("conflicts_with") or []:
+                other = by_ref.get(other_ref)
+                if other is None:
+                    c, k = other_ref.split(":", 1)
+                    other_entity = self.get(c, k, scope=scope or "default") if scope is not None else None
+                else:
+                    other_entity = other.entity
+                if other_entity is None or other_entity.epistemic_state != EpistemicState.VERIFIED or other_entity.archived:
+                    continue
+                conflict_sources.setdefault(_ref(h.entity), []).append(other_ref)
+                conflict_sources.setdefault(other_ref, []).append(_ref(h.entity))
+        slots: Dict[Tuple[str, str], List[SearchResult]] = {}
+        for h in verified_hits:
+            slot = h.entity.metadata.get("slot")
+            if slot:
+                slots.setdefault((h.entity.category, str(slot)), []).append(h)
+        for group in slots.values():
+            if len({g.entity.content for g in group}) > 1:
+                for g in group:
+                    others = [_ref(o.entity) for o in group if o is not g]
+                    conflict_sources.setdefault(_ref(g.entity), []).extend(o for o in others if o not in conflict_sources.get(_ref(g.entity), []))
+
+        results: List[SearchResult] = []
+        withheld: List[WithheldEntry] = []
+        hit_receipts: List[Dict[str, Any]] = []
+        n_conflict = n_gate = n_stale = 0
+        for h in hits:
+            ref = _ref(h.entity)
+            text = h.entity.content.lower()
+            covered = sum(1 for t in terms if t in text) if terms else 0
+            coverage_bp = int(round(10000 * covered / len(terms))) if terms else 10000
+            z_bp: Optional[int] = (int(round(10000 * (h.rank_score - mean) / std)) if std > 1e-9 else 0) if use_z else None
+            kept = True
+            reason = ""
+            if ref in conflict_sources:
+                kept, reason = False, "conflict_unresolved"
+                n_conflict += 1
+                withheld.append(WithheldEntry(ref=ref, reason=reason, sources=sorted(set(conflict_sources[ref]))))
+            elif coverage_bp < min_coverage_bp or (z_bp is not None and z_bp > z_max_bp):
+                kept, reason = False, "below_gate"
+                n_gate += 1
+                withheld.append(WithheldEntry(ref=ref, reason=reason))
+            elif ttl_seconds:
+                klass = h.entity.metadata.get("origin_class") or origin_class_of(h.entity.origin)
+                ttl = ttl_seconds.get(klass)
+                if ttl is not None:
+                    last = h.entity.metadata.get("last_verified_at") or h.entity.updated_at or h.entity.created_at
+                    if last is not None and now - float(last) > float(ttl):
+                        kept, reason = False, "stale"
+                        n_stale += 1
+                        withheld.append(WithheldEntry(ref=ref, reason=reason))
+            hit_receipts.append({"ref": ref, "coverage_bp": coverage_bp, "z_bp": z_bp, "kept": kept, "reason": reason})
+            if kept and len(results) < limit:
+                results.append(h)
+        if conflict_sources:
+            # A partner that did not match the query is withheld too: both sides of the pair stay out.
+            seen = {w.ref for w in withheld}
+            for ref, sources in conflict_sources.items():
+                if ref not in seen and ref not in by_ref:
+                    withheld.append(WithheldEntry(ref=ref, reason="conflict_unresolved", sources=sorted(set(sources))))
+                    n_conflict += 1
+
+        receipt: Dict[str, Any] = {
+            "channel": channel,
+            "scope": scope or "*",
+            "n_store": n_store,
+            "n_matched": len(hits),
+            "n_returned": len(results),
+            "n_withheld_conflict": n_conflict,
+            "n_withheld_gate": n_gate,
+            "n_withheld_stale": n_stale,
+            "gate": {"min_coverage_bp": int(min_coverage_bp), "z_max_bp": int(z_max_bp)},
+            "hits": hit_receipts,
+        }
+        query_digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:12]
+        journal_meta = {
+            "channel": channel, "query_sha256_12": query_digest, "n_store": n_store, "n_matched": len(hits),
+            "n_returned": len(results), "n_withheld_conflict": n_conflict, "n_withheld_gate": n_gate,
+            "n_withheld_stale": n_stale, "withheld": [w.ref for w in withheld],
+        }
+        with self._write_tx() as wcursor:
+            self._record_audit_event(
+                cursor=wcursor, action="recall", category="", key="", scope=scope or "*", value_sha256="",
+                author_id=actor, metadata=journal_meta,
+            )
+        _argus_append("kibisis.memory_recall", actor or "kibisis", {**journal_meta, "scope": scope or "*"})
+        return RecallResult(results=results, withheld=withheld, receipt=receipt)
 
     def search_keys(
         self,
@@ -3076,6 +3284,7 @@ class SQLiteMemoryVault(MemoryVault):
         # to supersede a reviewed entry applies the supersession now, under the reviewer's authority.
         stored_state = verdict
         if verdict == EpistemicState.VERIFIED.value:
+            meta["last_verified_at"] = time.time()  # K-R4: a person's verified review refreshes the TTL clock
             # K-R1 quorum: a person's verified review is one attestation; the entry is verified once
             # verification_quorum distinct principals have attested. Other reviewer origins never count.
             attested = list(meta.get("attestations") or [])

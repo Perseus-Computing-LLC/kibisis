@@ -142,7 +142,8 @@ _WORDS = ("alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo l
 def _fill(vault, n, seed=7):
     rng = random.Random(seed)
     for i in range(n):
-        words = " ".join(rng.choice(_WORDS) for _ in range(8))
+        # Every filler entry shares the word "alpha" with the probe queries and nothing else of theirs.
+        words = "alpha " + " ".join(rng.choice(_WORDS[1:]) for _ in range(7))
         vault.put("noise", f"n{i}", words, origin="user", author_id="a", epistemic_state="verified")
 
 

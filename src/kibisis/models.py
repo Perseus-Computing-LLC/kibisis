@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
@@ -204,3 +204,17 @@ class SearchHit(BaseModel):
     key: str = Field(description="Key of the entry.")
     scope: str = Field(default="default", description="Scope of the entry.")
     rank_score: float = Field(default=0.0, description="Relevance score (BM25 rank, as in SearchResult: lower is better).")
+
+
+class WithheldEntry(BaseModel):
+    """An entry ``recall`` matched but did not return, and why (K-R3/K-R4). Carries no content."""
+    ref: str = Field(description="``category:key`` of the withheld entry.")
+    reason: str = Field(description="``conflict_unresolved``, ``below_gate`` or ``stale``.")
+    sources: List[str] = Field(default_factory=list, description="For a conflict: the refs it conflicts with.")
+
+
+class RecallResult(BaseModel):
+    """What ``recall`` returned, what it withheld, and a receipt of how it decided (K-R3..K-R5)."""
+    results: List[SearchResult] = Field(default_factory=list)
+    withheld: List[WithheldEntry] = Field(default_factory=list)
+    receipt: Dict[str, Any] = Field(default_factory=dict)
