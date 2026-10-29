@@ -8,6 +8,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- K-R2: three-way supersession. `put(supersedes_key=...)` resolves to `applied` (the writer's origin class
+  is at or above the target's and the target is not reviewed, or a person confirmed the proposal: the target
+  is revoked and closed), `needs_confirmation` (the entry is stored as a proposal with
+  `metadata["proposed_supersedes"]`, the target stays active and carries `pending_supersession_by`; a
+  person's `verified` review applies it, any other verdict clears it), or `SupersessionRefused` (missing or
+  already superseded target). The outcome is in `metadata["supersession"]` and journaled as a
+  `supersession` event. Retiring an entry through an edge, a review or `archive()` marks every active entry
+  that `derived_from` it `disputed` with `invalidated_by`, recursively (cycles terminate). A key closed by
+  supersession refuses writes (`SupersededEntryError`, journaled as a `superseded_entry` refusal) unless a
+  principal passes `revive=True`, which opens a new version at or after the closed interval's end and
+  records `revived_from`; the old interval is never reopened. `state_transition` events carry a `cause`
+  (`write`, `supersede`, `review`, `cascade`).
+- K-R3/K-R4/K-R5: `recall()`, the model-facing read, returns a `RecallResult` of `results`, `withheld`
+  (`WithheldEntry`: ref, reason, sources; never content) and a `receipt`. Two verified entries that conflict
+  (an explicit `conflicts_with` edge, recorded on both sides and journaled as a `contradiction` before the
+  write, or the same `slot` with different content) are both withheld as `conflict_unresolved` until a
+  person resolves one. A hit is returned only if it covers at least `min_coverage_bp` of the query's words
+  (default 50%) and, with four or more matches, its BM25 z-score among the matched set is at most `z_max_bp`
+  (default -0.5): a crowd of tied scores carries no evidence and is dropped, so false accepts stay flat as
+  the store grows. `ttl_seconds` per origin class withholds entries older than `last_verified_at` (a verified
+  review refreshes it) as `stale`. The receipt carries `n_store`, `n_matched`, the counts withheld by reason,
+  the gate, and each hit's coverage and z-score in basis points. `contrasts_with` names confusables: a
+  symmetric edge, both sides returned, carried in the receipt. Every call is mirrored to Argus as
+  `kibisis.memory_recall` (channel, counts, withheld refs, a 12-hex digest of the query) and kept in a
+  bounded in-process log (`recent_recalls()`); a recall never writes to the vault.
+- K-J: `resolve_scope(env, cwd)` derives the default scope from the git checkout the process runs in
+  (`project:<name>-<8 hex of the real root path>`, the same for every subdirectory) and falls back to
+  `default` outside one. `KIBISIS_SCOPE` wins when set and is the only way to reach `global`.
 - K-B: the Rust crate's audit journal moves to format 3 and matches the Python vault byte for byte. New module
   `kibisis::journal`: `event_hash_v3` (SHA-256 of the canonical JSON array, metadata as the digest of its sorted-key
   JSON), `head_mac_v1` (HMAC-SHA256 over `kibisis audit head v1:` and `[sequence,"event_hash"]`, built on the crate's
@@ -36,6 +64,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SECURITY.md gains a threat model (in scope / out of scope for a local file-write attacker, an agent-side
   writer, a forged review, the passphrase, and a vault without SQLCipher), with the functions that enforce each
   point.
+
+### Changed
+- K-E: a `put()` with no `epistemic_state` stores a `candidate`. `verified` needs `verification_quorum`
+  independent principal attestations (constructor argument or `KIBISIS_VERIFICATION_QUORUM`, default 2): a
+  user write with `author_id` counts as one, each `review_entity(verdict="verified")` by a different reviewer
+  adds one; until then the entry is a candidate with `metadata["attestations"]` and `verification_pending`.
+  `search()` returns candidates by default, labeled by state; only `revoked` entries are left out unless asked for.
+- K-R1: the vault stamps every entry with an immutable `origin_class` (`principal` for user/human origins,
+  `agent` for model origins, `external` for tool and other origins). A lower-class writer cannot overwrite a
+  higher-class entry (`OriginClassError`, journaled as an `origin_class_refused` refusal); `act_class` is capped
+  at `inform` unless the writer is a principal (`act_class_capped_from` records the request); an entry
+  inherits the lowest class along `supersedes` / `derived_from` links (`trust_inherited_from`).
+- The `kibisis_recall` MCP tool and library callers that bind a recall to one scope refuse `scope="*"`.
 
 ### Deprecated
 - `evaluate_epistemic_abstention()` is a wrapper over `evaluate_abstention()` and warns (`DeprecationWarning`).
