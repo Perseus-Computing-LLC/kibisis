@@ -319,6 +319,19 @@ class OriginClassError(PermissionError):
         self.stored_class = stored_class
 
 
+class SupersessionRefused(ValueError):
+    """Raised when a ``supersedes`` edge cannot be made: the target is missing in the scope, or it is
+    already superseded (a retired edge is not re-pointed; supersede the entry that replaced it)."""
+
+
+class SupersededEntryError(PermissionError):
+    """Raised when a write lands on a key that an explicit ``supersedes`` edge has closed (K-R2).
+
+    The closed interval stays closed. A principal may pass ``revive=True`` to open a new version with a
+    new ``valid_from``; nothing reopens the old one.
+    """
+
+
 class EntryIntegrityError(PermissionError):
     """Raised when a stored entry fails its integrity check: it has no signature, its signature does
     not verify, or its sealed content does not belong to it. ``get`` raises it; ``search`` and
@@ -1403,6 +1416,7 @@ class SQLiteMemoryVault(MemoryVault):
         source_ref: Optional[str] = None,
         confidence: Optional[float] = None,
         act_class: Optional[str] = None,
+        revive: bool = False,
         _trusted_metadata: bool = False,
         _review_verdict: bool = False,
     ) -> MemoryEntity:
@@ -1495,10 +1509,27 @@ class SQLiteMemoryVault(MemoryVault):
         with self._write_tx() as cursor:
             self._fence(cursor, fencing_token, resource, holder_id)
             cursor.execute(
-                "SELECT epistemic_state, metadata_json, origin FROM entities WHERE category = ? AND key = ? AND scope = ?",
+                "SELECT epistemic_state, metadata_json, origin, superseded_by, valid_until, version "
+                "FROM entities WHERE category = ? AND key = ? AND scope = ?",
                 (category, key, scope),
             )
             existing = cursor.fetchone()
+
+            # K-R2 bitemporal non-revival: a key closed by a supersedes edge stays closed. Only a
+            # principal may revive it, and only forward in time: the new version's valid_from is at or
+            # after the closed interval's valid_until, so the old interval is never reopened.
+            if existing is not None and existing["superseded_by"]:
+                if not revive or origin_class_of(origin) != "principal":
+                    raise SupersededEntryError(
+                        f"'{category}:{key}' [scope={scope}] was superseded by {existing['superseded_by']}; "
+                        "the closed interval is not rewritten. A principal may pass revive=True to open a new one."
+                    )
+                closed_at = existing["valid_until"] or now
+                if valid_from is not None and valid_from < closed_at:
+                    raise ValueError("revive cannot backdate valid_from into the closed interval")
+                if valid_from is None:
+                    valid_from = max(now, closed_at)
+                meta["revived_from"] = {"version": int(existing["version"]), "superseded_by": existing["superseded_by"]}
 
             # K-R1: origin_class is immutable from below. The stored class is what a lower-trust
             # writer must not change; an equal class keeps it; a principal may raise it.
@@ -1577,25 +1608,70 @@ class SQLiteMemoryVault(MemoryVault):
                         "cannot replace it. Write a new key with supersedes_key to propose a replacement."
                     )
 
-            # Invalidate older entity if superseding is declared
+            # K-R2 three-way supersession. Retirement happens only through this explicit edge.
             if supersedes_key:
                 target_cat = supersedes_category or category
                 cursor.execute(
-                    "SELECT id, metadata_json, epistemic_state, origin FROM entities WHERE category = ? AND key = ? AND scope = ? AND archived = 0",
+                    "SELECT id, metadata_json, epistemic_state, origin, superseded_by FROM entities "
+                    "WHERE category = ? AND key = ? AND scope = ? AND archived = 0",
                     (target_cat, supersedes_key, scope),
                 )
                 target_row = cursor.fetchone()
-                if target_row is not None and trust_ceiling is not None and _is_reviewed(target_row):
-                    # A capped write cannot retire a reviewed entry. Record the proposal instead;
-                    # review_entity applies it when a person approves this entry.
+                target_ref = f"{target_cat}:{supersedes_key}"
+                if target_row is None:
+                    raise SupersessionRefused(f"supersedes target '{target_ref}' [scope={scope}] does not exist")
+                if target_row["superseded_by"]:
+                    raise SupersessionRefused(
+                        f"supersedes target '{target_ref}' [scope={scope}] is already superseded by "
+                        f"{target_row['superseded_by']}; supersede that entry instead"
+                    )
+                target_class = _row_origin_class(target_row)
+                confirmed_by = meta.get("supersession_approved_by") if _review_verdict else None
+                # Applied when the writer outranks or equals the target's class and the target is not a
+                # reviewed entry a non-principal may not retire; a person's approval of a proposal applies it.
+                applies = bool(confirmed_by) or entry_class == "principal" or (
+                    _class_rank(entry_class) >= _class_rank(target_class) and not _is_reviewed(target_row)
+                )
+                if not applies:
+                    # needs_confirmation: store this entry as a proposal; the target stays active and
+                    # carries the pending mark. review_entity applies or clears it.
                     meta.pop("supersedes", None)
                     meta["proposed_supersedes"] = {"category": target_cat, "key": supersedes_key}
-                    meta_str = json.dumps(meta, sort_keys=True)
+                    meta["supersession"] = {"outcome": "needs_confirmation", "target": target_ref}
+                    target_meta = json.loads(target_row["metadata_json"] or "{}")
+                    pending = list(target_meta.get("pending_supersession_by") or [])
+                    if f"{category}:{key}" not in pending:
+                        pending.append(f"{category}:{key}")
+                    target_meta["pending_supersession_by"] = pending
+                    cursor.execute(
+                        "UPDATE entities SET metadata_json = ?, updated_at = ? WHERE id = ?",
+                        (json.dumps(target_meta, sort_keys=True), now, target_row["id"]),
+                    )
+                    self._record_audit_event(
+                        cursor=cursor, action="supersession", category=target_cat, key=supersedes_key, scope=scope,
+                        value_sha256="", author_id=author_id,
+                        metadata={"outcome": "needs_confirmation", "proposed_by": f"{category}:{key}",
+                                  "writer_class": entry_class, "target_class": target_class},
+                    )
                     supersedes_ref = None
                     target_row = None
+                else:
+                    meta.pop("proposed_supersedes", None)
+                    meta["supersession"] = {"outcome": "applied", "target": target_ref}
+                    if confirmed_by:
+                        meta["supersession"]["confirmed_by"] = confirmed_by
+                    self._record_audit_event(
+                        cursor=cursor, action="supersession", category=target_cat, key=supersedes_key, scope=scope,
+                        value_sha256="", author_id=author_id,
+                        metadata={"outcome": "applied", "superseded_by": f"{category}:{key}",
+                                  "writer_class": entry_class, "target_class": target_class,
+                                  **({"confirmed_by": confirmed_by} if confirmed_by else {})},
+                    )
+                meta_str = json.dumps(meta, sort_keys=True)
                 if target_row is not None:
                     target_meta = json.loads(target_row["metadata_json"] or "{}")
                     target_meta["superseded_by"] = f"{category}:{key}"
+                    target_meta.pop("pending_supersession_by", None)
                     cursor.execute(
                         """
                         UPDATE entities
@@ -1624,8 +1700,9 @@ class SQLiteMemoryVault(MemoryVault):
                     if target_row["epistemic_state"] != EpistemicState.REVOKED.value:
                         self._record_state_transition(
                             cursor, target_cat, supersedes_key, scope, target_row["epistemic_state"],
-                            EpistemicState.REVOKED.value, row_origin(target_row), author_id,
+                            EpistemicState.REVOKED.value, row_origin(target_row), author_id, cause="supersede",
                         )
+                    self._cascade_invalidate(cursor, scope, target_ref, author_id, now)
 
             # Skip canonicalization when the vault has no tombstones. Asked of the database on every
             # write: a flag cached at open misses tombstones that other processes add later.
@@ -1696,12 +1773,14 @@ class SQLiteMemoryVault(MemoryVault):
                         is_encrypted = ?, encrypted_envelope_json = ?, epistemic_state = ?,
                         valid_from = ?, valid_until = ?, tenant_sig = ?,
                         supersedes = COALESCE(?, supersedes),
+                        superseded_by = CASE WHEN ? THEN NULL ELSE superseded_by END,
                         origin = ?, source_ref = ?, confidence = ?
                     WHERE id = ?
                     """,
                     (
                         stored_content, meta_str, version, now, is_encrypted, envelope_json,
                         ep_state.value, valid_from, valid_until, tenant_sig, supersedes_ref,
+                        1 if "revived_from" in meta else 0,
                         stored_origin, stored_source_ref, stored_confidence, entity_id
                     ),
                 )
@@ -1721,8 +1800,11 @@ class SQLiteMemoryVault(MemoryVault):
             )
             if previous_state is not None and previous_state != ep_state.value:
                 self._record_state_transition(
-                    cursor, category, key, scope, previous_state, ep_state.value, stored_origin, author_id
+                    cursor, category, key, scope, previous_state, ep_state.value, stored_origin, author_id,
+                    cause="review" if _review_verdict else "write",
                 )
+                if ep_state == EpistemicState.REVOKED:
+                    self._cascade_invalidate(cursor, scope, f"{category}:{key}", author_id, now)
             # Return what was stored, through the same constructor the read paths use, so the write
             # path cannot report a field differently from a later get() or search().
             cursor.execute(f"SELECT {_ENTITY_COLUMNS} FROM entities e WHERE e.id = ?", (entity_id,))
@@ -1740,15 +1822,22 @@ class SQLiteMemoryVault(MemoryVault):
         new: str,
         origin: str,
         reviewer: Optional[str],
+        cause: str = "write",
     ) -> None:
-        """Journal an epistemic-state change and mirror it to the Argus ledger when one is configured."""
+        """Journal an epistemic-state change and mirror it to the Argus ledger when one is configured.
+
+        ``cause`` names the path that made the change: ``supersede`` (explicit edge), ``review`` (a
+        person's verdict), ``cascade`` (a source it derived from was retired), ``archive``, or ``write``.
+        """
         payload = {
             "event": "state_transition",
             "from": previous,
             "to": new,
             "origin": origin,
             "reviewer": reviewer,
+            "cause": cause,
         }
+
         self._record_audit_event(
             cursor=cursor,
             action="state_transition",
@@ -1765,6 +1854,44 @@ class SQLiteMemoryVault(MemoryVault):
             {**payload, "category": category, "key": key, "scope": scope},
         )
 
+
+    def _cascade_invalidate(
+        self, cursor: sqlite3.Cursor, scope: str, retired_ref: str, author_id: Optional[str], now: float
+    ) -> List[str]:
+        """K-R2 cascading invalidation: every active entry that ``derived_from`` a retired entry becomes
+        ``disputed`` with ``invalidated_by`` set, and the cascade continues through their dependents.
+        Entries are marked once; cycles terminate. Returns the refs marked, in order."""
+        marked: List[str] = []
+        seen = {retired_ref}
+        queue = [retired_ref]
+        while queue:
+            ref = queue.pop(0)
+            cursor.execute(
+                "SELECT id, category, key, metadata_json, epistemic_state, origin FROM entities "
+                "WHERE scope = ? AND archived = 0 AND epistemic_state != 'revoked' AND metadata_json LIKE ?",
+                (scope, f'%{json.dumps(ref)}%'),
+            )
+            for dep in cursor.fetchall():
+                dep_ref = f"{dep['category']}:{dep['key']}"
+                if dep_ref in seen:
+                    continue
+                dep_meta = json.loads(dep["metadata_json"] or "{}")
+                if ref not in (dep_meta.get("derived_from") or []):
+                    continue
+                seen.add(dep_ref)
+                dep_meta["invalidated_by"] = ref
+                cursor.execute(
+                    "UPDATE entities SET epistemic_state = ?, metadata_json = ?, updated_at = ? WHERE id = ?",
+                    (EpistemicState.DISPUTED.value, json.dumps(dep_meta, sort_keys=True), now, dep["id"]),
+                )
+                if dep["epistemic_state"] != EpistemicState.DISPUTED.value:
+                    self._record_state_transition(
+                        cursor, dep["category"], dep["key"], scope, dep["epistemic_state"],
+                        EpistemicState.DISPUTED.value, row_origin(dep), author_id, cause="cascade",
+                    )
+                marked.append(dep_ref)
+                queue.append(dep_ref)
+        return marked
     def put(
         self,
         category: str,
@@ -1790,10 +1917,18 @@ class SQLiteMemoryVault(MemoryVault):
         source_ref: Optional[str] = None,
         confidence: Optional[float] = None,
         act_class: Optional[str] = None,
+        revive: bool = False,
         _trusted_metadata: bool = False,
         _review_verdict: bool = False,
     ) -> MemoryEntity:
         """Insert or update an entity. See ``__init__`` for ``fencing_token``, ``resource`` and ``holder_id``.
+
+        K-R2: ``supersedes_key`` is the only way an entry retires another. The outcome is reported in
+        ``metadata["supersession"]``: ``applied`` (target revoked and closed), or ``needs_confirmation``
+        (this entry is a proposal; a person's ``verified`` review applies it). A missing or already
+        superseded target raises :class:`SupersessionRefused`. Retiring an entry marks everything that
+        ``derived_from`` it ``disputed`` (cascade). A key closed by supersession refuses writes
+        (:class:`SupersededEntryError`) unless a principal passes ``revive=True``.
 
         K-E/K-R1: a write that states no ``epistemic_state`` is stored as ``candidate``. ``verified``
         is minted only when ``verification_quorum`` distinct principals have attested: a
@@ -1847,6 +1982,7 @@ class SQLiteMemoryVault(MemoryVault):
                 confidence=confidence,
                 _trusted_metadata=_trusted_metadata,
                 act_class=act_class,
+                revive=revive,
                 _review_verdict=_review_verdict,
             )
         except TombstonedValueError as exc:
@@ -1871,6 +2007,12 @@ class SQLiteMemoryVault(MemoryVault):
                 key=key,
                 author_id=author_id,
                 detail={"writer_class": exc.writer_class, "stored_class": exc.stored_class, "origin": origin or ""},
+            )
+            raise
+        except SupersededEntryError:
+            self.record_refusal(
+                path="put", reason="superseded_entry", scope=scope, category=category, key=key,
+                author_id=author_id, detail={"origin": origin or "", "revive": "yes" if revive else "no"},
             )
             raise
 
@@ -2086,6 +2228,7 @@ class SQLiteMemoryVault(MemoryVault):
                     value_sha256="",
                     author_id=author_id,
                 )
+                self._cascade_invalidate(cursor, scope, f"{category}:{key}", author_id, now)
             return archived
 
     def purge(
@@ -2817,6 +2960,27 @@ class SQLiteMemoryVault(MemoryVault):
             holder_id=holder_id,
         )
 
+    def _clear_pending_supersession(self, category: str, key: str, scope: str, proposer_ref: str) -> None:
+        """Drop ``proposer_ref`` from the target's ``pending_supersession_by`` mark (K-R2 proposal rejected)."""
+        with self._write_tx() as cursor:
+            cursor.execute(
+                "SELECT id, metadata_json FROM entities WHERE category = ? AND key = ? AND scope = ?",
+                (category, key, scope),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return
+            meta = json.loads(row["metadata_json"] or "{}")
+            pending = [r for r in (meta.get("pending_supersession_by") or []) if r != proposer_ref]
+            if pending:
+                meta["pending_supersession_by"] = pending
+            else:
+                meta.pop("pending_supersession_by", None)
+            cursor.execute(
+                "UPDATE entities SET metadata_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(meta, sort_keys=True), time.time(), row["id"]),
+            )
+
     def review_entity(
         self,
         category: str,
@@ -2877,6 +3041,12 @@ class SQLiteMemoryVault(MemoryVault):
         })
         meta["human_reviews"] = reviews
 
+        if meta.get("proposed_supersedes") and verdict != EpistemicState.VERIFIED.value:
+            # K-R2: the proposal is rejected; drop it and clear the target's pending mark.
+            dropped = meta.pop("proposed_supersedes")
+            meta.pop("supersession", None)
+            self._clear_pending_supersession(dropped["category"], dropped["key"], scope, f"{category}:{key}")
+
         if verdict == EpistemicState.REVOKED.value:
             # Revocation initiates tombstone recording and purges plaintext
             self.tombstone(
@@ -2889,12 +3059,14 @@ class SQLiteMemoryVault(MemoryVault):
                 resource=resource,
                 holder_id=holder_id,
             )
-            if entity.epistemic_state != EpistemicState.REVOKED:
-                with self._write_tx() as cursor:
+            with self._write_tx() as cursor:
+                if entity.epistemic_state != EpistemicState.REVOKED:
                     self._record_state_transition(
                         cursor, category, key, scope, entity.epistemic_state.value,
-                        EpistemicState.REVOKED.value, entity.origin, reviewer_id,
+                        EpistemicState.REVOKED.value, entity.origin, reviewer_id, cause="review",
                     )
+                # K-R2: everything derived from the revoked entry is now in question.
+                self._cascade_invalidate(cursor, scope, f"{category}:{key}", reviewer_id, time.time())
             entity.archived = True
             entity.epistemic_state = EpistemicState.REVOKED
             entity.metadata = meta

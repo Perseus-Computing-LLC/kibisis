@@ -190,7 +190,7 @@ def test_cascade_terminates_on_cycles(vault):
 def test_forget_cascades_too(vault):
     vault.put("src", "report", "raw figures", origin="user", author_id="a")
     vault.put("sum", "s1", "summary", origin="model", derived_from=["src:report"])
-    vault.forget("src", "report")
+    vault.archive("src", "report")
     assert vault.get("sum", "s1").epistemic_state == EpistemicState.DISPUTED
 
 
