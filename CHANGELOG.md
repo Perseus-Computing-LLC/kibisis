@@ -76,7 +76,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   higher-class entry (`OriginClassError`, journaled as an `origin_class_refused` refusal); `act_class` is capped
   at `inform` unless the writer is a principal (`act_class_capped_from` records the request); an entry
   inherits the lowest class along `supersedes` / `derived_from` links (`trust_inherited_from`).
-- The `kibisis_recall` MCP tool and library callers that bind a recall to one scope refuse `scope="*"`.
+- `recall()` refuses `scope="*"`: a model-facing read is bound to one scope (the MCP server already was).
 
 ### Deprecated
 - `evaluate_epistemic_abstention()` is a wrapper over `evaluate_abstention()` and warns (`DeprecationWarning`).
