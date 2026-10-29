@@ -1674,4 +1674,130 @@ mod tests {
         assert_eq!(actions.iter().filter(|a| *a == "purge").count(), 1);
         assert!(vault.verify_audit_chain(None));
     }
+
+    #[test]
+    fn audit_events_are_format_3_with_a_signed_head() {
+        let key = b"in-memory vault test signing key";
+        let mut vault = InMemoryMemoryVault::with_signing_key(key);
+        assert!(vault.audit_head().is_none());
+        assert_eq!(vault.verify_audit_journal(), Ok(()));
+
+        vault
+            .put(&MemoryEntity::new("convention", "t1", "payload 1"))
+            .unwrap();
+        vault
+            .put(&MemoryEntity::new("convention", "t2", "payload 2"))
+            .unwrap();
+        vault
+            .put(&MemoryEntity::new("convention", "t1", "payload 1 updated"))
+            .unwrap();
+        vault.archive("convention", "t2").unwrap();
+        vault
+            .tombstone("convention", "t1", "retracted", Some("alice"), "default")
+            .unwrap();
+
+        let events = vault.list_audit_events(None, 100);
+        assert_eq!(events.len(), 5);
+        let mut prev = journal::GENESIS_HASH.to_string();
+        for ev in &events {
+            assert_eq!(ev.format, journal::JOURNAL_FORMAT);
+            assert_eq!(ev.metadata_json, None);
+            assert_eq!(ev.prev_hash, prev);
+            assert_eq!(ev.event_hash, journal::event_hash_v3(&ev.fields()));
+            prev = ev.event_hash.clone();
+        }
+        assert_eq!(events[4].author_id.as_deref(), Some("alice"));
+
+        let head = vault.audit_head().expect("every append signs the head");
+        let last = events.last().unwrap();
+        assert_eq!(
+            head,
+            journal::JournalHead::sign(key, last.sequence, &last.event_hash)
+        );
+        assert_eq!(vault.verify_audit_journal(), Ok(()));
+        assert!(vault.verify_audit_chain(None));
+    }
+
+    #[test]
+    fn audit_tail_cut_fails_verification() {
+        let mut vault = InMemoryMemoryVault::new();
+        for i in 0..3 {
+            vault
+                .put(&MemoryEntity::new(
+                    "c",
+                    &format!("k{i}"),
+                    &format!("value {i}"),
+                ))
+                .unwrap();
+        }
+        assert_eq!(vault.verify_audit_journal(), Ok(()));
+
+        // Remove the last row while the head still names it.
+        vault.audit_journal.lock().unwrap().pop();
+        assert_eq!(
+            vault.verify_audit_journal(),
+            Err(journal::ChainError::TailCut {
+                head_sequence: 3,
+                last_sequence: Some(2),
+            })
+        );
+        assert!(!vault.verify_audit_chain(None));
+
+        // Remove every row: the head alone shows the journal existed.
+        vault.audit_journal.lock().unwrap().clear();
+        assert_eq!(
+            vault.verify_audit_journal(),
+            Err(journal::ChainError::TailCut {
+                head_sequence: 3,
+                last_sequence: None,
+            })
+        );
+        assert!(!vault.verify_audit_chain(None));
+    }
+
+    #[test]
+    fn audit_mid_chain_edit_and_missing_head_fail_verification() {
+        let mut vault = InMemoryMemoryVault::new();
+        for i in 0..3 {
+            vault
+                .put(&MemoryEntity::new(
+                    "c",
+                    &format!("k{i}"),
+                    &format!("value {i}"),
+                ))
+                .unwrap();
+        }
+        {
+            let mut journal = vault.audit_journal.lock().unwrap();
+            journal[1].key = "k9".to_string();
+        }
+        assert_eq!(
+            vault.verify_audit_journal(),
+            Err(journal::ChainError::HashMismatch { sequence: 2 })
+        );
+        assert!(!vault.verify_audit_chain(None));
+
+        let mut vault = InMemoryMemoryVault::new();
+        vault.put(&MemoryEntity::new("c", "k", "v")).unwrap();
+        *vault.audit_head.lock().unwrap() = None;
+        assert_eq!(
+            vault.verify_audit_journal(),
+            Err(journal::ChainError::MissingHead)
+        );
+        assert!(!vault.verify_audit_chain(None));
+    }
+
+    #[test]
+    fn two_vaults_sign_their_heads_under_different_keys() {
+        let mut a = InMemoryMemoryVault::new();
+        let mut b = InMemoryMemoryVault::new();
+        a.put(&MemoryEntity::new("c", "k", "v")).unwrap();
+        b.put(&MemoryEntity::new("c", "k", "v")).unwrap();
+        let (ha, hb) = (a.audit_head().unwrap(), b.audit_head().unwrap());
+        assert_eq!((ha.sequence, hb.sequence), (1, 1));
+        assert_ne!(ha.mac, hb.mac, "a fresh vault gets its own signing key");
+        // Swapping heads between vaults fails: the MAC is bound to the vault's key.
+        *a.audit_head.lock().unwrap() = Some(hb);
+        assert_eq!(a.verify_audit_journal(), Err(journal::ChainError::HeadMac));
+    }
 }
