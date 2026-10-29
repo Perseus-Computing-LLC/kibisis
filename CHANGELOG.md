@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- K-B: the Rust crate's audit journal moves to format 3 and matches the Python vault byte for byte. New module
+  `kibisis::journal`: `event_hash_v3` (SHA-256 of the canonical JSON array, metadata as the digest of its sorted-key
+  JSON), `head_mac_v1` (HMAC-SHA256 over `kibisis audit head v1:` and `[sequence,"event_hash"]`, built on the crate's
+  own SHA-256, so the crate still has no runtime dependencies) and `verify_chain`, which names the failure
+  (`ChainError`: tail cut, mid-chain edit, missing head, bad MAC). `InMemoryMemoryVault` re-signs its head on every
+  append; `new()` derives a fresh non-secret key per vault, `with_signing_key` takes the caller's key, and
+  `verify_audit_journal` returns the `ChainError` behind `verify_audit_chain`. `AuditEvent` gains `metadata_json`
+  (canonical JSON, `None` in the in-memory vault) and `format`; its `timestamp` stays whole seconds, so Rust rows
+  hash as `<seconds>.000000`. The crate's former `:`-joined layout is gone (the in-memory journal is never persisted,
+  so there are no legacy journals to read). One vector file, `tests/fixtures/journal_format3_vectors.json`, written
+  by `tests/fixtures/make_journal_vectors.py` from the Python reference, is checked by both `tests/journal_vectors.rs`
+  and `tests/test_journal_vectors.py`, including a five-event chain whose tail cut and mid-chain edits must fail in
+  both languages. Vectors keep floats out of metadata: JSON writers print the same double differently, so a metadata
+  float is not guaranteed to hash alike across implementations. `serde_json` is a dev-dependency for the fixture.
 - `SQLiteMemoryVault.evaluate_abstention(probes, answerable=, unanswerable=, search_fn=, k=, scope=)` and
   `kibisis.Probe` (#20). Scores probes the vault must answer (query -> expected `category:key`) and probes it
   must refuse, through any caller-supplied `search_fn` (default: `search(query, match="any")`), and reports
@@ -27,20 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `evaluate_epistemic_abstention()` is a wrapper over `evaluate_abstention()` and warns (`DeprecationWarning`).
   It keeps its keys; `perfect_abstention` still means only that every probe returned nothing, which an empty
   vault also achieves. The report now also carries `store_size`, `verdict` and `perfect` from the new eval.
-- K-B: the Rust crate's audit journal moves to format 3 and matches the Python vault byte for byte. New module
-  `kibisis::journal`: `event_hash_v3` (SHA-256 of the canonical JSON array, metadata as the digest of its sorted-key
-  JSON), `head_mac_v1` (HMAC-SHA256 over `kibisis audit head v1:` and `[sequence,"event_hash"]`, built on the crate's
-  own SHA-256, so the crate still has no runtime dependencies) and `verify_chain`, which names the failure
-  (`ChainError`: tail cut, mid-chain edit, missing head, bad MAC). `InMemoryMemoryVault` re-signs its head on every
-  append; `new()` derives a fresh non-secret key per vault, `with_signing_key` takes the caller's key, and
-  `verify_audit_journal` returns the `ChainError` behind `verify_audit_chain`. `AuditEvent` gains `metadata_json`
-  (canonical JSON, `None` in the in-memory vault) and `format`; its `timestamp` stays whole seconds, so Rust rows
-  hash as `<seconds>.000000`. The crate's former `:`-joined layout is gone (the in-memory journal is never persisted,
-  so there are no legacy journals to read). One vector file, `tests/fixtures/journal_format3_vectors.json`, written
-  by `tests/fixtures/make_journal_vectors.py` from the Python reference, is checked by both `tests/journal_vectors.rs`
-  and `tests/test_journal_vectors.py`, including a five-event chain whose tail cut and mid-chain edits must fail in
-  both languages. Vectors keep floats out of metadata: JSON writers print the same double differently, so a metadata
-  float is not guaranteed to hash alike across implementations. `serde_json` is a dev-dependency for the fixture.
+
 
 ## [0.1.0-alpha.10] - 2026-10-28
 
