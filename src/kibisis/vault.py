@@ -1969,8 +1969,14 @@ class SQLiteMemoryVault(MemoryVault):
         fencing_token: Optional[int] = None,
         resource: Optional[str] = None,
         holder_id: Optional[str] = None,
+        origin: Optional[str] = None,
     ) -> MemoryEntity:
-        """Atomically revoke old_key and record new_key as its superseding replacement."""
+        """Atomically revoke old_key and record new_key as its superseding replacement.
+
+        ``origin`` is passed through to :meth:`put`: the replacement asks for ``verified``, which
+        under K-R1 is the author's attestation only when the origin is a principal (``user`` or
+        ``import``) and is minted once ``verification_quorum`` is met.
+        """
         return self.put(
             category=category,
             key=new_key,
@@ -1986,6 +1992,7 @@ class SQLiteMemoryVault(MemoryVault):
             supersedes_key=old_key,
             supersedes_category=category,
             epistemic_state=EpistemicState.VERIFIED.value,
+            origin=origin,
         )
 
     def put_batch(
@@ -3040,8 +3047,14 @@ class SQLiteMemoryVault(MemoryVault):
         fencing_token: Optional[int] = None,
         resource: Optional[str] = None,
         holder_id: Optional[str] = None,
+        origin: Optional[str] = "user",
     ) -> MemoryEntity:
-        """Store or update the dedicated user persona / preference slot."""
+        """Store or update the dedicated user persona / preference slot.
+
+        The slot is the person's own profile, so ``origin`` defaults to ``"user"``: the write is its
+        author's attestation and the slot is ``verified`` once ``verification_quorum`` is met
+        (K-R1); below quorum it is stored as a candidate with ``verification_pending``.
+        """
         meta = metadata.copy() if metadata else {}
         meta["is_persona_slot"] = True
         return self.put(
@@ -3055,6 +3068,7 @@ class SQLiteMemoryVault(MemoryVault):
             fencing_token=fencing_token,
             resource=resource,
             holder_id=holder_id,
+            origin=origin,
         )
 
     def get_persona_slot(
