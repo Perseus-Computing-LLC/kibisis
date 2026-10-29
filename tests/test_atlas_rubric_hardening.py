@@ -6,7 +6,8 @@ from kibisis import EpistemicState, MemoryEntity, SQLiteMemoryVault
 class TestAtlasRubricHardening(unittest.TestCase):
 
     def test_epistemic_lifecycle_and_unverified_filtering(self):
-        vault = SQLiteMemoryVault()
+        # K-R1: a single person's review reaches quorum here.
+        vault = SQLiteMemoryVault(verification_quorum=1)
         # 1. Candidate ingestion
         entity = vault.admit_candidate(
             category="theories",
@@ -16,14 +17,14 @@ class TestAtlasRubricHardening(unittest.TestCase):
         )
         self.assertEqual(entity.epistemic_state, EpistemicState.CANDIDATE)
 
-        # By default, candidates are suppressed from active recall
-        res = vault.search(query="Quantum", scope="lab_alpha", include_unverified=False)
-        self.assertEqual(len(res), 0)
-
-        # Search with include_unverified finds candidate
-        res_unv = vault.search(query="Quantum", scope="lab_alpha", include_unverified=True)
-        self.assertEqual(len(res_unv), 1)
-        self.assertEqual(res_unv[0].entity.key, "quantum_gravity")
+        # K-K: candidates are recallable by default, labeled by state; a verified-only recall
+        # withholds them.
+        res = vault.search(query="Quantum", scope="lab_alpha")
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0].entity.key, "quantum_gravity")
+        self.assertEqual(res[0].entity.epistemic_state, EpistemicState.CANDIDATE)
+        res_ver = vault.search(query="Quantum", scope="lab_alpha", epistemic_state=EpistemicState.VERIFIED.value)
+        self.assertEqual(len(res_ver), 0)
 
         # Human review promotes to verified
         reviewed = vault.review_entity(
@@ -37,8 +38,8 @@ class TestAtlasRubricHardening(unittest.TestCase):
         self.assertEqual(reviewed.epistemic_state, EpistemicState.VERIFIED)
         self.assertEqual(len(reviewed.metadata["human_reviews"]), 1)
 
-        # Now standard search finds it
-        res_verified = vault.search(query="Quantum", scope="lab_alpha", include_unverified=False)
+        # Now a verified-only search finds it too
+        res_verified = vault.search(query="Quantum", scope="lab_alpha", epistemic_state=EpistemicState.VERIFIED.value)
         self.assertEqual(len(res_verified), 1)
         self.assertEqual(res_verified[0].entity.epistemic_state, EpistemicState.VERIFIED)
 
@@ -53,6 +54,8 @@ class TestAtlasRubricHardening(unittest.TestCase):
         )
         self.assertEqual(revoked.epistemic_state, EpistemicState.REVOKED)
         self.assertIsNone(vault.get("theories", "quantum_gravity", scope="lab_alpha"))
+        # Revoked entries are withheld from default recall.
+        self.assertEqual(vault.search(query="Quantum", scope="lab_alpha"), [])
 
         # Cannot re-insert tombstoned payload into same scope
         with self.assertRaises(ValueError) as cm:
@@ -105,8 +108,8 @@ class TestAtlasRubricHardening(unittest.TestCase):
 
 
     def test_bitemporal_validity_point_in_time(self):
-        vault = SQLiteMemoryVault()
-        # Event valid from t=1000 to t=2000
+        vault = SQLiteMemoryVault(verification_quorum=1)
+        # Event valid from t=1000 to t=2000, verified by the person who wrote it
         vault.put(
             category="regulations",
             key="tariffs",
@@ -114,6 +117,8 @@ class TestAtlasRubricHardening(unittest.TestCase):
             valid_from=1000.0,
             valid_until=2000.0,
             scope="trade_dept",
+            epistemic_state="verified",
+            origin="user",
         )
 
         # Point-in-time search at t=500 (before validity) -> 0

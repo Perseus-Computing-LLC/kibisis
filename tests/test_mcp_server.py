@@ -99,7 +99,8 @@ class TestProtocol(unittest.TestCase):
 
 class TestToolLifecycle(unittest.TestCase):
     def setUp(self):
-        self.vault = SQLiteMemoryVault(":memory:", allow_plaintext=True)
+        # K-R1: one person's review is enough to verify in this lifecycle.
+        self.vault = SQLiteMemoryVault(":memory:", allow_plaintext=True, verification_quorum=1)
         self.server = KibisisMCPServer(vault=self.vault, scope="default")
 
     def tearDown(self):
@@ -259,7 +260,13 @@ class TestStdioProcess(unittest.TestCase):
 class TestReviewCommand(unittest.TestCase):
     def test_list_approve_and_reject(self):
         with tempfile.TemporaryDirectory() as tmp:
-            env = {"KIBISIS_DB_PATH": str(Path(tmp) / "vault.db"), "KIBISIS_PASSPHRASE": TEST_KEY, "KIBISIS_SCOPE": "default"}
+            env = {
+                "KIBISIS_DB_PATH": str(Path(tmp) / "vault.db"),
+                "KIBISIS_PASSPHRASE": TEST_KEY,
+                "KIBISIS_SCOPE": "default",
+                # K-R1: the review CLI opens the vault itself; one reviewer reaches quorum here.
+                "KIBISIS_VERIFICATION_QUORUM": "1",
+            }
             saved = {k: os.environ.get(k) for k in env}
             os.environ.update(env)
             try:

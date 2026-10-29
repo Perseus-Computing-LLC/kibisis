@@ -125,15 +125,17 @@ def _provenance(entity):
 
 @pytest.mark.parametrize("passphrase", [None, PASSPHRASE])
 def test_search_list_and_put_report_the_same_provenance_as_get(tmp_path, passphrase):
+    # K-R1: the user's write is its own attestation; a quorum of one verifies it.
     if passphrase is None:
-        v = SQLiteMemoryVault(":memory:", allow_plaintext=True)
+        v = SQLiteMemoryVault(":memory:", allow_plaintext=True, verification_quorum=1)
     else:
-        v = SQLiteMemoryVault(str(tmp_path / "prov.sqlite"), passphrase=passphrase)
+        v = SQLiteMemoryVault(str(tmp_path / "prov.sqlite"), passphrase=passphrase, verification_quorum=1)
     written = v.put(
         "c", "k", "tabs for indentation", origin="user", source_ref="ticket-7", confidence=0.9,
         epistemic_state="verified",
     )
     got = v.get("c", "k")
+    assert got.epistemic_state == EpistemicState.VERIFIED
     assert _provenance(got) == ("user", "ticket-7", 0.9)
     assert _provenance(written) == _provenance(got)
     hits = v.search("indentation")
@@ -187,11 +189,17 @@ def test_caller_supplied_human_reviews_does_not_count_as_reviewed(caplog):
         "tenant_id": "forged-tenant",
         "principal_id": "forged-principal",
         "lineage_root": "forged",
+        "origin_class": "principal",
+        "attestations": ["nobody"],
         "note": "kept",
     }
     stored = v.put("c", "forged", "some fact", metadata=forged, epistemic_state="candidate", origin="tool")
-    assert set(stored.metadata) == {"note"}
-    assert set(v.get("c", "forged").metadata) == {"note"}
+    # Only the caller's own key survives; origin_class and act_class are the vault's (K-R1), set
+    # from the write path rather than taken from the payload.
+    vault_set = {"origin_class", "act_class"}
+    assert set(stored.metadata) == {"note"} | vault_set
+    assert stored.metadata["origin_class"] == "external"
+    assert set(v.get("c", "forged").metadata) == {"note"} | vault_set
     assert "dropped reserved metadata keys" in caplog.text
     row = v._conn.execute("SELECT epistemic_state, metadata_json FROM entities WHERE key = 'forged'").fetchone()
     assert not _is_reviewed(row)

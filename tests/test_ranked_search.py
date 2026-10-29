@@ -61,14 +61,15 @@ def _open(kind, path, monkeypatch, passphrase=PASS):
             pytest.skip("sqlcipher3 is not installed")
         if vault_module.sqlcipher3.sqlite_version_info < (3, 43, 0):
             pytest.skip("this SQLCipher's SQLite predates contentless-delete FTS5 tables (3.43)")
+    # K-R1: the corpus is a person's; one attestation verifies it.
     if kind == "plain":
-        return SQLiteMemoryVault(str(path), allow_plaintext=True)
-    return SQLiteMemoryVault(str(path), passphrase=passphrase)
+        return SQLiteMemoryVault(str(path), allow_plaintext=True, verification_quorum=1)
+    return SQLiteMemoryVault(str(path), passphrase=passphrase, verification_quorum=1)
 
 
 def _fill(vault, rows=CORPUS):
     for category, key, content in rows:
-        vault.put(category, key, content, epistemic_state="verified")
+        vault.put(category, key, content, epistemic_state="verified", origin="user")
 
 
 def _ranking(vault, query, **kwargs):
@@ -399,7 +400,7 @@ def test_search_keys_applies_the_filters_and_boundaries_of_search(tmp_path, monk
     vault = _open(kind, tmp_path / "keys.db", monkeypatch)
     for row in rows:
         row = dict(row)
-        vault.put(row.pop("category"), row.pop("key"), row.pop("content"), **row)
+        vault.put(row.pop("category"), row.pop("key"), row.pop("content"), origin="user", **row)
     vault.archive("f", "arch")
     cases = [
         {},
@@ -407,6 +408,7 @@ def test_search_keys_applies_the_filters_and_boundaries_of_search(tmp_path, monk
         {"scope": "team"},
         {"scope": "*", "category": "g"},
         {"epistemic_state": "candidate"},
+        {"epistemic_state": "verified"},
         {"scope": "*", "as_of_valid_time": now - 75},
         {"tenant_id": "acme"},
         {"principal_id": "bo"},
@@ -420,9 +422,11 @@ def test_search_keys_applies_the_filters_and_boundaries_of_search(tmp_path, monk
         expected = [(r.entity.key, round(r.rank_score, 9)) for r in vault.search("orchid", limit=limit, **case)]
         got = [(h.key, round(h.rank_score, 9)) for h in vault.search_keys("orchid", limit=limit, **case)]
         assert got == expected, case
-    # the boundaries do leave entries out, so the comparison above is not vacuous
+    # the boundaries do leave entries out, so the comparison above is not vacuous. K-K: the
+    # candidate is part of default recall; scope, validity window and archival still exclude.
     keys = {h.key for h in vault.search_keys("orchid", limit=10)}
-    assert {"t1", "t2", "l1", "l2", "v1"} <= keys and not {"c1", "v2", "old", "arch"}.intersection(keys)
+    assert {"t1", "t2", "l1", "l2", "v1", "c1"} <= keys and not {"v2", "old", "arch"}.intersection(keys)
+    assert "c1" not in {h.key for h in vault.search_keys("orchid", limit=10, epistemic_state="verified")}
     assert {h.key for h in vault.search_keys("orchid", limit=10, tenant_id="acme")} == keys - {"t2"}
     assert {h.key for h in vault.search_keys("orchid", limit=10, authorized_lineage_roots=["root-a"])} == keys - {"l2"}
     vault.close()

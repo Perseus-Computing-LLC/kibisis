@@ -268,7 +268,9 @@ class GatewayModelCannotClaimHumanAuthority(unittest.TestCase):
     """gateway.model_cannot_claim_human_authority"""
 
     def setUp(self):
-        self.vault = SQLiteMemoryVault(":memory:", allow_plaintext=True)
+        # K-R1: one principal's attestation is enough here, so a person's library write or review
+        # is verified; the model path under test never reaches verified at any quorum.
+        self.vault = SQLiteMemoryVault(":memory:", allow_plaintext=True, verification_quorum=1)
         self.server = KibisisMCPServer(vault=self.vault, scope="default")
 
     def tearDown(self):
@@ -285,8 +287,10 @@ class GatewayModelCannotClaimHumanAuthority(unittest.TestCase):
         writes = [e for e in self.vault.list_audit_events(limit=100) if e.key == "keys"]
         self.assertEqual([e.author_id for e in writes], ["mcp-agent"])
         # Positive control: the same text written by a person through the library is verified.
-        self.vault.put("ops", "keys-human", claim, author_id="human:owner", epistemic_state="verified")
+        self.vault.put("ops", "keys-human", claim, author_id="human:owner", epistemic_state="verified", origin="user")
         self.assertEqual(self.vault.get("ops", "keys-human").epistemic_state.value, "verified")
+        self.assertEqual(self.vault.get("ops", "keys-human").metadata["origin_class"], "principal")
+        self.assertEqual(entity.metadata["origin_class"], "agent")
 
     def test_trust_and_identity_arguments_are_refused_and_journaled(self):
         attempts = [
@@ -324,7 +328,10 @@ class GatewayModelCannotClaimHumanAuthority(unittest.TestCase):
         self.assertEqual(self.vault.get("ops", "c").epistemic_state.value, "candidate")
 
     def test_model_cannot_replace_or_retire_a_reviewed_entry(self):
-        self.vault.put("ops", "policy", "Two reviewers for every deploy", author_id="human:owner", epistemic_state="verified")
+        self.vault.put(
+            "ops", "policy", "Two reviewers for every deploy", author_id="human:owner", epistemic_state="verified", origin="user"
+        )
+        self.assertEqual(self.vault.get("ops", "policy").epistemic_state.value, "verified")
         is_error, text = _call(self.server, "kibisis_remember", {"category": "ops", "key": "policy", "content": "No reviewers needed"})
         self.assertTrue(is_error)
         self.assertEqual(self.vault.get("ops", "policy").content, "Two reviewers for every deploy")

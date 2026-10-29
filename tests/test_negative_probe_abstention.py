@@ -7,7 +7,8 @@ from kibisis import EpistemicState, SQLiteMemoryVault
 
 class TestNegativeProbeAbstention(unittest.TestCase):
     def setUp(self):
-        self.vault = SQLiteMemoryVault(":memory:", allow_plaintext=True)
+        # K-R1: the facts seeded here are a person's; one attestation verifies them.
+        self.vault = SQLiteMemoryVault(":memory:", allow_plaintext=True, verification_quorum=1)
 
     def tearDown(self):
         self.vault.close()
@@ -80,7 +81,8 @@ class TestNegativeProbeAbstention(unittest.TestCase):
         self.assertEqual(past_results[0].entity.content, "db-primary-old.internal.net")
 
     def test_candidate_and_revoked_quarantine(self):
-        """Candidate and revoked memories must be quarantined from normal recall."""
+        """Revoked memories are quarantined from normal recall; candidates come back labeled (K-K)
+        and are withheld only from a verified-only recall."""
         self.vault.store(
             category="rumor",
             key="candidate_fact",
@@ -98,21 +100,29 @@ class TestNegativeProbeAbstention(unittest.TestCase):
             key="active_rule",
             content="FIDO2 passkey authentication required for all operators",
             epistemic_state=EpistemicState.VERIFIED.value,
+            origin="user",
         )
+        self.assertEqual(self.vault.get("policy", "active_rule").epistemic_state, EpistemicState.VERIFIED)
 
-        # Normal search: candidate and revoked must be quarantined
-        results = self.vault.search("policy", include_unverified=False)
+        # Normal search: revoked must be quarantined
+        results = self.vault.search("policy")
         matched_keys = [r.entity.key for r in results]
         self.assertIn("active_rule", matched_keys)
         self.assertNotIn("revoked_rule", matched_keys)
 
-        candidate_results = self.vault.search("deadline", include_unverified=False)
-        self.assertEqual(len(candidate_results), 0)
+        # Normal search returns the candidate, labeled as such
+        candidate_results = self.vault.search("deadline")
+        self.assertEqual(len(candidate_results), 1)
+        self.assertEqual(candidate_results[0].entity.key, "candidate_fact")
+        self.assertEqual(candidate_results[0].entity.epistemic_state, EpistemicState.CANDIDATE)
 
-        # Search with include_unverified=True reveals candidate
-        unverified_results = self.vault.search("deadline", include_unverified=True)
-        self.assertEqual(len(unverified_results), 1)
-        self.assertEqual(unverified_results[0].entity.key, "candidate_fact")
+        # A verified-only search withholds the candidate
+        verified_results = self.vault.search("deadline", epistemic_state=EpistemicState.VERIFIED.value)
+        self.assertEqual(len(verified_results), 0)
+
+        # Revoked entries are returned only when asked for by state
+        revoked_results = self.vault.search("rotation", epistemic_state=EpistemicState.REVOKED.value)
+        self.assertEqual([r.entity.key for r in revoked_results], ["revoked_rule"])
 
 
 if __name__ == "__main__":

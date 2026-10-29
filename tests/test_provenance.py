@@ -64,7 +64,7 @@ def test_remember_stores_origin():
 
 
 def test_default_state_is_candidate_for_model_origin():
-    vault = SQLiteMemoryVault(":memory:")
+    vault = SQLiteMemoryVault(":memory:", verification_quorum=1)
     m = vault.remember("c", "from_model", "The sky is blue.", origin="model")
     assert m.epistemic_state == EpistemicState.CANDIDATE
     assert vault.get("c", "from_model").epistemic_state == EpistemicState.CANDIDATE
@@ -74,13 +74,18 @@ def test_default_state_is_candidate_for_model_origin():
     assert m2.metadata.get("trust_capped_from") == "verified"
     u = vault.remember("c", "from_user", "The sky is blue.", origin="user", epistemic_state="verified")
     assert u.epistemic_state == EpistemicState.VERIFIED
-    # model writes do not reach default recall; the user's does
-    keys = {r.entity.key for r in vault.search("sky", limit=10)}
-    assert "from_user" in keys and "from_model" not in keys
+    # K-K: default recall returns the model's candidates labeled as such alongside the user's
+    # verified entry; a verified-only recall carries the user's entry alone.
+    by_key = {r.entity.key: r.entity.epistemic_state for r in vault.search("sky", limit=10)}
+    assert by_key["from_user"] == EpistemicState.VERIFIED
+    assert by_key["from_model"] == EpistemicState.CANDIDATE
+    assert by_key["from_model_2"] == EpistemicState.CANDIDATE
+    verified_keys = {r.entity.key for r in vault.search("sky", limit=10, epistemic_state="verified")}
+    assert verified_keys == {"from_user"}
 
 
 def test_admit_refuses_model_self_promotion():
-    vault = SQLiteMemoryVault(":memory:")
+    vault = SQLiteMemoryVault(":memory:", verification_quorum=1)
     vault.remember("c", "k", "fact", origin="model")
     with pytest.raises(AdmissionRefused):
         vault.admit("c", "k", reviewer="hermes-agent", reviewer_origin="model")
@@ -101,7 +106,7 @@ def test_state_transition_emits_audit_event(tmp_path, monkeypatch):
         pytest.skip("argus-verify CLI not on PATH")
     ledger_path = tmp_path / "argus.jsonl"
     monkeypatch.setenv("ARGUS_LEDGER_PATH", str(ledger_path))
-    vault = SQLiteMemoryVault(":memory:")
+    vault = SQLiteMemoryVault(":memory:", verification_quorum=1)
     vault.remember("c", "k", "fact", origin="model")  # unknown->candidate on first write: no transition
     vault.admit("c", "k", reviewer="thomas", reviewer_origin="user")  # candidate->verified
     vault.review_entity("c", "k", verdict="disputed", reviewer_id="thomas")  # verified->disputed
@@ -154,6 +159,8 @@ def test_admit_cli_sets_reviewer_origin_user(tmp_path, monkeypatch):
     db = str(tmp_path / "v.sqlite")
     monkeypatch.setenv("KIBISIS_PASSPHRASE", "test-passphrase")
     monkeypatch.delenv("KIBISIS_PASSPHRASE_FILE", raising=False)
+    # K-R1: the CLI opens the vault itself; one person's admit reaches quorum here.
+    monkeypatch.setenv("KIBISIS_VERIFICATION_QUORUM", "1")
     v = SQLiteMemoryVault(db, passphrase="test-passphrase")
     v.remember("c", "k", "fact", origin="model")
     v.close()
