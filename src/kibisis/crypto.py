@@ -115,17 +115,28 @@ class AESGCMCryptoEnvelopeProvider(CryptoEnvelopeProvider):
         return aesgcm.decrypt(nonce, full_payload, associated_data=aad)
 
 
-def derive_integrity_keys(passphrase: str, vault_salt: bytes) -> Tuple[bytes, bytes]:
-    """Return a vault's (signing key, digest key).
+def derive_vault_keys(passphrase: str, vault_salt: bytes) -> Tuple[bytes, bytes, bytes]:
+    """Return a vault's (signing key, digest key, term key).
 
-    Both come from one PBKDF2-HMAC-SHA256 stretch of the passphrase (600,000 iterations) under the
+    All three come from one PBKDF2-HMAC-SHA256 stretch of the passphrase (600,000 iterations) under the
     vault's salt plus a fixed suffix, so they are separate from the content key, and are split with
-    HKDF-Expand. Testing a passphrase guess against a stored signature or digest therefore costs a
-    full PBKDF2 run, the same as testing it against sealed content.
+    HKDF-Expand under distinct labels. Testing a passphrase guess against a stored signature, digest or
+    term token therefore costs a full PBKDF2 run, the same as testing it against sealed content.
+
+    The term key tags the words of the keyed term index that a vault without SQLCipher keeps on disk
+    (``SQLiteMemoryVault._term_token``). It is its own key so that a token can never be mistaken for, or
+    turned into, an entry signature or a value digest.
     """
     root = AESGCMCryptoEnvelopeProvider().stretched_key(passphrase, vault_salt + _INTEGRITY_SALT_SUFFIX)
     signing = HKDFExpand(algorithm=hashes.SHA256(), length=32, info=b"kibisis entry signature v2").derive(root)
     digest = HKDFExpand(algorithm=hashes.SHA256(), length=32, info=b"kibisis value digest v2").derive(root)
+    term = HKDFExpand(algorithm=hashes.SHA256(), length=32, info=b"kibisis term index v1").derive(root)
+    return signing, digest, term
+
+
+def derive_integrity_keys(passphrase: str, vault_salt: bytes) -> Tuple[bytes, bytes]:
+    """Return a vault's (signing key, digest key): the first two keys of :func:`derive_vault_keys`."""
+    signing, digest, _ = derive_vault_keys(passphrase, vault_salt)
     return signing, digest
 
 

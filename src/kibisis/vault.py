@@ -8,6 +8,7 @@ import hmac
 import inspect
 import json
 import logging
+import math
 import os
 try:
     import sqlcipher3
@@ -16,6 +17,7 @@ except ImportError:
 import re
 import sqlite3
 import string
+import threading
 import time
 import unicodedata
 import warnings
@@ -29,7 +31,7 @@ from .crypto import (
     ENTRY_SIGNATURE_PREFIX,
     TOMBSTONE_BINDING,
     AESGCMCryptoEnvelopeProvider,
-    derive_integrity_keys,
+    derive_vault_keys,
     entry_aad,
     keyed_value_digest,
     sign_entry,
@@ -61,6 +63,11 @@ JOURNAL_FORMAT = 3
 #: Version of the entry index (``entities_search``) that a SQLCipher vault keeps for ranked search. A vault
 #: whose index has another version, or none, gets one built from its entries when opened with its passphrase.
 SEARCH_INDEX_FORMAT = 1
+
+#: Version of the keyed term index (``entities_terms``) that a vault with a passphrase keeps when its file is
+#: not SQLCipher-encrypted. A vault whose term index has another version, or none, gets one built from its
+#: entries when opened. Bump it when the token derivation or the table layout changes.
+TERM_INDEX_FORMAT = 1
 
 # sqlcipher3 raises its own OperationalError, which is not sqlite3's.
 _OPERATIONAL_ERRORS = (sqlite3.OperationalError, sqlcipher3.OperationalError)
@@ -495,6 +502,7 @@ class SQLiteMemoryVault(MemoryVault):
         memory_security: bool = True,
         cache_mb: Optional[int] = None,
         verification_quorum: Optional[int] = None,
+        term_index: bool = True,
     ) -> None:
         """Open a vault. Entry content is encrypted by default.
 
@@ -523,6 +531,11 @@ class SQLiteMemoryVault(MemoryVault):
         Under SQLCipher a page read from outside the cache is decrypted again, so search over a vault larger
         than the cache slows down; a cache that holds the vault's pages removes that cost. The cache holds
         decrypted pages in this process's memory.
+
+        Without SQLCipher, a vault with a passphrase keeps a keyed term index in its file so that search
+        does not open every entry (:meth:`_ensure_term_index`; SECURITY.md states what the tokens show).
+        ``term_index=False`` keeps no such index, removes one the file has, and searches as before: by
+        opening every entry into an index in memory, at a cost that grows with the vault.
         """
         self.db_path = str(db_path)
         if cache_mb is not None and int(cache_mb) <= 0:
@@ -560,6 +573,7 @@ class SQLiteMemoryVault(MemoryVault):
         self._legacy_signing_key = hashlib.sha256(f"kibisis-tenant-sig:{sig_seed}".encode("utf-8")).digest()
         self._signing_key = self._legacy_signing_key
         self._digest_key: Optional[bytes] = None
+        self._term_key: Optional[bytes] = None
         self._keyed = False
         self._integrity_format = 1
         self._converted_to_sqlcipher = False
@@ -590,8 +604,11 @@ class SQLiteMemoryVault(MemoryVault):
                 self._converted_to_sqlcipher = True
 
         self._search_index = False  # True once a SQLCipher vault's entry index is in use
-        self._scan_cache: Optional[Tuple[Tuple[int, int], Any]] = None  # in-memory index without SQLCipher
-        self._recent_recalls: Deque[Dict[str, Any]] = deque(maxlen=1000)  # K-R5 in-process recall log
+        self._term_index = False  # True once the keyed term index of a vault without SQLCipher is in use
+<<<<<<< HEAD
+=======
+        self._tokenizer: Optional[sqlite3.Connection] = None  # FTS5's tokenizer, for the term index
+>>>>>>> 16f214b (feat: keyed term index for a passphrase vault without SQLCipher (K-D))
         self._conn = sqlcipher3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         self._conn.row_factory = sqlcipher3.Row
         self._sqlcipher_active = False
@@ -620,12 +637,20 @@ class SQLiteMemoryVault(MemoryVault):
             salt = self._vault_salt()
             if crypto_provider is None:
                 self.crypto_provider = AESGCMCryptoEnvelopeProvider(salt=salt)
-            self._signing_key, self._digest_key = derive_integrity_keys(passphrase, salt)
+            self._signing_key, self._digest_key, self._term_key = derive_vault_keys(passphrase, salt)
             self._keyed = True
             try:
                 self._upgrade_integrity()
                 if self._sqlcipher_active:
                     self._ensure_search_index()
+                elif term_index:
+                    self._ensure_term_index()
+                elif self._has_meta_key("term_index_format"):
+                    with self._write_tx() as cursor:  # opened with term_index=False: leave no tokens behind
+                        for trigger in ("entities_search_ai", "entities_search_au", "entities_search_ad"):
+                            cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                        cursor.execute("DROP TABLE IF EXISTS entities_search_dirty")
+                        self._drop_term_index(cursor)
             except BaseException:
                 self._conn.close()
                 raise
@@ -1094,7 +1119,7 @@ class SQLiteMemoryVault(MemoryVault):
             "UPDATE entities SET content = ?, is_encrypted = ?, encrypted_envelope_json = ?, tenant_sig = ? WHERE id = ?",
             (stored, is_encrypted, envelope_json, signature, r["id"]),
         )
-        if self._search_index:
+        if self._search_index or self._term_index:
             self._index_entry(cursor, r["id"], r["category"], r["key"], content, r["scope"])
 
     def _open_entry(self, r: Any) -> str:
@@ -1864,7 +1889,7 @@ class SQLiteMemoryVault(MemoryVault):
                         stored_origin, stored_source_ref, stored_confidence, entity_id
                     ),
                 )
-            if self._search_index:
+            if self._search_index or self._term_index:
                 self._index_entry(cursor, entity_id, category, key, content, scope)
 
             # Record hash-chained mutation audit event
@@ -2408,12 +2433,14 @@ class SQLiteMemoryVault(MemoryVault):
 
         ``match="all"`` (the default) wants every word of the query. ``match="any"`` wants at least one and
         leaves out common words such as "what" and "the": use it for questions in natural language. A word
-        also matches longer words that start with it.
+        also matches longer words that start with it, except in a vault with a passphrase whose file is not
+        SQLCipher-encrypted, which matches whole words only (below).
 
         A vault with a passphrase ranks its sealed entries with the scores a plaintext vault would give
         them. With SQLCipher it searches an index of entry terms kept inside the encrypted file. Without
-        SQLCipher no entry terms are written to disk: it builds an index in memory by opening every entry,
-        and builds it again after the vault changes.
+        SQLCipher no entry word is written to disk: it keeps an index of keyed tokens of the words, looks
+        the query's words up there and opens only the entries it returns (``term_index=False`` at open
+        searches by opening every entry instead, at a cost that grows with the vault).
         """
         terms, rows = self._ranked_rows(
             query, category, limit, scope, epistemic_state, as_of_valid_time, include_unverified, active_only,
@@ -2660,6 +2687,8 @@ class SQLiteMemoryVault(MemoryVault):
         )
         if self._search_index:
             rows = self._indexed_rows(fts_query, filter_sql, filter_params, limit, columns)
+        elif self._term_index:
+            rows = self._term_rows(terms, match, target_scope, filter_sql, filter_params, limit, columns)
         elif self.crypto_provider is not None and self.passphrase:
             rows = self._scanned_rows(fts_query, filter_sql, filter_params, limit, columns)
         else:
@@ -2759,6 +2788,101 @@ class SQLiteMemoryVault(MemoryVault):
         ).fetchall()
         return [(r, r["score"], None) for r in rows]
 
+    def _term_rows(
+        self,
+        terms: List[str],
+        match: str,
+        target_scope: str,
+        filter_sql: str,
+        params: List[Any],
+        limit: int,
+        columns: str = _ENTITY_COLUMNS,
+    ) -> List[Tuple[Any, float, Optional[str]]]:
+        """Ranked rows from the keyed term index (:meth:`_ensure_term_index`): a vault with a passphrase
+        whose file is not SQLCipher-encrypted.
+
+        Each query word is a phrase of one or more tokens ("us-east-1" is three, adjacent). A row's score
+        is the BM25 that FTS5's ``rank`` computes (k1 = 1.2, b = 0.75, every column weighted 1): for each
+        phrase, the inverse document frequency over every indexed entry, whatever its scope and whatever
+        the filters, as FTS5 counts over its whole table, times a saturating function of the phrase's
+        instances in the row and of the row's length against the average. So scores equal a plaintext
+        vault's for whole-word queries. Lower is better; ties fall to the lower id, as the other paths order.
+        Only the rows this returns are opened, by the caller.
+        """
+        try:
+            self._drain_search_queue()
+        except _OPERATIONAL_ERRORS as exc:  # another connection holds the write lock: search what is indexed
+            logger.debug("kibisis: searching before queued entries were indexed: %s", exc)
+        phrases = [self._tokens(t) for t in terms]
+        if not all(phrases):  # a word in which the tokenizer finds no token matches nothing
+            if match == "all":
+                return []
+            phrases = [p for p in phrases if p]
+            if not phrases:
+                return []
+        n_row, n_token = self._conn.execute(
+            "SELECT count(*), coalesce(sum(ntok), 0) FROM entities_terms_docs"
+        ).fetchone()
+        if not n_row:
+            return []
+        scopes = [r[0] for r in self._conn.execute("SELECT DISTINCT scope FROM entities").fetchall()]
+        searched = scopes if target_scope == "*" else [target_scope]
+        idfs: List[float] = []
+        hits: List[Dict[int, Tuple[int, int]]] = []  # per phrase: id -> (instances in the row, row length)
+        for phrase in phrases:
+            joins = " ".join(
+                f"JOIN entities_terms t{k} ON t{k}.id = t0.id AND t{k}.pos = t0.pos + {k} AND t{k}.token = ?"
+                for k in range(1, len(phrase))
+            )
+            n_hit = 0
+            found: Dict[int, Tuple[int, int]] = {}
+            for scope in scopes:
+                tokens = [self._term_token(scope, word) for word in phrase]
+                n_hit += self._conn.execute(
+                    f"SELECT count(DISTINCT t0.id) FROM entities_terms t0 {joins} WHERE t0.token = ?",
+                    [*tokens[1:], tokens[0]],
+                ).fetchone()[0]
+                if scope not in searched:
+                    continue
+                for row in self._conn.execute(
+                    f"SELECT t0.id, count(*), d.ntok FROM entities_terms t0 {joins} "
+                    f"JOIN entities_terms_docs d ON d.id = t0.id JOIN entities e ON e.id = t0.id "
+                    f"WHERE t0.token = ? AND {filter_sql} GROUP BY t0.id",
+                    [*tokens[1:], tokens[0], *params],
+                ):
+                    found[row[0]] = (row[1], row[2])
+            idf = math.log((n_row - n_hit + 0.5) / (n_hit + 0.5))
+            idfs.append(idf if idf > 0.0 else 1e-6)
+            hits.append(found)
+        if match == "all":
+            ids = set.intersection(*(set(found) for found in hits))
+        else:
+            ids = set().union(*(set(found) for found in hits))
+        if not ids:
+            return []
+        k1, b = 1.2, 0.75
+        avgdl = n_token / n_row
+        scored: List[Tuple[float, int]] = []
+        for entity_id in ids:
+            score = 0.0
+            length = None
+            for idf, found in zip(idfs, hits):
+                if entity_id not in found:
+                    continue  # this phrase adds nothing to the row's score
+                freq, length = found[entity_id]
+                score += idf * ((freq * (k1 + 1.0)) / (freq + k1 * (1 - b + b * length / avgdl)))
+            scored.append((-1.0 * score, entity_id))
+        scored.sort()
+        ranked = scored[:limit]
+        marks = ", ".join("?" for _ in ranked)
+        stored = {
+            r["id"]: r
+            for r in self._conn.execute(
+                f"SELECT {columns} FROM entities e WHERE e.id IN ({marks})", [entity_id for _, entity_id in ranked]
+            ).fetchall()
+        }
+        return [(stored[entity_id], score, None) for score, entity_id in ranked if entity_id in stored]
+
     def _scanned_rows(
         self, fts_query: str, filter_sql: str, params: List[Any], limit: int, columns: str = _ENTITY_COLUMNS
     ) -> List[Tuple[Any, float, Optional[str]]]:
@@ -2832,29 +2956,15 @@ class SQLiteMemoryVault(MemoryVault):
         if current is None or int(current) != SEARCH_INDEX_FORMAT:
             try:
                 with self._write_tx() as cursor:
-                    for trigger in ("entities_search_ai", "entities_search_au", "entities_search_ad"):
-                        cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
                     cursor.execute("DROP TABLE IF EXISTS entities_search")
                     cursor.execute(
                         "CREATE VIRTUAL TABLE entities_search USING fts5("
                         "category, key, content, scope, content='', contentless_delete=1)"
                     )
-                    cursor.execute("CREATE TABLE IF NOT EXISTS entities_search_dirty (id INTEGER PRIMARY KEY)")
-                    cursor.execute(
-                        "CREATE TRIGGER entities_search_ai AFTER INSERT ON entities BEGIN "
-                        "INSERT OR IGNORE INTO entities_search_dirty (id) VALUES (new.id); END"
-                    )
-                    cursor.execute(
-                        "CREATE TRIGGER entities_search_au AFTER UPDATE OF category, key, content, scope, "
-                        "is_encrypted, encrypted_envelope_json, tenant_sig ON entities BEGIN "
-                        "INSERT OR IGNORE INTO entities_search_dirty (id) VALUES (new.id); END"
-                    )
-                    cursor.execute(
-                        "CREATE TRIGGER entities_search_ad AFTER DELETE ON entities BEGIN "
-                        "DELETE FROM entities_search WHERE rowid = old.id; "
-                        "DELETE FROM entities_search_dirty WHERE id = old.id; END"
-                    )
-                    cursor.execute("INSERT OR IGNORE INTO entities_search_dirty (id) SELECT id FROM entities")
+                    self._create_index_queue(cursor, "DELETE FROM entities_search WHERE rowid = old.id; ")
+                    # A file converted to SQLCipher may carry the keyed term index of its plain days: the
+                    # FTS5 index replaces it.
+                    self._drop_term_index(cursor)
                     self._set_meta(cursor, "search_index_format", SEARCH_INDEX_FORMAT)
             except _OPERATIONAL_ERRORS as exc:
                 text = str(exc).lower()
@@ -2866,12 +2976,119 @@ class SQLiteMemoryVault(MemoryVault):
         self._search_index = True
         self._drain_search_queue()
 
+    def _ensure_term_index(self) -> None:
+        """Keep a keyed term index in a file that SQLCipher does not encrypt, so that search on a vault
+        with a passphrase looks up the query's words instead of opening every entry.
+
+        ``entities_terms`` holds, for each indexed entry, one row per word of its category, key, content
+        and scope: the word's position and its token, the first 16 hex characters of HMAC-SHA256 under
+        the vault's term key (:func:`derive_vault_keys`) of the entry's scope, a NUL byte and the word as
+        FTS5's unicode61 tokenizer folds it. ``entities_terms_docs`` holds each entry's word count. No
+        word reaches the file in the clear, and without the passphrase a token cannot be tested against a
+        guessed word; what the file does show is the shape of the text, see SECURITY.md. Search tags the
+        query's words the same way, reads the rows of those tokens, scores them with the BM25 formula
+        FTS5 uses (whole-vault statistics, so scores equal a plaintext vault's) and opens only the
+        entries it returns. Whole words only: a token says nothing about the tokens of longer words, so
+        a query word does not match words that start with it in this mode, as it does in the others.
+
+        The same triggers as the SQLCipher index queue every row whose text changes, so rows that a
+        process running an older kibisis writes without feeding the index are indexed before the next
+        search. A vault without the index, or with one of another version, gets one built by opening
+        each entry once. Sub-linear in the vault: a query costs its words' rows, not the file.
+        """
+        current = self._meta("term_index_format")
+        if current is None or int(current) != TERM_INDEX_FORMAT:
+            with self._write_tx() as cursor:
+                self._drop_term_index(cursor)
+                cursor.execute("CREATE TABLE entities_terms (token TEXT NOT NULL, id INTEGER NOT NULL, pos INTEGER NOT NULL)")
+                cursor.execute("CREATE INDEX entities_terms_token ON entities_terms (token, id, pos)")
+                cursor.execute("CREATE INDEX entities_terms_id ON entities_terms (id)")
+                cursor.execute("CREATE TABLE entities_terms_docs (id INTEGER PRIMARY KEY, ntok INTEGER NOT NULL)")
+                self._create_index_queue(
+                    cursor,
+                    "DELETE FROM entities_terms WHERE id = old.id; DELETE FROM entities_terms_docs WHERE id = old.id; ",
+                )
+                self._set_meta(cursor, "term_index_format", TERM_INDEX_FORMAT)
+        self._term_index = True
+        self._drain_search_queue()
+
+    @staticmethod
+    def _create_index_queue(cursor: Any, on_delete: str) -> None:
+        """(Re)create the queue of rows to index, ``entities_search_dirty``, and the triggers that feed it:
+        every inserted row and every row whose text changes is queued; ``on_delete`` runs when a row is
+        deleted, before its queue entry goes."""
+        for trigger in ("entities_search_ai", "entities_search_au", "entities_search_ad"):
+            cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        cursor.execute("CREATE TABLE IF NOT EXISTS entities_search_dirty (id INTEGER PRIMARY KEY)")
+        cursor.execute(
+            "CREATE TRIGGER entities_search_ai AFTER INSERT ON entities BEGIN "
+            "INSERT OR IGNORE INTO entities_search_dirty (id) VALUES (new.id); END"
+        )
+        cursor.execute(
+            "CREATE TRIGGER entities_search_au AFTER UPDATE OF category, key, content, scope, "
+            "is_encrypted, encrypted_envelope_json, tenant_sig ON entities BEGIN "
+            "INSERT OR IGNORE INTO entities_search_dirty (id) VALUES (new.id); END"
+        )
+        cursor.execute(
+            "CREATE TRIGGER entities_search_ad AFTER DELETE ON entities BEGIN "
+            + on_delete
+            + "DELETE FROM entities_search_dirty WHERE id = old.id; END"
+        )
+        cursor.execute("INSERT OR IGNORE INTO entities_search_dirty (id) SELECT id FROM entities")
+
+    @staticmethod
+    def _drop_term_index(cursor: Any) -> None:
+        cursor.execute("DROP TABLE IF EXISTS entities_terms")
+        cursor.execute("DROP TABLE IF EXISTS entities_terms_docs")
+        cursor.execute("DELETE FROM vault_meta WHERE key = 'term_index_format'")
+
+    def _tokens(self, text: str) -> List[str]:
+        """The words of ``text`` in order, as FTS5's default tokenizer (unicode61) splits and folds them,
+        read back through an ``fts5vocab`` table, so the term index and the FTS5 indexes agree on what a
+        word is and on how many a text has."""
+        with self._tokenizer_lock:
+            if self._tokenizer is None:
+                self._tokenizer = sqlite3.connect(":memory:", check_same_thread=False)
+                self._tokenizer.execute("CREATE VIRTUAL TABLE t USING fts5(x)")
+                self._tokenizer.execute("CREATE VIRTUAL TABLE tv USING fts5vocab(t, 'instance')")
+            self._tokenizer.execute("DELETE FROM t")
+            self._tokenizer.execute("INSERT INTO t (rowid, x) VALUES (1, ?)", (text,))
+            return [r[0] for r in self._tokenizer.execute("SELECT term FROM tv ORDER BY offset").fetchall()]
+
+    def _term_token(self, scope: str, word: str) -> str:
+        """The term index token of ``word`` (already folded by :meth:`_tokens`) in ``scope``."""
+        if self._term_key is None:
+            raise EncryptionRequiredError("The term index needs a vault opened with its passphrase.")
+        tag = hmac.new(self._term_key, scope.encode("utf-8") + b"\x00" + word.encode("utf-8"), hashlib.sha256)
+        return tag.hexdigest()[:16]
+
     def _index_entry(self, cursor: Any, entity_id: int, category: str, key: str, content: str, scope: str) -> None:
         """Put an entry's terms in the entry index, in place of any it had there."""
-        cursor.execute(
-            "INSERT OR REPLACE INTO entities_search (rowid, category, key, content, scope) VALUES (?, ?, ?, ?, ?)",
-            (entity_id, category, key, content, scope),
-        )
+        if self._search_index:
+            cursor.execute(
+                "INSERT OR REPLACE INTO entities_search (rowid, category, key, content, scope) VALUES (?, ?, ?, ?, ?)",
+                (entity_id, category, key, content, scope),
+            )
+        elif self._term_index:
+            rows: List[Tuple[str, int, int]] = []
+            pos = 0
+            for column in (category, key, content, scope):
+                for word in self._tokens(column):
+                    rows.append((self._term_token(scope, word), entity_id, pos))
+                    pos += 1
+                pos += 1  # a gap, so no phrase spans two columns (FTS5 matches phrases within one column)
+            cursor.execute("DELETE FROM entities_terms WHERE id = ?", (entity_id,))
+            cursor.executemany("INSERT INTO entities_terms (token, id, pos) VALUES (?, ?, ?)", rows)
+            cursor.execute("INSERT OR REPLACE INTO entities_terms_docs (id, ntok) VALUES (?, ?)", (entity_id, len(rows)))
+        cursor.execute("DELETE FROM entities_search_dirty WHERE id = ?", (entity_id,))
+
+    def _unindex_entry(self, cursor: Any, entity_id: int) -> None:
+        """Take an entry out of the entry index and the queue: deleted, or failed its integrity check."""
+        if self._search_index:
+            cursor.execute("DELETE FROM entities_search WHERE rowid = ?", (entity_id,))
+        elif self._term_index:
+            cursor.execute("DELETE FROM entities_terms WHERE id = ?", (entity_id,))
+            cursor.execute("DELETE FROM entities_terms_docs WHERE id = ?", (entity_id,))
         cursor.execute("DELETE FROM entities_search_dirty WHERE id = ?", (entity_id,))
 
     def _index_queued(self, cursor: Any) -> int:
@@ -2885,15 +3102,14 @@ class SQLiteMemoryVault(MemoryVault):
             ).fetchone()
             content = None if r is None else self._readable_content(r)
             if content is None:  # deleted, or failed its integrity check: keep it out of the index
-                cursor.execute("DELETE FROM entities_search WHERE rowid = ?", (entity_id,))
-                cursor.execute("DELETE FROM entities_search_dirty WHERE id = ?", (entity_id,))
+                self._unindex_entry(cursor, entity_id)
             else:
                 self._index_entry(cursor, entity_id, r["category"], r["key"], content, r["scope"])
         return len(ids)
 
     def _drain_search_queue(self) -> None:
         """Index the rows written since the last search by a process that did not feed the index."""
-        if not self._search_index:
+        if not (self._search_index or self._term_index):
             return
         if not self._conn.execute("SELECT EXISTS (SELECT 1 FROM entities_search_dirty)").fetchone()[0]:
             return
@@ -2903,10 +3119,15 @@ class SQLiteMemoryVault(MemoryVault):
     def _rebuild_search_index(self) -> None:
         """Build the entry index again from the entries, so that no deleted or replaced terms stay in it."""
         with self._write_tx() as cursor:
-            cursor.execute("INSERT INTO entities_search (entities_search) VALUES ('delete-all')")
+            if self._search_index:
+                cursor.execute("INSERT INTO entities_search (entities_search) VALUES ('delete-all')")
+            else:
+                cursor.execute("DELETE FROM entities_terms")
+                cursor.execute("DELETE FROM entities_terms_docs")
             cursor.execute("INSERT OR IGNORE INTO entities_search_dirty (id) SELECT id FROM entities")
             self._index_queued(cursor)
-            cursor.execute("INSERT INTO entities_search (entities_search) VALUES ('optimize')")
+            if self._search_index:
+                cursor.execute("INSERT INTO entities_search (entities_search) VALUES ('optimize')")
 
     @staticmethod
     def _entity(r: Any, content: str) -> MemoryEntity:
@@ -3414,7 +3635,7 @@ class SQLiteMemoryVault(MemoryVault):
         self._conn.execute("INSERT INTO entities_fts(entities_fts) VALUES ('rebuild')")
         self._conn.execute("INSERT INTO entities_fts(entities_fts) VALUES ('optimize')")
         self._conn.commit()
-        if self._search_index:
+        if self._search_index or self._term_index:
             self._rebuild_search_index()
         if self.db_path != ":memory:":
             self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -4019,4 +4240,7 @@ class SQLiteMemoryVault(MemoryVault):
         if self._scan_cache is not None:
             self._scan_cache[1].close()
             self._scan_cache = None
+        if self._tokenizer is not None:
+            self._tokenizer.close()
+            self._tokenizer = None
         self._conn.close()

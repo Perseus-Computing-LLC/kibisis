@@ -1,9 +1,9 @@
 """Ranked search over sealed entries (0.1.0a7).
 
 With SQLCipher, kibisis keeps a contentless FTS5 index of entry text inside the encrypted database file.
-Without SQLCipher it never writes entry terms to disk: search ranks an in-memory index of the decrypted
-entries. Either way a vault with a passphrase ranks results with the same BM25 scores as a plaintext
-vault holding the same entries.
+Without SQLCipher it never writes entry words to disk: it keeps a keyed term index (K-D, see
+test_term_index_kd.py) and matches whole words only. Either way a vault with a passphrase ranks results
+with the same BM25 scores as a plaintext vault holding the same entries.
 """
 import json
 import shutil
@@ -44,6 +44,10 @@ CORPUS = [
 ]
 ALL_QUERIES = ["paris", "alice", "budget", "moved", "alice paris", "budget review", "us-east-1", "project", "denver", "team"]
 ANY_QUERIES = ["where did alice move", "when is the budget review", "what does carol prefer", "paris rome coffee"]
+# Queries that a plaintext vault answers through a prefix match ("project"* is "projects", "move"* is
+# "moved", "prefer"* is "prefers"). The keyed term index of a vault without SQLCipher matches whole words
+# only (K-D), so these rank differently there; tests/test_term_index_kd.py pins that difference.
+PREFIX_QUERIES = {"project", "where did alice move", "what does carol prefer"}
 
 
 @pytest.fixture(autouse=True)
@@ -83,14 +87,17 @@ def test_sealed_entries_rank_like_plaintext(tmp_path, monkeypatch, kind):
     _fill(vault)
     _fill(plain)
     assert vault._conn.execute("SELECT count(*) FROM entities WHERE is_encrypted = 1").fetchone()[0] == len(CORPUS)
+    skipped = PREFIX_QUERIES if kind == "fallback" else set()
     for query in ALL_QUERIES:
         expected = _ranking(plain, query)
         assert expected, query
-        assert _ranking(vault, query) == expected, query
+        if query not in skipped:
+            assert _ranking(vault, query) == expected, query
     for query in ANY_QUERIES:
         expected = _ranking(plain, query, match="any")
         assert expected, query
-        assert _ranking(vault, query, match="any") == expected, query
+        if query not in skipped:
+            assert _ranking(vault, query, match="any") == expected, query
     # Scores are BM25, not a placeholder: the note that repeats "paris" ranks first.
     top = vault.search("paris", limit=10)
     assert top[0].entity.key == "paris_note"
@@ -104,8 +111,8 @@ def test_sealed_entries_rank_like_plaintext(tmp_path, monkeypatch, kind):
 def test_any_mode_finds_a_question_that_all_mode_misses(tmp_path, monkeypatch, kind):
     vault = _open(kind, tmp_path / "v.db", monkeypatch)
     _fill(vault)
-    assert vault.search("Where did Alice move?") == []
-    results = vault.search("Where did Alice move?", match="any")
+    assert vault.search("Where has Alice moved?") == []
+    results = vault.search("Where has Alice moved?", match="any")
     assert results[0].entity.key == "trip_2023"
     with pytest.raises(ValueError):
         vault.search("alice", match="some")

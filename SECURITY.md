@@ -17,7 +17,7 @@ Subject: `[SECURITY] Kibisis Vulnerability Report`
 
 ## Scope
 - **Python package:** each entry's content is sealed with AES-256-GCM under a key derived with PBKDF2-HMAC-SHA256 (600,000 iterations). An on-disk vault will not open without a passphrase unless you pass `allow_plaintext=True`. With `sqlcipher3` installed, SQLCipher also encrypts the whole database file, including categories, keys and metadata. Without it, those fields are stored in plain text and Kibisis logs a warning. With or without SQLCipher, each entry is signed with a key derived from the passphrase by PBKDF2 and its sealed content is bound to the entry, so entries cannot be swapped or altered without the passphrase, and the value digests kept in the journal and in tombstones are keyed, so they do not reveal short values.
-- **Search index:** with SQLCipher, a vault with a passphrase keeps a full-text index of entry content in the database file so that search can rank sealed entries. It holds each entry's words and their positions, enough to rebuild the entry's text without case or punctuation, and SQLCipher's whole-file encryption protects it, not the entry's AES-256-GCM seal; both keys come from the passphrase. Without SQLCipher, entry words are never written to disk: search builds its index in memory. Words of deleted or replaced entries stay in index pages until `scrub()` rebuilds the index (the MCP server's forget runs it).
+- **Search index:** with SQLCipher, a vault with a passphrase keeps a full-text index of entry content in the database file so that search can rank sealed entries. It holds each entry's words and their positions, enough to rebuild the entry's text without case or punctuation, and SQLCipher's whole-file encryption protects it, not the entry's AES-256-GCM seal; both keys come from the passphrase. Without SQLCipher, entry words are never written to disk: search uses an index of keyed tokens of the words (HMAC under a passphrase-derived key), whose shape, not content, is readable from the file; see the threat model. Words of deleted or replaced entries stay in index pages until `scrub()` rebuilds the index (the MCP server's forget runs it).
 - **Rust crate:** holds memory in RAM and does not encrypt it.
 - **Leases:** Rust's `InMemoryLeaseCoordinator` coordinates threads in one process. Rust's `FileLeaseCoordinator` and Python's `SQLiteLeaseCoordinator` coordinate processes on one machine that share a directory or an SQLite file on a local filesystem. None of them is a distributed lock. A Python vault opened with `enforce_fencing=True` refuses writes that do not carry the current fencing token; otherwise it checks a token only when a call passes one. The MCP server and the Rust crate do not check tokens.
 - **Not covered:** a running process that already holds the key, or a weak passphrase.
@@ -93,6 +93,16 @@ also stored in plain text.
   journal's categories, keys and author ids, and the `entities_fts` index of category, key and scope terms
   (created at vault.py L792). The content column of a sealed row is empty (`_seal`, L992), so entry text and
   its terms are not in that index.
+- *Reading the shape of the text from the keyed term index.* The index (`entities_terms`, K-D) holds, for
+  each entry, the sequence of its words as tokens: 16 hex characters of HMAC-SHA256, under a key derived
+  from the passphrase (`derive_vault_keys`, crypto.py), of the entry's scope and the folded word. Without the
+  passphrase a token cannot be tested against a guessed word (each guess would cost the PBKDF2 stretch, as
+  for sealed content), and the same word has another token in another scope and in another vault. What
+  the file does show is structure: how many words each entry has, which entries in one scope share a word,
+  how often each token occurs and in what order. Word-frequency and co-occurrence analysis, and a known
+  entry's text, let a file reader tell which other entries mention the same words. This is the known
+  cost of a searchable encrypted index; a vault that must not show it opens with `term_index=False`
+  (search then opens every entry, as before K-D) or installs `sqlcipher3`.
 
 ### Agent-side writer (a model, through MCP or the library)
 
@@ -164,10 +174,10 @@ in one of two reduced modes. `_ranked_rows` (L2059) picks the search path:
 | Mode | Entry text on disk | Entry terms on disk | Categories, keys, metadata, states, journal |
 |---|---|---|---|
 | No passphrase (`allow_plaintext=True`) | Plain, in `entities.content` | Plain, in `entities_fts` (`_plaintext_rows`, L2129) | Plain |
-| Passphrase, no SQLCipher | Sealed (AES-GCM) | Not written: the index is built in process memory from decrypted entries (`_scan_index`, L2210) and rebuilt when the vault changes | Plain |
+| Passphrase, no SQLCipher | Sealed (AES-GCM) | Keyed tokens, in order, in `entities_terms` (`_ensure_term_index`): HMAC-SHA256 of scope and word under a passphrase-derived key, no word in the clear; see the term index item above for what their shape shows. With `term_index=False`: not written, the index is built in process memory from decrypted entries (`_scan_index`) and rebuilt when the vault changes | Plain |
 | Passphrase + SQLCipher | Sealed, inside an encrypted file | Inside the encrypted file: a contentless FTS5 table of words and positions, enough to rebuild each entry's text without case or punctuation (`_ensure_search_index`, L2245) | Encrypted with the file |
 
-In the middle row, the search index lives in a `:memory:` SQLite connection; it is as exposed as the rest of
-the process's memory and no more. In every mode, words of deleted or replaced entries stay in FTS5 index
-pages and free pages until `scrub()` (L2784) rebuilds the index and vacuums; the MCP server's `forget` runs
-it, the library does not run it for you.
+In the middle row with `term_index=False`, the search index lives in a `:memory:` SQLite connection; it is
+as exposed as the rest of the process's memory and no more. In every mode, words (or tokens) of deleted or
+replaced entries stay in index pages and free pages until `scrub()` (L2784) rebuilds the index and vacuums;
+the MCP server's `forget` runs it, the library does not run it for you.

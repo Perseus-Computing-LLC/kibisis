@@ -50,7 +50,7 @@ CORPUS = [
     ("ops", "oncall", "On-call rotates every Tuesday morning at 9:30."),
     ("ops", "patching", "Kernel patching happens on the first Friday of the month."),
     ("people", "erin", "Erin joined the platform team from Austin last May."),
-    ("people", "frank", "Frank reviews every budget draft before finance sees it."),
+    ("people", "frank", "Frank checks every budget draft before finance sees it."),
     ("food", "dinner", "Team dinner is at the Rome cafe near the office on Thursday."),
     ("food", "snacks", "Snacks are restocked on Friday; peanuts stay out because of allergies."),
     ("health", "sleep", "Carol sleeps eight hours and runs before the standup."),
@@ -73,7 +73,7 @@ CORPUS = [
     ("notes", "empty_ish", "Nothing."),
 ]
 ALL_QUERIES = ["paris", "alice", "budget", "moved", "alice paris", "budget review", "us-east-1", "denver", "team", "9:30"]
-ANY_QUERIES = ["where did alice go", "when is the budget review", "what does carol like", "paris rome coffee", "tokyo october"]
+ANY_QUERIES = ["where did alice go", "when is the budget review", "which city is carol from", "paris rome coffee", "tokyo october"]
 
 
 @pytest.fixture(autouse=True)
@@ -177,9 +177,13 @@ def test_term_index_matches_whole_words_only(tmp_path, no_sqlcipher):
     plain = SQLiteMemoryVault(str(tmp_path / "plain.db"), allow_plaintext=True)
     _fill(vault)
     _fill(plain)
-    assert {r.entity.key for r in plain.search("project")} == {"atlas", "hermes", "zephyr"}  # "projects" too
-    assert {r.entity.key for r in vault.search("project")} == {"atlas", "hermes"}
-    assert {r.entity.key for r in vault.search("projects")} == {"atlas", "hermes", "zephyr", "borealis", "cascade", "delta", "echo"}
+    projects = {"atlas", "hermes", "zephyr", "borealis", "cascade", "delta", "echo"}  # the "projects" category
+    assert {r.entity.key for r in plain.search("project")} == projects  # "project"* matches "projects"
+    assert {r.entity.key for r in vault.search("project")} == {"atlas", "hermes"}  # the whole word, in content
+    assert {r.entity.key for r in vault.search("projects")} == projects
+    assert [r.entity.key for r in vault.search("budget review")] == [r.entity.key for r in plain.search("budget review")]
+    assert [r.entity.key for r in plain.search("budget check")] == ["frank"]  # prefix: "check"* matches "checks"
+    assert vault.search("budget check") == []  # no entry holds the whole word "check"
     assert vault.search("pari") == [] and plain.search("pari") != []
     vault.close()
     plain.close()
@@ -392,4 +396,27 @@ def test_sqlcipher_and_plaintext_vaults_keep_no_term_table(tmp_path, monkeypatch
     assert vault._sqlcipher_active and not vault._term_index
     names = [r[0] for r in vault._conn.execute("SELECT name FROM sqlite_master")]
     assert "entities_terms" not in names
+    vault.close()
+
+
+def test_term_index_can_be_left_off(tmp_path, no_sqlcipher):
+    """``term_index=False`` keeps the former posture: no tokens in the file, search opens every entry."""
+    path = tmp_path / "v.db"
+    vault = _open(path)
+    _fill(vault)
+    before = {q: _ranking(vault, q) for q in ALL_QUERIES}
+    vault.close()
+    vault = _open(path, term_index=False)
+    assert not vault._term_index
+    tables, values = _raw_text(path)
+    assert "entities_terms" not in tables and "entities_search_dirty" not in tables
+    assert vault._meta("term_index_format") is None
+    assert {q: _ranking(vault, q) for q in ALL_QUERIES} == before
+    assert len(vault.search("project")) == 7  # prefix matches again: "project"* is the "projects" category
+    vault.put("notes", "late", "a kumquat written without the index", epistemic_state="verified")
+    assert [r.entity.key for r in vault.search("kumquat")] == ["late"]
+    vault.close()
+    vault = _open(path)  # the next open with the index builds it again, including the row written without it
+    assert _doc_count(vault) == len(CORPUS) + 1
+    assert [r.entity.key for r in vault.search("kumquat")] == ["late"]
     vault.close()
