@@ -185,7 +185,8 @@ class TestConfig(unittest.TestCase):
         self.assertNotIn("/opt/data", default_db_path({"HOME": "/home/u"}, "linux"))
 
     def test_scope_validation(self):
-        self.assertEqual(resolve_scope({}), "default")
+        with tempfile.TemporaryDirectory() as tmp:  # K-J: outside a git checkout the scope is default
+            self.assertEqual(resolve_scope({}, cwd=tmp), "default")
         self.assertEqual(resolve_scope({"KIBISIS_SCOPE": "team-a"}), "team-a")
         for bad in ("*", "", " ", "a b", "x" * 200, "a*"):
             with self.subTest(scope=bad):

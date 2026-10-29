@@ -10,8 +10,10 @@ Environment variables:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Mapping, Optional
@@ -65,10 +67,54 @@ def validate_scope(scope: str) -> str:
     return scope
 
 
-def resolve_scope(env: Optional[Mapping[str, str]] = None) -> str:
-    """``KIBISIS_SCOPE`` if set, else ``default``. Wildcards and empty values are refused."""
+GLOBAL_SCOPE = "global"
+_SCOPE_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def git_root(cwd: Optional[str] = None) -> Optional[str]:
+    """Absolute path of the git checkout containing ``cwd``, or None when there is none."""
+    start = os.path.abspath(cwd or os.getcwd())
+    if not os.path.isdir(start):
+        return None
+    try:
+        out = subprocess.run(
+            ["git", "-C", start, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    root = out.stdout.strip()
+    return os.path.realpath(root) if root else None
+
+
+def project_scope_for(root: str) -> str:
+    """The scope a checkout at ``root`` gets: ``project:<name>-<8 hex of the root path>``.
+
+    The name is the directory's basename reduced to scope-safe characters; the digest keeps two
+    checkouts with the same name at different paths apart and makes every subdirectory agree."""
+    real = os.path.realpath(root)
+    name = _SCOPE_SAFE.sub("-", os.path.basename(real)).strip("-") or "repo"
+    digest = hashlib.sha256(real.encode("utf-8")).hexdigest()[:8]
+    return validate_scope(f"project:{name[:64]}-{digest}")
+
+
+def resolve_scope(env: Optional[Mapping[str, str]] = None, cwd: Optional[str] = None) -> str:
+    """The scope a process works in (K-J).
+
+    ``KIBISIS_SCOPE`` wins when set (``global`` is only ever reached this way). Otherwise, inside a git
+    checkout the scope is that project's (:func:`project_scope_for` of the root), and outside one it is
+    ``default``. Wildcards and empty values are refused.
+    """
     env = os.environ if env is None else env
-    return validate_scope(env.get(ENV_SCOPE, DEFAULT_SCOPE))
+    explicit = env.get(ENV_SCOPE)
+    if explicit is not None:
+        return validate_scope(explicit)
+    root = git_root(cwd)
+    if root is not None:
+        return project_scope_for(root)
+    return DEFAULT_SCOPE
 
 
 def plaintext_allowed(env: Optional[Mapping[str, str]] = None) -> bool:

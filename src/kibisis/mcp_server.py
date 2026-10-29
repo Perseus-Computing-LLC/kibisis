@@ -5,7 +5,8 @@ clients such as Claude Desktop, Cursor, VS Code and Codex. Run it with ``python 
 
 The server, not the model, decides scope, identity and trust:
 
-- **Scope** is fixed when the server starts (``KIBISIS_SCOPE``, default ``default``). Tools take no
+- **Scope** is fixed when the server starts: ``KIBISIS_SCOPE`` if set (``global`` only this way), else
+  the project scope derived from the git checkout the server runs in, else ``default``. Tools take no
   scope argument. A call that names a different scope, a wildcard or an empty scope is refused, and
   the refusal is written to the audit journal.
 - **Trust.** Every write is recorded with author ``mcp-agent`` and stored as a ``candidate`` at most,
