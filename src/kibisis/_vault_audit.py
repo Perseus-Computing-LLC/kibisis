@@ -22,7 +22,6 @@ from .models import AuditEvent
 logger = logging.getLogger("kibisis.vault")
 
 
-
 #: Journal hash layout this version writes (``audit_journal.format``). Formats 1 and 2 hashed a
 #: ``':'``-joined string of eight fields and left ``metadata_json`` out, so a ``':'`` inside a category
 #: or key could alias another event and a rewritten reviewer or verdict passed verification. Format 3

@@ -35,7 +35,6 @@ from .protocols import EncryptionRequiredError
 logger = logging.getLogger("kibisis.vault")
 
 
-
 #: Integrity format this version writes (vault_meta 'integrity_format'). Format 2 binds sealed content
 #: to its entry, signs entries with a key derived by PBKDF2, keys the value digests kept in the journal
 #: and in tombstones, and refuses entries without a signature. A vault without the marker is upgraded
