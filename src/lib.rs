@@ -61,6 +61,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod file_lease;
+pub mod journal;
 
 pub use file_lease::FileLeaseCoordinator;
 
@@ -68,6 +69,15 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Compute SHA-256 hex digest using pure Rust (FIPS 180-4 compliant).
 pub fn sha256_hex(input: &[u8]) -> String {
+    let mut result = String::with_capacity(64);
+    for b in sha256(input) {
+        result.push_str(&format!("{b:02x}"));
+    }
+    result
+}
+
+/// Compute the SHA-256 digest bytes using pure Rust (FIPS 180-4 compliant).
+pub fn sha256(input: &[u8]) -> [u8; 32] {
     let mut h: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
         0x5be0cd19,
@@ -154,11 +164,11 @@ pub fn sha256_hex(input: &[u8]) -> String {
         h[7] = h[7].wrapping_add(h_var);
     }
 
-    let mut result = String::with_capacity(64);
-    for val in h {
-        result.push_str(&format!("{:08x}", val));
+    let mut out = [0u8; 32];
+    for (chunk, val) in out.chunks_exact_mut(4).zip(h) {
+        chunk.copy_from_slice(&val.to_be_bytes());
     }
-    result
+    out
 }
 
 /// Exact and canonical SHA-256 digests a tombstone records for a value.
@@ -341,6 +351,7 @@ impl MemoryEntity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditEvent {
     pub sequence: u64,
+    /// Whole seconds since the UNIX epoch.
     pub timestamp: u64,
     pub action: String,
     pub category: String,
@@ -350,6 +361,29 @@ pub struct AuditEvent {
     pub prev_hash: String,
     pub event_hash: String,
     pub author_id: Option<String>,
+    /// Canonical metadata JSON (sorted keys, compact), or `None` for no metadata. See
+    /// [`journal::EventFields::metadata_json`].
+    pub metadata_json: Option<String>,
+    /// Journal layout the row was hashed under; see [`journal::JOURNAL_FORMAT`].
+    pub format: u8,
+}
+
+impl AuditEvent {
+    /// The fields this event's hash covers, as [`journal::event_hash_v3`] takes them.
+    pub fn fields(&self) -> journal::EventFields<'_> {
+        journal::EventFields {
+            sequence: self.sequence,
+            timestamp: self.timestamp as f64,
+            action: &self.action,
+            category: &self.category,
+            key: &self.key,
+            scope: &self.scope,
+            value_sha256: &self.value_sha256,
+            prev_hash: &self.prev_hash,
+            author_id: self.author_id.as_deref(),
+            metadata_json: self.metadata_json.as_deref(),
+        }
+    }
 }
 
 /// Distributed concurrency lease granting single-writer privileges.
@@ -640,6 +674,8 @@ impl MemoryVault for InMemoryMemoryVault {
             prev_hash,
             event_hash,
             author_id: None,
+            metadata_json: None,
+            format: 0, // legacy ':'-joined layout
         });
 
         Ok(saved)
@@ -796,6 +832,8 @@ impl MemoryVault for InMemoryMemoryVault {
                 prev_hash,
                 event_hash,
                 author_id: None,
+                metadata_json: None,
+                format: 0, // legacy ':'-joined layout
             });
 
             return Ok(true);
@@ -910,6 +948,8 @@ impl MemoryVault for InMemoryMemoryVault {
                     prev_hash,
                     event_hash,
                     author_id: author_id.map(|s| s.to_string()),
+                    metadata_json: None,
+                    format: 0, // legacy ':'-joined layout
                 });
             }
         }

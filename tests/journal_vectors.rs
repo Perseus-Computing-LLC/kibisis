@@ -5,14 +5,17 @@
 //! with `kibisis::journal`, so the two implementations hash byte for byte alike or a test fails.
 
 use kibisis::journal::{
-    event_hash_v3, event_payload_v3, head_mac_v1, hmac_sha256_hex, json_quote, verify_chain, ChainError,
-    EventFields, JournalHead, GENESIS_HASH, HEAD_MAC_DOMAIN, JOURNAL_FORMAT,
+    event_hash_v3, event_payload_v3, head_mac_v1, hmac_sha256_hex, json_quote, verify_chain,
+    ChainError, EventFields, JournalHead, GENESIS_HASH, HEAD_MAC_DOMAIN, JOURNAL_FORMAT,
 };
 use kibisis::AuditEvent;
 use serde_json::Value;
 
 fn load() -> Value {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/journal_format3_vectors.json");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/journal_format3_vectors.json"
+    );
     let text = std::fs::read_to_string(path).expect("vector file");
     serde_json::from_str(&text).expect("vector json")
 }
@@ -62,9 +65,15 @@ fn fields<'a>(v: &'a Value, metadata_json: Option<&'a str>) -> EventFields<'a> {
 #[test]
 fn vector_file_header_matches_the_crate() {
     let data = load();
-    assert_eq!(data["journal_format"].as_u64().unwrap(), u64::from(JOURNAL_FORMAT));
+    assert_eq!(
+        data["journal_format"].as_u64().unwrap(),
+        u64::from(JOURNAL_FORMAT)
+    );
     assert_eq!(JOURNAL_FORMAT, 3);
-    assert_eq!(data["head_mac_domain"].as_str().unwrap().as_bytes(), HEAD_MAC_DOMAIN);
+    assert_eq!(
+        data["head_mac_domain"].as_str().unwrap().as_bytes(),
+        HEAD_MAC_DOMAIN
+    );
     assert_eq!(GENESIS_HASH, "0".repeat(64));
     assert!(data["events"].as_array().unwrap().len() >= 12);
 }
@@ -86,7 +95,11 @@ fn every_event_vector_rederives_byte_for_byte() {
         let hash = event_hash_v3(&f);
         assert_eq!(hash, s(v, "event_hash"), "{name}: event hash");
         let key = hex_to_bytes(s(v, "signing_key_hex"));
-        assert_eq!(head_mac_v1(&key, f.sequence, &hash), s(v, "head_mac"), "{name}: head mac");
+        assert_eq!(
+            head_mac_v1(&key, f.sequence, &hash),
+            s(v, "head_mac"),
+            "{name}: head mac"
+        );
     }
 }
 
@@ -110,7 +123,10 @@ fn hmac_sha256_matches_rfc_4231() {
     );
     // RFC 4231 test case 6: a key longer than the block size is hashed first.
     assert_eq!(
-        hmac_sha256_hex(&[0xaa; 131], b"Test Using Larger Than Block-Size Key - Hash Key First"),
+        hmac_sha256_hex(
+            &[0xaa; 131],
+            b"Test Using Larger Than Block-Size Key - Hash Key First"
+        ),
         "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
     );
 }
@@ -133,7 +149,10 @@ fn colon_join_ambiguity_is_resolved() {
         format!("{}:{}", s(&a, "category"), s(&a, "key")),
         format!("{}:{}", s(&b, "category"), s(&b, "key"))
     );
-    assert_ne!(event_hash_v3(&fields(&a, None)), event_hash_v3(&fields(&b, None)));
+    assert_ne!(
+        event_hash_v3(&fields(&a, None)),
+        event_hash_v3(&fields(&b, None))
+    );
 }
 
 // --- the chain vector: links, head, tail cut, mid-chain edit ----------------------------------------
@@ -179,7 +198,10 @@ fn chain_vector_verifies() {
     assert_eq!(events.len(), 5);
     assert!(events.iter().all(|e| e.format == 3));
     assert_eq!(verify_chain(&events, Some(&head), &key), Ok(()));
-    assert_eq!(JournalHead::sign(&key, head.sequence, &head.event_hash), head);
+    assert_eq!(
+        JournalHead::sign(&key, head.sequence, &head.event_hash),
+        head
+    );
     // An empty journal with no head is sound.
     assert_eq!(verify_chain(&[], None, &key), Ok(()));
 }
@@ -190,39 +212,67 @@ fn chain_vector_tail_cut_fails() {
     let cut = &events[..events.len() - 1];
     assert!(matches!(
         verify_chain(cut, Some(&head), &key),
-        Err(ChainError::TailCut { head_sequence: 5, last_sequence: Some(4) })
+        Err(ChainError::TailCut {
+            head_sequence: 5,
+            last_sequence: Some(4)
+        })
     ));
     assert!(matches!(
         verify_chain(&events[..3], Some(&head), &key),
-        Err(ChainError::TailCut { head_sequence: 5, last_sequence: Some(3) })
+        Err(ChainError::TailCut {
+            head_sequence: 5,
+            last_sequence: Some(3)
+        })
     ));
     // Every row removed, head left behind.
     assert!(matches!(
         verify_chain(&[], Some(&head), &key),
-        Err(ChainError::TailCut { head_sequence: 5, last_sequence: None })
+        Err(ChainError::TailCut {
+            head_sequence: 5,
+            last_sequence: None
+        })
     ));
     // Head removed: a format 3 journal must be anchored.
-    assert_eq!(verify_chain(&events, None, &key), Err(ChainError::MissingHead));
+    assert_eq!(
+        verify_chain(&events, None, &key),
+        Err(ChainError::MissingHead)
+    );
     // Re-pointing the head at the new last row needs the signing key.
     let forged = JournalHead {
         sequence: 4,
         event_hash: cut[3].event_hash.clone(),
         mac: "00".repeat(32),
     };
-    assert_eq!(verify_chain(cut, Some(&forged), &key), Err(ChainError::HeadMac));
+    assert_eq!(
+        verify_chain(cut, Some(&forged), &key),
+        Err(ChainError::HeadMac)
+    );
     let resigned = JournalHead::sign(&key, 4, &cut[3].event_hash);
     assert_eq!(verify_chain(cut, Some(&resigned), &key), Ok(()));
-    assert_eq!(verify_chain(cut, Some(&resigned), b"not the key"), Err(ChainError::HeadMac));
+    assert_eq!(
+        verify_chain(cut, Some(&resigned), b"not the key"),
+        Err(ChainError::HeadMac)
+    );
 }
 
 #[test]
 fn chain_vector_mid_chain_edit_fails() {
     let (events, head, key) = chain();
-    let edits: Vec<(&str, Box<dyn Fn(&mut AuditEvent)>)> = vec![
+    type Edit = Box<dyn Fn(&mut AuditEvent)>;
+    let edits: Vec<(&str, Edit)> = vec![
         ("key", Box::new(|e| e.key = "k9".into())),
-        ("author_id", Box::new(|e| e.author_id = Some("mallory".into()))),
-        ("metadata", Box::new(|e| e.metadata_json = Some(r#"{"reviewer":"mallory"}"#.into()))),
-        ("value_sha256", Box::new(|e| e.value_sha256 = "f".repeat(64))),
+        (
+            "author_id",
+            Box::new(|e| e.author_id = Some("mallory".into())),
+        ),
+        (
+            "metadata",
+            Box::new(|e| e.metadata_json = Some(r#"{"reviewer":"mallory"}"#.into())),
+        ),
+        (
+            "value_sha256",
+            Box::new(|e| e.value_sha256 = "f".repeat(64)),
+        ),
         ("timestamp", Box::new(|e| e.timestamp += 1)),
     ];
     for (name, edit) in edits {
@@ -247,6 +297,9 @@ fn chain_vector_mid_chain_edit_fails() {
     swapped.swap(0, 1);
     assert_eq!(
         verify_chain(&swapped, Some(&head), &key),
-        Err(ChainError::Sequence { index: 0, sequence: 2 })
+        Err(ChainError::Sequence {
+            index: 0,
+            sequence: 2
+        })
     );
 }
