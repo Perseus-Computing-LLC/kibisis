@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `SQLiteMemoryVault.evaluate_abstention(probes, answerable=, unanswerable=, search_fn=, k=, scope=)` and
+  `kibisis.Probe` (#20). Scores probes the vault must answer (query -> expected `category:key`) and probes it
+  must refuse, through any caller-supplied `search_fn` (default: `search(query, match="any")`), and reports
+  every outcome: `answered`, `false_block`, `wrong_entry`, `abstained`, `false_accept`, with
+  `answerable_hit_rate`, `unanswerable_abstain_rate`, `false_accept_count`, `false_reject_count`, per-tag
+  figures, the matched entries of each miss, `store_size` (N) and a `verdict`. The verdict is `perfect` only
+  when the store holds entries, at least one probe is answerable, and nothing was missed or leaked: an empty
+  vault or a retriever that returns nothing is `empty_store` / `false_rejects`, never perfect.
+- `kibisis.mcp_server.recalled_refs(text)` lists the `category:key` of each entry in a `<kibisis-recall>`
+  envelope, so the eval can score the MCP recall tool's own output. Tests run it through the MCP recall handler
+  and through `search()` with the server's arguments and check the figures agree.
+- SECURITY.md gains a threat model (in scope / out of scope for a local file-write attacker, an agent-side
+  writer, a forged review, the passphrase, and a vault without SQLCipher), with the functions that enforce each
+  point.
+
+### Deprecated
+- `evaluate_epistemic_abstention()` is a wrapper over `evaluate_abstention()` and warns (`DeprecationWarning`).
+  It keeps its keys; `perfect_abstention` still means only that every probe returned nothing, which an empty
+  vault also achieves. The report now also carries `store_size`, `verdict` and `perfect` from the new eval.
 - K-B: the Rust crate's audit journal moves to format 3 and matches the Python vault byte for byte. New module
   `kibisis::journal`: `event_hash_v3` (SHA-256 of the canonical JSON array, metadata as the digest of its sorted-key
   JSON), `head_mac_v1` (HMAC-SHA256 over `kibisis audit head v1:` and `[sequence,"event_hash"]`, built on the crate's

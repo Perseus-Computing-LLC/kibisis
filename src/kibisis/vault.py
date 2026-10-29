@@ -18,8 +18,10 @@ import sqlite3
 import string
 import time
 import unicodedata
+import warnings
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 from .admission import AdmissionDecision, FactDisposition, MemoryAdmissionGate
 from .crypto import (
     ENTRY_BINDING,
@@ -133,6 +135,49 @@ def _validate_origin(origin: Optional[str], what: str = "origin") -> Optional[st
     if origin not in ORIGINS:
         raise ValueError(f"{what} must be one of {ORIGINS}, got {origin!r}")
     return origin
+
+
+@dataclass(frozen=True)
+class Probe:
+    """One query for :meth:`SQLiteMemoryVault.evaluate_abstention`.
+
+    ``expected`` holds the ``category:key`` references that answer the query; any one of them in the
+    results counts as answered. ``None`` means nothing stored answers it, so the right result is none.
+    ``tag`` groups probes in the report (for example ``"near-miss"`` or ``"off-topic"``).
+    """
+
+    query: str
+    expected: Optional[Union[str, Iterable[str]]] = None  # stored as a frozenset of "category:key"
+    tag: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.query, str) or not self.query.strip():
+            raise ValueError("Probe.query must be a non-empty string")
+        if self.expected is not None:
+            refs = frozenset(_entry_ref(r) for r in ([self.expected] if isinstance(self.expected, str) else self.expected))
+            if not refs:
+                raise ValueError(f"Probe {self.query!r}: expected must name at least one category:key, or be None")
+            object.__setattr__(self, "expected", refs)
+
+    @property
+    def answerable(self) -> bool:
+        return self.expected is not None
+
+
+def _entry_ref(ref: Any) -> str:
+    """``category:key`` of a search result, entity, hit, ``(category, key)`` pair or ``"category:key"`` string."""
+    entity = getattr(ref, "entity", None)
+    if entity is not None:
+        ref = entity
+    if hasattr(ref, "category") and hasattr(ref, "key"):
+        return f"{ref.category}:{ref.key}"
+    if isinstance(ref, tuple) and len(ref) == 2:
+        return f"{ref[0]}:{ref[1]}"
+    if isinstance(ref, str):
+        if ":" not in ref:
+            raise ValueError(f"entry reference {ref!r} must be 'category:key'")
+        return ref
+    raise TypeError(f"cannot read an entry reference from {type(ref).__name__}")
 
 
 def _argus_ledger_path() -> Optional[str]:
@@ -3765,38 +3810,170 @@ class SQLiteMemoryVault(MemoryVault):
 
         return imported_count
 
+    def evaluate_abstention(
+        self,
+        probes: Optional[Iterable[Probe]] = None,
+        *,
+        answerable: Optional[Mapping[str, Union[str, Iterable[str]]]] = None,
+        unanswerable: Optional[Iterable[str]] = None,
+        search_fn: Optional[Callable[[str], Iterable[Any]]] = None,
+        k: int = 6,
+        scope: str = "default",
+    ) -> Dict[str, Any]:
+        """Score recall on probes the vault must answer and probes it must refuse.
+
+        Probes come as :class:`Probe` objects, as ``answerable`` (query -> ``category:key`` or several)
+        and ``unanswerable`` (queries nothing stored answers), or both. Each probe is scored on the
+        first ``k`` results of ``search_fn(query)``; the default is this vault's natural-language
+        search, ``search(query, scope=scope, limit=k, match="any")``. Pass the function a caller
+        really runs (the MCP server's recall, a plugin's prefetch) so the path that is scored is the
+        path in use. It may return search results, hits, entities, ``(category, key)`` pairs or
+        ``"category:key"`` strings.
+
+        Outcomes per probe: an answerable probe is ``answered`` when an expected entry is in the top
+        ``k``, ``false_block`` when nothing comes back and ``wrong_entry`` when only other entries do;
+        an unanswerable probe is ``abstained`` when nothing comes back and ``false_accept`` otherwise.
+        ``false_reject_count`` is ``false_block_count + wrong_entry_count``. ``store_size`` is the number
+        of active entries in ``scope``.
+
+        ``verdict`` is ``"perfect"`` only when the store holds entries, at least one probe is
+        answerable, every answerable probe was answered and every unanswerable probe refused.
+        Otherwise it names what went wrong: ``"empty_store"``, ``"no_probes"``,
+        ``"no_answerable_probes"`` (refusing everything is not evidence of anything),
+        ``"false_rejects"``, ``"false_accepts"`` or ``"mixed"``. ``perfect`` is that verdict as a bool.
+        """
+        if isinstance(k, bool) or not isinstance(k, int) or k < 1:
+            raise ValueError("k must be a positive integer")
+        all_probes: List[Probe] = []
+        for probe in probes or ():
+            if not isinstance(probe, Probe):
+                raise TypeError(f"probes must be Probe objects, got {type(probe).__name__}")
+            all_probes.append(probe)
+        for query, refs in (answerable or {}).items():
+            all_probes.append(Probe(query, expected=frozenset([refs] if isinstance(refs, str) else refs)))
+        for query in unanswerable or ():
+            all_probes.append(Probe(query))
+        if search_fn is None:
+            search_fn = lambda q: self.search(q, scope=scope, limit=k, match="any")
+
+        store_size = int(
+            self._conn.execute(
+                "SELECT COUNT(*) FROM entities WHERE scope = ? AND archived = 0", (scope,)
+            ).fetchone()[0]
+        )
+
+        counts = {"answered": 0, "false_block": 0, "wrong_entry": 0, "abstained": 0, "false_accept": 0}
+        by_tag: Dict[str, Dict[str, int]] = {}
+        outcomes: List[Dict[str, Any]] = []
+        false_accepts: List[Dict[str, Any]] = []
+        false_rejects: List[Dict[str, Any]] = []
+        for probe in all_probes:
+            matched = [_entry_ref(r) for r in search_fn(probe.query)][:k]
+            if probe.expected is None:
+                outcome = "abstained" if not matched else "false_accept"
+            elif not matched:
+                outcome = "false_block"
+            elif any(ref in probe.expected for ref in matched):
+                outcome = "answered"
+            else:
+                outcome = "wrong_entry"
+            counts[outcome] += 1
+            tag = by_tag.setdefault(
+                probe.tag,
+                {"answerable": 0, "unanswerable": 0, "answered": 0, "false_block": 0, "wrong_entry": 0,
+                 "abstained": 0, "false_accept": 0},
+            )
+            tag["answerable" if probe.answerable else "unanswerable"] += 1
+            tag[outcome] += 1
+            expected = sorted(probe.expected) if probe.expected is not None else None
+            record = {"probe": probe.query, "tag": probe.tag, "outcome": outcome, "expected": expected, "matched": matched}
+            outcomes.append(record)
+            if outcome == "false_accept":
+                false_accepts.append({"probe": probe.query, "tag": probe.tag, "matched": matched})
+            elif outcome in ("false_block", "wrong_entry"):
+                false_rejects.append(
+                    {"probe": probe.query, "tag": probe.tag, "outcome": outcome, "expected": expected, "matched": matched}
+                )
+
+        answerable_count = sum(1 for p in all_probes if p.answerable)
+        unanswerable_count = len(all_probes) - answerable_count
+        false_reject_count = counts["false_block"] + counts["wrong_entry"]
+        false_accept_count = counts["false_accept"]
+        if not all_probes:
+            verdict = "no_probes"
+        elif store_size == 0:
+            verdict = "empty_store"
+        elif answerable_count == 0:
+            verdict = "no_answerable_probes"
+        elif false_reject_count and false_accept_count:
+            verdict = "mixed"
+        elif false_reject_count:
+            verdict = "false_rejects"
+        elif false_accept_count:
+            verdict = "false_accepts"
+        else:
+            verdict = "perfect"
+
+        return {
+            "scope": scope,
+            "store_size": store_size,
+            "k": k,
+            "total_probes": len(all_probes),
+            "answerable_count": answerable_count,
+            "unanswerable_count": unanswerable_count,
+            "answered_count": counts["answered"],
+            "false_block_count": counts["false_block"],
+            "wrong_entry_count": counts["wrong_entry"],
+            "false_reject_count": false_reject_count,
+            "abstained_count": counts["abstained"],
+            "false_accept_count": false_accept_count,
+            "answerable_hit_rate": (counts["answered"] / answerable_count) if answerable_count else None,
+            "unanswerable_abstain_rate": (counts["abstained"] / unanswerable_count) if unanswerable_count else None,
+            "false_accepts": false_accepts,
+            "false_rejects": false_rejects,
+            "outcomes": outcomes,
+            "by_tag": by_tag,
+            "verdict": verdict,
+            "perfect": verdict == "perfect",
+        }
+
     def evaluate_epistemic_abstention(
         self,
         negative_probes: List[str],
         scope: str = "default",
     ) -> Dict[str, Any]:
-        """Evaluate vault abstention on negative out-of-scope probes.
+        """Deprecated: use :meth:`evaluate_abstention`, which also scores probes the vault must answer.
 
-        Ensures the vault does not return fabricated or false positive recall results
-        when probed with out-of-scope or non-existent topics.
+        Scores only probes that should return nothing, through ``search(probe, scope=scope)`` with its
+        default ``match="all"``, and keeps its old keys: ``perfect_abstention`` is true whenever every
+        probe returned nothing, which an empty vault or a dead retriever also achieves. The new
+        report's ``store_size``, ``verdict`` and ``perfect`` are included so the gap is visible.
         """
-        total = len(negative_probes)
-        abstained = 0
-        false_positives = []
-
-        for probe in negative_probes:
-            res = self.search(probe, scope=scope)
-            if len(res) == 0:
-                abstained += 1
-            else:
-                false_positives.append({
-                    "probe": probe,
-                    "matched_keys": [r.entity.key for r in res],
-                })
-
-        abstention_rate = (abstained / total) if total > 0 else 1.0
+        warnings.warn(
+            "evaluate_epistemic_abstention() is deprecated: use evaluate_abstention(), which scores "
+            "answerable probes too and does not call an empty vault perfect",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        report = self.evaluate_abstention(
+            unanswerable=negative_probes, scope=scope, k=10, search_fn=lambda q: self.search(q, scope=scope),
+        )
+        total = report["total_probes"]
+        abstained = report["abstained_count"]
+        false_positives = [
+            {"probe": leak["probe"], "matched_keys": [ref.split(":", 1)[1] for ref in leak["matched"]]}
+            for leak in report["false_accepts"]
+        ]
         return {
             "total_probes": total,
             "abstained_count": abstained,
             "false_positive_count": len(false_positives),
-            "abstention_rate": abstention_rate,
+            "abstention_rate": (abstained / total) if total > 0 else 1.0,
             "false_positives": false_positives,
             "perfect_abstention": (abstained == total),
+            "store_size": report["store_size"],
+            "verdict": report["verdict"],
+            "perfect": report["perfect"],
         }
 
     def close(self) -> None:

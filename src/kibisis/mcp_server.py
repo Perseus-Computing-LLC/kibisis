@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 import sys
 import traceback
 from datetime import datetime, timezone
@@ -256,6 +257,18 @@ def fence_recall(scope: str, entries: List[MemoryEntity]) -> str:
         lines.append("</entry>")
     lines.append("</kibisis-recall>")
     return "\n".join(lines)
+
+
+_RECALLED_ENTRY = re.compile(r'^<entry category="([^"]*)" key="([^"]*)"', re.MULTILINE)
+
+
+def recalled_refs(text: str) -> List[str]:
+    """``category:key`` of each entry in a :func:`fence_recall` envelope, in the order recalled.
+
+    Lets an evaluator score the recall tool's output itself (``SQLiteMemoryVault.evaluate_abstention``
+    with ``search_fn``), rather than a library call that may not match what the tool does.
+    """
+    return [f"{html.unescape(category)}:{html.unescape(key)}" for category, key in _RECALLED_ENTRY.findall(text)]
 
 
 def _text(args: Mapping[str, Any], name: str) -> Optional[str]:

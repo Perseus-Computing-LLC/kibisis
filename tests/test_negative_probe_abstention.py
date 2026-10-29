@@ -39,7 +39,8 @@ class TestNegativeProbeAbstention(unittest.TestCase):
             "personal banking account routing number",
         ]
 
-        report = self.vault.evaluate_epistemic_abstention(unknown_probes)
+        with self.assertWarns(DeprecationWarning):  # kept as a wrapper over evaluate_abstention()
+            report = self.vault.evaluate_epistemic_abstention(unknown_probes)
         self.assertEqual(report["total_probes"], len(unknown_probes))
         self.assertEqual(report["abstained_count"], len(unknown_probes))
         self.assertEqual(report["false_positive_count"], 0)

@@ -120,7 +120,7 @@ class TestOutcomes:
     def test_wrong_entry_is_a_false_reject_with_matched_keys(self):
         vault = seeded_vault()
         # The right entry exists but the retriever hands back another one.
-        wrong = lambda q: vault.search("office move fourth floor", match="any", limit=K)  # noqa: E731
+        wrong = lambda q: vault.search("office move fourth floor", match="any", limit=K)
         report = vault.evaluate_abstention(answerable={"When is the release freeze?": "decision:release_freeze"}, search_fn=wrong)
         assert report["wrong_entry_count"] == 1
         assert report["false_block_count"] == 0
@@ -140,7 +140,7 @@ class TestOutcomes:
     def test_top_k_cuts_the_results_scored(self):
         vault = seeded_vault()
         # A retriever that returns the right entry last, after five others.
-        others = [r for r in vault.search("open issues floor survey budget", match="any", limit=10)
+        others = [r for r in vault.search("issues floor survey budget navigation", match="any", limit=10)
                   if r.entity.key != "release_freeze"][:5]
         right = vault.search("release freeze", match="all", limit=1)
         assert len(others) == 5 and right
@@ -176,7 +176,7 @@ class TestDistractors:
         probes += [Probe(q, tag="near-miss") for q in NEAR_MISS]
         probes += [Probe(q, tag="off-topic") for q in OFF_TOPIC]
         # Deliberately loose: any word may match and nothing is cut off by score.
-        loose = lambda q: vault.search(q, scope="default", match="any", limit=K, include_unverified=True)  # noqa: E731
+        loose = lambda q: vault.search(q, scope="default", match="any", limit=K, include_unverified=True)
         report = vault.evaluate_abstention(probes, search_fn=loose, k=K)
 
         assert report["store_size"] == len(ENTRIES) + 2
