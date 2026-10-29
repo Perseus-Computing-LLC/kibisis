@@ -264,9 +264,9 @@ def test_recall_does_not_write_to_the_vault_journal(vault):
 
 def test_recall_returns_while_another_connection_holds_the_write_lock(tmp_path):
     db = str(tmp_path / "v.sqlite")
-    a = SQLiteMemoryVault(db, auto_gate=False, verification_quorum=1)
+    a = SQLiteMemoryVault(db, passphrase="kr5-lock-test-passphrase", auto_gate=False, verification_quorum=1)
     _verified(a, "fact", "k", "the office is in austin texas")
-    b = SQLiteMemoryVault(db, auto_gate=False)
+    b = SQLiteMemoryVault(db, passphrase="kr5-lock-test-passphrase", auto_gate=False)
     b._conn.execute("BEGIN IMMEDIATE")
     try:
         t0 = time.time()
