@@ -153,7 +153,15 @@ def test_external_write_cannot_overwrite_agent_entry(vault):
     with pytest.raises(OriginClassError):
         vault.put("notes", "k", "new fact", origin="tool")
     with pytest.raises(OriginClassError):
-        vault.put("notes", "k", "new fact")  # unknown origin is external
+        vault.put("notes", "k", "new fact", origin="unknown")
+
+
+def test_rewrite_without_origin_keeps_stored_class(vault):
+    # A library re-write that states no origin keeps the entry's origin and class (existing contract).
+    vault.put("notes", "k", "fact", origin="model")
+    e = vault.put("notes", "k", "fact v2")
+    assert e.origin == "model"
+    assert e.metadata["origin_class"] == "agent"
 
 
 def test_equal_trust_rewrite_keeps_origin_class(vault):
@@ -173,8 +181,10 @@ def test_origin_class_refusal_is_journaled(vault):
     vault.put("notes", "k", "fact", origin="user", author_id="alice")
     with pytest.raises(OriginClassError):
         vault.put("notes", "k", "new fact", origin="model", author_id="bot")
-    actions = [ev.action for ev in vault.list_audit_events()]
-    assert "origin_class_refused" in actions
+    events = vault.list_audit_events()
+    refusals = [ev for ev in events if ev.action == "refuse" and ev.metadata.get("reason") == "origin_class_refused"]
+    assert refusals, [ev.action for ev in events]
+    assert refusals[-1].metadata["detail"] == {"writer_class": "agent", "stored_class": "principal", "origin": "model"}
 
 
 # --- K-R1: act_class -------------------------------------------------------------------------

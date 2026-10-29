@@ -75,8 +75,46 @@ ORIGINS = ("user", "model", "tool", "import", "unknown")
 #: comes from an internal path whose metadata the vault produced (``review_entity``, ``import_snapshot``).
 #: ``human_reviews`` is what ``_is_reviewed`` consults, so a caller-supplied value would forge a
 #: person's review; ``tenant_id`` and ``principal_id`` bound recall; ``lineage_*`` is reserved.
-RESERVED_METADATA_KEYS = frozenset({"human_reviews", "tenant_id", "principal_id"})
+RESERVED_METADATA_KEYS = frozenset({
+    "human_reviews", "tenant_id", "principal_id",
+    # K-R1 origin-bound admission: set by the vault from the write path, never from the payload.
+    "origin_class", "act_class", "act_class_capped_from", "attestations", "verification_pending",
+    "trust_inherited_from",
+})
 RESERVED_METADATA_PREFIX = "lineage_"
+
+#: K-R1: the trust class of a write, fixed by the vault from ``origin`` at write time. ``principal``
+#: is a person or an operator-run import; ``agent`` is model output; ``external`` is a tool result or
+#: an unstated origin. Higher index = more trusted.
+ORIGIN_CLASSES = ("external", "agent", "principal")
+_ORIGIN_TO_CLASS = {"user": "principal", "import": "principal", "model": "agent", "tool": "external", "unknown": "external"}
+#: ``inform`` entries may be shown to a model; only ``act`` entries may drive an action (conventions,
+#: standing instructions). Agent and external writers are capped at ``inform``.
+ACT_CLASSES = ("inform", "act")
+#: Distinct principals who must attest before an entry is ``verified`` (K-R1); ``KIBISIS_VERIFICATION_QUORUM``
+#: overrides the default for a deployment.
+DEFAULT_VERIFICATION_QUORUM = 2
+
+
+def origin_class_of(origin: Optional[str]) -> str:
+    """Trust class for an origin; an unstated origin is ``external``."""
+    return _ORIGIN_TO_CLASS.get(origin or "unknown", "external")
+
+
+def _class_rank(origin_class: Optional[str]) -> int:
+    return ORIGIN_CLASSES.index(origin_class) if origin_class in ORIGIN_CLASSES else 0
+
+
+def _row_origin_class(row: Any) -> str:
+    """Origin class of a fetched row: the stored one, else derived from the row's origin."""
+    try:
+        meta = json.loads(row["metadata_json"] or "{}")
+    except (TypeError, ValueError, IndexError, KeyError):
+        meta = {}
+    stored = meta.get("origin_class")
+    if stored in ORIGIN_CLASSES:
+        return stored
+    return origin_class_of(row_origin(row))
 
 
 def _reserved_metadata_keys(meta: Dict[str, Any]) -> List[str]:
@@ -268,6 +306,19 @@ class AdmissionRefused(PermissionError):
     """Raised when a reviewer that is not a person tries to promote an entry to ``verified``."""
 
 
+class OriginClassError(PermissionError):
+    """Raised when a lower-trust writer (K-R1 ``origin_class``) tries to overwrite a higher-trust entry.
+
+    The entry's class is fixed by the vault at write time; a model or tool cannot change it by
+    re-writing the key. Write a new key with ``supersedes_key`` to propose a replacement instead.
+    """
+
+    def __init__(self, message: str, *, writer_class: str = "", stored_class: str = "") -> None:
+        super().__init__(message)
+        self.writer_class = writer_class
+        self.stored_class = stored_class
+
+
 class EntryIntegrityError(PermissionError):
     """Raised when a stored entry fails its integrity check: it has no signature, its signature does
     not verify, or its sealed content does not belong to it. ``get`` raises it; ``search`` and
@@ -380,8 +431,14 @@ class SQLiteMemoryVault(MemoryVault):
         auto_gate: bool = True,
         memory_security: bool = True,
         cache_mb: Optional[int] = None,
+        verification_quorum: Optional[int] = None,
     ) -> None:
         """Open a vault. Entry content is encrypted by default.
+
+        ``verification_quorum`` (K-R1) is how many distinct principals must attest to an entry before
+        it is stored as ``verified``: the author of a ``origin="user"`` write that asked for
+        ``verified`` counts as one, each person reviewing it as ``verified`` counts as one more. It
+        defaults to ``KIBISIS_VERIFICATION_QUORUM`` or :data:`DEFAULT_VERIFICATION_QUORUM`.
 
         The passphrase comes from the argument, then KIBISIS_PASSPHRASE_FILE, then KIBISIS_PASSPHRASE.
         With no passphrase the vault refuses to open (EncryptionRequiredError) unless ``allow_plaintext=True``.
@@ -412,6 +469,11 @@ class SQLiteMemoryVault(MemoryVault):
         self.coordinator = coordinator
         self.enforce_fencing = enforce_fencing
         self.auto_gate = auto_gate
+        if verification_quorum is None:
+            verification_quorum = int(os.environ.get("KIBISIS_VERIFICATION_QUORUM", DEFAULT_VERIFICATION_QUORUM))
+        if verification_quorum < 1:
+            raise ValueError("verification_quorum must be at least 1")
+        self.verification_quorum = int(verification_quorum)
         if enforce_fencing and coordinator is None:
             raise ValueError("enforce_fencing=True needs a lease coordinator: pass coordinator=")
         self._fallback_search_warned = False
@@ -1340,9 +1402,14 @@ class SQLiteMemoryVault(MemoryVault):
         origin: Optional[str] = None,
         source_ref: Optional[str] = None,
         confidence: Optional[float] = None,
+        act_class: Optional[str] = None,
         _trusted_metadata: bool = False,
+        _review_verdict: bool = False,
     ) -> MemoryEntity:
         """Write path behind :meth:`put`, which journals the tombstone refusals this raises.
+
+        ``_review_verdict`` is set by :meth:`review_entity` only: the state it passes was decided
+        under the quorum rule there, with ``attestations`` already in ``metadata``.
 
         ``_trusted_metadata`` is set only by internal callers whose ``metadata`` the vault itself
         produced; a caller's reserved keys (:data:`RESERVED_METADATA_KEYS`) are dropped otherwise.
@@ -1352,6 +1419,8 @@ class SQLiteMemoryVault(MemoryVault):
         _validate_origin(origin)
         if confidence is not None and not (0.0 <= float(confidence) <= 1.0):
             raise ValueError("confidence must be within [0, 1]")
+        if act_class is not None and act_class not in ACT_CLASSES:
+            raise ValueError(f"act_class must be one of {ACT_CLASSES}, got {act_class!r}")
         if origin == "model":
             # Trust comes from where the write came from, not from what it says about itself.
             trust_ceiling = EpistemicState.CANDIDATE.value
@@ -1389,12 +1458,27 @@ class SQLiteMemoryVault(MemoryVault):
             if decision.disposition == FactDisposition.TRANSIENT and valid_until is None:
                 valid_until = now + 86400.0  # Default 24h validity for transient states
         else:
-            ep_state = EpistemicState(epistemic_state) if epistemic_state else EpistemicState.VERIFIED
+            # K-E: a write that states no epistemic state is a candidate. Nothing but a person's
+            # review (and the quorum below) mints verified.
+            ep_state = EpistemicState(epistemic_state) if epistemic_state else EpistemicState.CANDIDATE
 
         if trust_ceiling is not None and ep_state in (EpistemicState.VERIFIED, EpistemicState.DISPUTED):
             # Default recall returns verified and disputed entries; a capped write is neither.
             meta["trust_capped_from"] = ep_state.value
             ep_state = EpistemicState.CANDIDATE
+
+        # K-R1: the trust class of this write. A re-write that states no origin keeps the entry's
+        # stored origin (and class); that is resolved against the stored row inside the transaction.
+        writer_class: Optional[str] = origin_class_of(origin) if origin is not None else None
+        requested_verified = ep_state == EpistemicState.VERIFIED and not _review_verdict
+        if requested_verified:
+            # An explicit "verified" from a principal is that principal's attestation, counted toward
+            # the quorum; from anyone else it is a claim and the entry stays a candidate.
+            if writer_class != "principal":
+                meta["trust_capped_from"] = ep_state.value
+                ep_state = EpistemicState.CANDIDATE
+            else:
+                ep_state = EpistemicState.CANDIDATE  # settled against the quorum below
 
         # Check explicit superseding target
         supersedes_ref: Optional[str] = None
@@ -1410,13 +1494,83 @@ class SQLiteMemoryVault(MemoryVault):
 
         with self._write_tx() as cursor:
             self._fence(cursor, fencing_token, resource, holder_id)
+            cursor.execute(
+                "SELECT epistemic_state, metadata_json, origin FROM entities WHERE category = ? AND key = ? AND scope = ?",
+                (category, key, scope),
+            )
+            existing = cursor.fetchone()
+
+            # K-R1: origin_class is immutable from below. The stored class is what a lower-trust
+            # writer must not change; an equal class keeps it; a principal may raise it.
+            stored_class = _row_origin_class(existing) if existing is not None else None
+            if writer_class is None:
+                writer_class = stored_class or origin_class_of(origin)
+            if stored_class is not None and _class_rank(writer_class) < _class_rank(stored_class):
+                raise OriginClassError(
+                    f"'{category}:{key}' [scope={scope}] is {stored_class}-class; a {writer_class}-class write "
+                    "cannot replace it. Write a new key with supersedes_key to propose a replacement.",
+                    writer_class=writer_class, stored_class=stored_class,
+                )
+            entry_class = writer_class
+            # Max-untrust along supersedes and derived_from: a non-principal entry is no more trusted
+            # than what it replaces or draws on, so trust cannot be laundered through a rewrite.
+            if entry_class != "principal":
+                inherited: List[str] = []
+                links: List[Tuple[str, str]] = []
+                if supersedes_key:
+                    links.append((supersedes_category or category, supersedes_key))
+                for ref in derived_from or []:
+                    if ":" in ref:
+                        c, k = ref.split(":", 1)
+                        links.append((c, k))
+                for c, k in links:
+                    cursor.execute(
+                        "SELECT metadata_json, origin FROM entities WHERE category = ? AND key = ? AND scope = ?",
+                        (c, k, scope),
+                    )
+                    link_row = cursor.fetchone()
+                    if link_row is None:
+                        continue
+                    link_class = _row_origin_class(link_row)
+                    if _class_rank(link_class) < _class_rank(entry_class):
+                        entry_class = link_class
+                        inherited.append(f"{c}:{k}")
+                if inherited:
+                    meta["trust_inherited_from"] = inherited
+            meta["origin_class"] = entry_class
+            # act_class: only a principal may mark an entry as one that drives actions.
+            wanted_act = act_class or (meta.get("act_class") if _trusted_metadata else None) or "inform"
+            if wanted_act == "act" and entry_class != "principal":
+                meta["act_class_capped_from"] = "act"
+                wanted_act = "inform"
+            meta["act_class"] = wanted_act
+
+            # Verification quorum: distinct principals who attested. The author of a principal write
+            # that asked for verified is one; review_entity adds reviewers. Below quorum stays candidate.
+            if not _review_verdict:
+                prior_meta: Dict[str, Any] = {}
+                if existing is not None:
+                    try:
+                        prior_meta = json.loads(existing["metadata_json"] or "{}")
+                    except (TypeError, ValueError):
+                        prior_meta = {}
+                attested = list(prior_meta.get("attestations") or []) if existing is not None else []
+                if requested_verified and entry_class == "principal":
+                    signer = author_id or principal_id or "principal"
+                    if signer not in attested:
+                        attested.append(signer)
+                if attested:
+                    meta["attestations"] = attested
+                if requested_verified and entry_class == "principal":
+                    if len(attested) >= self.verification_quorum:
+                        ep_state = EpistemicState.VERIFIED
+                        meta.pop("verification_pending", None)
+                    else:
+                        meta["verification_pending"] = {"have": len(attested), "need": self.verification_quorum}
+            meta_str = json.dumps(meta, sort_keys=True)
+
             if trust_ceiling is not None:
                 # A capped write cannot replace an entry a person verified or reviewed.
-                cursor.execute(
-                    "SELECT epistemic_state, metadata_json FROM entities WHERE category = ? AND key = ? AND scope = ?",
-                    (category, key, scope),
-                )
-                existing = cursor.fetchone()
                 if existing is not None and _is_reviewed(existing):
                     raise ReviewedEntryError(
                         f"'{category}:{key}' [scope={scope}] is verified or reviewed by a person; a capped write "
@@ -1635,9 +1789,20 @@ class SQLiteMemoryVault(MemoryVault):
         origin: Optional[str] = None,
         source_ref: Optional[str] = None,
         confidence: Optional[float] = None,
+        act_class: Optional[str] = None,
         _trusted_metadata: bool = False,
+        _review_verdict: bool = False,
     ) -> MemoryEntity:
         """Insert or update an entity. See ``__init__`` for ``fencing_token``, ``resource`` and ``holder_id``.
+
+        K-E/K-R1: a write that states no ``epistemic_state`` is stored as ``candidate``. ``verified``
+        is minted only when ``verification_quorum`` distinct principals have attested: a
+        ``origin="user"``/``"import"`` write that asks for ``verified`` is its author's attestation,
+        :meth:`review_entity` adds a reviewer's. The vault sets ``origin_class`` (``principal``,
+        ``agent``, ``external``) from ``origin``; a lower-class writer cannot overwrite a higher-class
+        entry (:class:`OriginClassError`), and a non-principal entry inherits the lowest class along
+        ``supersedes_key`` and ``derived_from``. ``act_class`` (``inform``/``act``) is capped at
+        ``inform`` unless the writer is a principal.
 
         ``origin`` records where the write came from (:data:`ORIGINS`); ``origin="model"`` implies
         ``trust_ceiling="candidate"``. A re-write that gives no origin keeps the entry's existing one.
@@ -1681,6 +1846,8 @@ class SQLiteMemoryVault(MemoryVault):
                 source_ref=source_ref,
                 confidence=confidence,
                 _trusted_metadata=_trusted_metadata,
+                act_class=act_class,
+                _review_verdict=_review_verdict,
             )
         except TombstonedValueError as exc:
             # The write's transaction rolled back; journal the refusal in its own transaction.
@@ -1692,6 +1859,18 @@ class SQLiteMemoryVault(MemoryVault):
                 key=exc.key,
                 author_id=exc.author_id,
                 detail={"value_digest_prefix": exc.digest[:12]},
+            )
+            raise
+        except OriginClassError as exc:
+            # Same: the transaction rolled back, so the refusal is journaled on its own.
+            self.record_refusal(
+                path="put",
+                reason="origin_class_refused",
+                scope=scope,
+                category=category,
+                key=key,
+                author_id=author_id,
+                detail={"writer_class": exc.writer_class, "stored_class": exc.stored_class, "origin": origin or ""},
             )
             raise
 
@@ -2070,9 +2249,10 @@ class SQLiteMemoryVault(MemoryVault):
         if epistemic_state:
             clauses.append("e.epistemic_state = ?")
             params.append(epistemic_state)
-        elif not include_unverified:
-            # Epistemic polarity: unverified candidate/revoked memories withheld from active recall unless explicitly requested
-            clauses.append("e.epistemic_state IN ('verified', 'disputed')")
+        else:
+            # K-K: candidates are recallable and shown labeled by state; only revoked entries are withheld
+            # unless asked for by state. ``include_unverified`` is kept for callers and is now implied.
+            clauses.append("e.epistemic_state IN ('verified', 'disputed', 'candidate')")
         # Bi-temporal point-in-time filter: valid_from <= T and (valid_until IS NULL or valid_until > T)
         at = as_of_valid_time if as_of_valid_time is not None else (time.time() if active_only else None)
         if at is not None:
@@ -2715,7 +2895,21 @@ class SQLiteMemoryVault(MemoryVault):
 
         # Update entity with new epistemic status and review metadata. Approving an entry that proposed
         # to supersede a reviewed entry applies the supersession now, under the reviewer's authority.
-        proposal = meta.pop("proposed_supersedes", None) if verdict == EpistemicState.VERIFIED.value else None
+        stored_state = verdict
+        if verdict == EpistemicState.VERIFIED.value:
+            # K-R1 quorum: a person's verified review is one attestation; the entry is verified once
+            # verification_quorum distinct principals have attested. Other reviewer origins never count.
+            attested = list(meta.get("attestations") or [])
+            if reviewer_origin == "user" and reviewer_id and reviewer_id not in attested:
+                attested.append(reviewer_id)
+            if attested:
+                meta["attestations"] = attested
+            if len(attested) >= self.verification_quorum:
+                meta.pop("verification_pending", None)
+            else:
+                meta["verification_pending"] = {"have": len(attested), "need": self.verification_quorum}
+                stored_state = EpistemicState.CANDIDATE.value
+        proposal = meta.pop("proposed_supersedes", None) if stored_state == EpistemicState.VERIFIED.value else None
         if proposal:
             meta["supersession_approved_by"] = reviewer_id
         return self.put(
@@ -2723,7 +2917,7 @@ class SQLiteMemoryVault(MemoryVault):
             key=key,
             content=entity.content,
             metadata=meta,
-            epistemic_state=verdict,
+            epistemic_state=stored_state,
             valid_from=entity.valid_from,
             valid_until=entity.valid_until,
             scope=scope,
@@ -2734,6 +2928,7 @@ class SQLiteMemoryVault(MemoryVault):
             supersedes_key=proposal["key"] if proposal else None,
             supersedes_category=proposal["category"] if proposal else None,
             _trusted_metadata=True,  # human_reviews was appended here, inside the write transaction
+            _review_verdict=True,
         )
 
     def scrub(self) -> None:
