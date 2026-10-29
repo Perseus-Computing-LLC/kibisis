@@ -208,6 +208,7 @@ def test_active_search_filters_superseded_and_expired_facts():
 def test_context_item_carries_supersession_and_temporal_metadata():
     """A context item exported from an entity carries its supersession link and temporal metadata."""
     vault = SQLiteMemoryVault(":memory:", auto_gate=False)
+    vault.put(category="policy", key="legacy_rule", content="Keep secret keys off the wire.")  # K-R2: the edge needs a target
     ent = vault.put(
         category="policy",
         key="security_rule",
