@@ -85,6 +85,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps no term index (and removes one the file has) and searches as before, by opening every entry, for a
   vault whose threat model cannot take what the index shows: word counts per entry, which entries in a scope
   share a word, token frequency and order (SECURITY.md, threat model, "Reading the shape of the text").
+- K-A: `src/kibisis/vault.py` is split by concern. `SQLiteMemoryVault` is now composed from mixins in
+  `_vault_audit.py` (journal and chain head), `_vault_crypto.py` (sealing, signing, digests, integrity
+  upgrade), `_vault_review.py` (origins and trust classes, admission, review, state transitions, abstention),
+  `_vault_search.py` (search, recall, the entry and term indexes), `_vault_tombstone.py` (tombstones, purge,
+  scrub) and `_vault_snapshot.py` (export and import); `vault.py` keeps the constructor, schema, write lock
+  and fencing, the put family, get, archive, list_entities, persona slots and the exceptions. The code is
+  moved as it was, and every name that `kibisis.vault` had is still importable from it. No behaviour change.
 
 ### Changed
 - K-E: a `put()` with no `epistemic_state` stores a `candidate`. `verified` needs `verification_quorum`
