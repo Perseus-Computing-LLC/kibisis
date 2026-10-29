@@ -21,7 +21,8 @@ import unicodedata
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from collections import deque
+from typing import Any, Callable, Deque, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 from .admission import AdmissionDecision, FactDisposition, MemoryAdmissionGate
 from .crypto import (
     ENTRY_BINDING,
@@ -81,7 +82,7 @@ RESERVED_METADATA_KEYS = frozenset({
     "human_reviews", "tenant_id", "principal_id",
     # K-R1 origin-bound admission: set by the vault from the write path, never from the payload.
     "origin_class", "act_class", "act_class_capped_from", "attestations", "verification_pending",
-    "trust_inherited_from", "conflicts_with",
+    "trust_inherited_from", "conflicts_with", "contrasts_with",
 })
 RESERVED_METADATA_PREFIX = "lineage_"
 
@@ -590,6 +591,7 @@ class SQLiteMemoryVault(MemoryVault):
 
         self._search_index = False  # True once a SQLCipher vault's entry index is in use
         self._scan_cache: Optional[Tuple[Tuple[int, int], Any]] = None  # in-memory index without SQLCipher
+        self._recent_recalls: Deque[Dict[str, Any]] = deque(maxlen=1000)  # K-R5 in-process recall log
         self._conn = sqlcipher3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         self._conn.row_factory = sqlcipher3.Row
         self._sqlcipher_active = False
@@ -1467,6 +1469,7 @@ class SQLiteMemoryVault(MemoryVault):
         act_class: Optional[str] = None,
         revive: bool = False,
         conflicts_with: Optional[List[str]] = None,
+        contrasts_with: Optional[List[str]] = None,
         _trusted_metadata: bool = False,
         _review_verdict: bool = False,
     ) -> MemoryEntity:
@@ -1584,43 +1587,29 @@ class SQLiteMemoryVault(MemoryVault):
             # K-R5: contradiction check before anything else happens to the write. An explicit
             # ``conflicts_with`` edge is recorded on both sides and journaled; recall withholds a pair of
             # verified entries that conflict until a person resolves it (K-R3).
-            conflict_refs: List[str] = []
-            if _trusted_metadata and existing is not None:
+            existing_meta: Dict[str, Any] = {}
+            if existing is not None:
                 try:
-                    conflict_refs = list((json.loads(existing["metadata_json"] or "{}")).get("conflicts_with") or [])
+                    existing_meta = json.loads(existing["metadata_json"] or "{}")
                 except (TypeError, ValueError):
-                    conflict_refs = []
+                    existing_meta = {}
+            conflict_refs = self._record_edges(
+                cursor, "conflicts_with", conflicts_with, category, key, scope, now, existing_meta, _trusted_metadata
+            )
             if conflicts_with:
-                self_ref = f"{category}:{key}"
-                for ref in conflicts_with:
-                    if ":" not in ref:
-                        raise ValueError(f"conflicts_with entries are 'category:key' refs, got {ref!r}")
-                    if ref == self_ref:
-                        raise ValueError("an entry cannot conflict with itself")
-                    c, k = ref.split(":", 1)
-                    cursor.execute(
-                        "SELECT id, metadata_json FROM entities WHERE category = ? AND key = ? AND scope = ?", (c, k, scope)
-                    )
-                    other = cursor.fetchone()
-                    if other is None:
-                        raise ValueError(f"conflicts_with target '{ref}' [scope={scope}] does not exist")
-                    other_meta = json.loads(other["metadata_json"] or "{}")
-                    back = list(other_meta.get("conflicts_with") or [])
-                    if self_ref not in back:
-                        back.append(self_ref)
-                        other_meta["conflicts_with"] = back
-                        cursor.execute(
-                            "UPDATE entities SET metadata_json = ?, updated_at = ? WHERE id = ?",
-                            (json.dumps(other_meta, sort_keys=True), now, other["id"]),
-                        )
-                    if ref not in conflict_refs:
-                        conflict_refs.append(ref)
                 self._record_audit_event(
                     cursor=cursor, action="contradiction", category=category, key=key, scope=scope,
                     value_sha256=val_hash, author_id=author_id, metadata={"with": list(conflicts_with)},
                 )
             if conflict_refs:
                 meta["conflicts_with"] = conflict_refs
+            # Contrast edges name confusables: entries a reader could mistake for each other. Both are
+            # returned; the receipt carries the edge so the scaffold can show the distinction.
+            contrast_refs = self._record_edges(
+                cursor, "contrasts_with", contrasts_with, category, key, scope, now, existing_meta, _trusted_metadata
+            )
+            if contrast_refs:
+                meta["contrasts_with"] = contrast_refs
 
             # K-R1: origin_class is immutable from below. The stored class is what a lower-trust
             # writer must not change; an equal class keeps it; a principal may raise it.
@@ -1946,6 +1935,47 @@ class SQLiteMemoryVault(MemoryVault):
         )
 
 
+    def _record_edges(
+        self,
+        cursor: sqlite3.Cursor,
+        field: str,
+        refs: Optional[List[str]],
+        category: str,
+        key: str,
+        scope: str,
+        now: float,
+        existing_meta: Dict[str, Any],
+        keep_existing: bool,
+    ) -> List[str]:
+        """Record a symmetric ``category:key`` edge list (``conflicts_with`` / ``contrasts_with``) on this
+        entry and on each target, which must exist in the scope. Returns this entry's edge list."""
+        kept: List[str] = list(existing_meta.get(field) or []) if keep_existing else []
+        if not refs:
+            return kept
+        self_ref = f"{category}:{key}"
+        for ref in refs:
+            if ":" not in ref:
+                raise ValueError(f"{field} entries are 'category:key' refs, got {ref!r}")
+            if ref == self_ref:
+                raise ValueError(f"an entry cannot be in {field} with itself")
+            c, k = ref.split(":", 1)
+            cursor.execute("SELECT id, metadata_json FROM entities WHERE category = ? AND key = ? AND scope = ?", (c, k, scope))
+            other = cursor.fetchone()
+            if other is None:
+                raise ValueError(f"{field} target '{ref}' [scope={scope}] does not exist")
+            other_meta = json.loads(other["metadata_json"] or "{}")
+            back = list(other_meta.get(field) or [])
+            if self_ref not in back:
+                back.append(self_ref)
+                other_meta[field] = back
+                cursor.execute(
+                    "UPDATE entities SET metadata_json = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(other_meta, sort_keys=True), now, other["id"]),
+                )
+            if ref not in kept:
+                kept.append(ref)
+        return kept
+
     def _cascade_invalidate(
         self, cursor: sqlite3.Cursor, scope: str, retired_ref: str, author_id: Optional[str], now: float
     ) -> List[str]:
@@ -2010,6 +2040,7 @@ class SQLiteMemoryVault(MemoryVault):
         act_class: Optional[str] = None,
         revive: bool = False,
         conflicts_with: Optional[List[str]] = None,
+        contrasts_with: Optional[List[str]] = None,
         _trusted_metadata: bool = False,
         _review_verdict: bool = False,
     ) -> MemoryEntity:
@@ -2080,6 +2111,7 @@ class SQLiteMemoryVault(MemoryVault):
                 act_class=act_class,
                 revive=revive,
                 conflicts_with=conflicts_with,
+                contrasts_with=contrasts_with,
                 _review_verdict=_review_verdict,
             )
         except TombstonedValueError as exc:
@@ -2520,7 +2552,10 @@ class SQLiteMemoryVault(MemoryVault):
                         kept, reason = False, "stale"
                         n_stale += 1
                         withheld.append(WithheldEntry(ref=ref, reason=reason))
-            hit_receipts.append({"ref": ref, "coverage_bp": coverage_bp, "z_bp": z_bp, "kept": kept, "reason": reason})
+            hit_receipts.append({
+                "ref": ref, "coverage_bp": coverage_bp, "z_bp": z_bp, "kept": kept, "reason": reason,
+                "contrasts_with": list(h.entity.metadata.get("contrasts_with") or []),
+            })
             if kept and len(results) < limit:
                 results.append(h)
         if conflict_sources:
@@ -2549,13 +2584,17 @@ class SQLiteMemoryVault(MemoryVault):
             "n_returned": len(results), "n_withheld_conflict": n_conflict, "n_withheld_gate": n_gate,
             "n_withheld_stale": n_stale, "withheld": [w.ref for w in withheld],
         }
-        with self._write_tx() as wcursor:
-            self._record_audit_event(
-                cursor=wcursor, action="recall", category="", key="", scope=scope or "*", value_sha256="",
-                author_id=actor, metadata=journal_meta,
-            )
+        # A read never writes: it takes no lock a writer holds and does not move the audit head that
+        # write-invalidated caches follow. The record goes to Argus and to an in-process log.
+        record = {**journal_meta, "scope": scope or "*", "actor": actor or "", "at": int(now)}
+        self._recent_recalls.append(record)
         _argus_append("kibisis.memory_recall", actor or "kibisis", {**journal_meta, "scope": scope or "*"})
         return RecallResult(results=results, withheld=withheld, receipt=receipt)
+
+    def recent_recalls(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """The newest recall records this process made (K-R5), newest last; the Argus ledger is the durable copy."""
+        items = list(self._recent_recalls)
+        return items[-limit:] if limit else items
 
     def search_keys(
         self,

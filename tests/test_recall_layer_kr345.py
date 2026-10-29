@@ -243,10 +243,56 @@ def test_every_recall_emits_one_argus_event(vault, monkeypatch, tmp_path):
     assert recalls[1]["payload"]["n_returned"] == 0
 
 
-def test_recall_with_no_argus_configured_still_journals_locally(vault):
+def test_recall_without_argus_is_still_observable_in_process(vault):
     _verified(vault, "fact", "a", "the office is in austin texas")
     vault.recall("office", match="any")
-    events = [ev for ev in vault.list_audit_events() if ev.action == "recall"]
-    assert len(events) == 1
-    assert events[0].metadata["channel"] == "library"
-    assert events[0].metadata["n_returned"] == 1
+    recent = vault.recent_recalls()
+    assert len(recent) == 1
+    assert recent[0]["channel"] == "library"
+    assert recent[0]["n_returned"] == 1
+
+
+def test_recall_does_not_write_to_the_vault_journal(vault):
+    # A read must not take the write lock (a prefetch under another connection's BEGIN IMMEDIATE
+    # has to return) and must not move the audit head that write-invalidated caches follow.
+    _verified(vault, "fact", "a", "the office is in austin texas")
+    before = [ev.sequence for ev in vault.list_audit_events()]
+    vault.recall("office", match="any")
+    after = [ev.sequence for ev in vault.list_audit_events()]
+    assert after == before
+
+
+def test_recall_returns_while_another_connection_holds_the_write_lock(tmp_path):
+    db = str(tmp_path / "v.sqlite")
+    a = SQLiteMemoryVault(db, auto_gate=False, verification_quorum=1)
+    _verified(a, "fact", "k", "the office is in austin texas")
+    b = SQLiteMemoryVault(db, auto_gate=False)
+    b._conn.execute("BEGIN IMMEDIATE")
+    try:
+        t0 = time.time()
+        out = a.recall("office texas", match="any")
+        assert time.time() - t0 < 1.0
+        assert [r.entity.key for r in out.results] == ["k"]
+    finally:
+        b._conn.execute("ROLLBACK")
+        b.close()
+        a.close()
+
+
+# --- K-R5 contrast edges for confusables ---------------------------------------------------------
+
+
+def test_contrast_edge_is_symmetric_and_both_sides_are_returned_with_the_edge(vault):
+    _verified(vault, "fact", "k11", "the k11 is the desktop dac on the desk")
+    _verified(vault, "fact", "btr17", "the btr17 is the portable dac in the bag", contrasts_with=["fact:k11"])
+    assert vault.get("fact", "k11").metadata["contrasts_with"] == ["fact:btr17"]
+    out = vault.recall("dac", match="any")
+    assert {r.entity.key for r in out.results} == {"k11", "btr17"}
+    hits = {h["ref"]: h for h in out.receipt["hits"]}
+    assert hits["fact:k11"]["contrasts_with"] == ["fact:btr17"]
+    assert hits["fact:btr17"]["contrasts_with"] == ["fact:k11"]
+
+
+def test_contrast_edge_to_a_missing_entry_is_refused(vault):
+    with pytest.raises(ValueError):
+        vault.put("fact", "b", "y", origin="user", contrasts_with=["fact:nope"])
