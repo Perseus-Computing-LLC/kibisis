@@ -20,23 +20,23 @@ An agent that runs for hours learns things worth keeping: decisions, preferences
 - **Forgetting that sticks.** A tombstoned value is deleted everywhere in its scope. Writing it again is refused, even under another key or with different case, spacing or punctuation.
 - **Scopes that hold.** Each memory is signed over its scope, category, key and content, and a row that fails the check is never returned.
 - **A journal of every change.** Every write, archive, tombstone and purge is recorded in a hash chain, in the same transaction as the change.
-- **One writer at a time.** Leases carry fencing tokens that only go up. They coordinate processes on one machine, through a shared SQLite file in Python or a shared directory in Rust, and threads within one Rust process. A Python vault opened with `enforce_fencing=True` refuses writes that do not carry the current token.
+- **One writer at a time.** Leases carry fencing tokens that only go up. They coordinate processes on one machine through a shared directory (one lock file and one state file per resource; the Python `FileLeaseCoordinator` is the Rust one, through the `kibisis_native` extension), and threads within one Rust process. A Python vault opened with `enforce_fencing=True` refuses writes that do not carry the current token.
 - **Ready for agents.** An MCP server over stdio offers remember, recall, forget, verify-ledger and health tools. It serves one scope fixed at startup, stores what an agent writes as an unreviewed candidate, and returns recall as escaped data, not instructions.
 - **Local only.** Kibisis contains no network code.
 
 ## Install
 
-This README describes 0.1.0-alpha.11 (0.1.0a11 on PyPI). It is a pre-release, so name the version.
+This README describes 0.1.0-alpha.12 (0.1.0a12 on PyPI). It is a pre-release, so name the version.
 
 ```toml
 # Rust: Cargo.toml
 [dependencies]
-kibisis = "0.1.0-alpha.11"
+kibisis = "0.1.0-alpha.12"
 ```
 
 ```bash
 # Python
-pip install kibisis==0.1.0a11
+pip install kibisis==0.1.0a12
 ```
 
 ## Quickstart

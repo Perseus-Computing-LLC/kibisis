@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.12] - 2026-10-30
+
 ### Changed
 - K-C (telarch P7.3): one lease coordinator. `kibisis.FileLeaseCoordinator` adapts the crate's
   `FileLeaseCoordinator` through the new `kibisis_native` extension (`bindings/python`, pyo3, abi3):
@@ -15,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and head MAC are the crate's functions, so the Python vault and the Rust verifier share one
   implementation. The shared `expires_at` is a whole second rounded up (the crate's resolution).
   `kibisis` now requires `kibisis-native` (same version); there is no pure-Python fallback.
+- Release workflow: `kibisis_native` wheels for manylinux x86_64 and macOS universal2 plus an sdist are
+  built, attested and published alongside the `kibisis` wheel (abi3, CPython >= 3.11). The install check
+  takes a file lease through the extension on both platforms.
 
 ## [0.1.0-alpha.11] - 2026-10-29
 

@@ -44,3 +44,7 @@ addopts = ["--import-mode=importlib"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 
+
+[tool.uv.sources]
+# uv-only: the extension resolves from this checkout; the published wheel still depends on the PyPI release.
+kibisis-native = { path = "bindings/python" }

@@ -180,10 +180,11 @@ wheels = [
 
 [[package]]
 name = "kibisis"
-version = "0.1.0a11"
+version = "0.1.0a12"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
+    { name = "kibisis-native" },
     { name = "pydantic" },
     { name = "sqlcipher3" },
 ]
@@ -191,9 +192,15 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "cryptography", specifier = ">=42" },
+    { name = "kibisis-native", directory = "bindings/python" },
     { name = "pydantic", specifier = ">=2" },
     { name = "sqlcipher3", specifier = ">=0.5" },
 ]
+
+[[package]]
+name = "kibisis-native"
+version = "0.1.0a12"
+source = { directory = "bindings/python" }
 
 [[package]]
 name = "pycparser"

@@ -1,8 +1,9 @@
 name: Release
 
-# A tag builds and tests the crate and the Python package, attests them, checks that the wheel
-# installs with its dependencies on Ubuntu and macOS arm64, and creates a GitHub release that names
-# the commit. Publishing to PyPI and crates.io runs in the protected `pypi` and `crates-io`
+# A tag builds the kibisis_native extension wheels (manylinux x86_64, macOS universal2, plus an sdist),
+# builds and tests the crate and the Python package, attests them, checks that the wheel installs with
+# its dependencies (kibisis_native resolved from the same release files) on Ubuntu and macOS arm64, and
+# creates a GitHub release that names the commit. Publishing to PyPI and crates.io runs in the protected `pypi` and `crates-io`
 # environments, so nothing is published until a required reviewer approves the deployment.
 # Pull requests run the same build and install jobs; attestation, release and publishing are tag-only.
 
@@ -17,8 +18,52 @@ permissions:
   contents: read
 
 jobs:
+  native:
+    name: kibisis_native wheel (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: manylinux-x86_64, os: ubuntu-latest, target: x86_64, manylinux: auto, sdist: true }
+          - { name: macos-universal2, os: macos-15, target: universal2-apple-darwin, manylinux: "", sdist: false }
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # abi3-py311: one wheel per platform covers every CPython >= 3.11.
+      - name: Build the extension wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          working-directory: bindings/python
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out ../../native-dist
+          sccache: "false"
+
+      - name: Build the extension sdist
+        if: matrix.sdist
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          working-directory: bindings/python
+          command: sdist
+          args: --out ../../native-dist
+
+      - name: Upload the extension distributions
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-${{ matrix.name }}
+          path: native-dist/
+          if-no-files-found: error
+
   build:
     name: Build, test and attest
+    needs: native
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -46,12 +91,21 @@ jobs:
           tag = os.environ["GITHUB_REF_NAME"] if ref.startswith("refs/tags/") else None
           cargo = tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]["version"]
           python = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
+          native_cargo = tomllib.loads(pathlib.Path("bindings/python/Cargo.toml").read_text())["package"]["version"]
+          native_python = tomllib.loads(pathlib.Path("bindings/python/pyproject.toml").read_text())["project"]["version"]
           pep440 = re.sub(r"-(alpha|beta|rc)\.", lambda m: {"alpha": "a", "beta": "b", "rc": "rc"}[m.group(1)], cargo)
           problems = []
           if tag is not None and tag != f"v{cargo}":
               problems.append(f"tag {tag} != Cargo.toml v{cargo}")
           if python != pep440:
               problems.append(f"pyproject.toml {python} != {pep440}")
+          if native_cargo != cargo:
+              problems.append(f"bindings/python/Cargo.toml {native_cargo} != {cargo}")
+          if native_python != pep440:
+              problems.append(f"bindings/python/pyproject.toml {native_python} != {pep440}")
+          deps = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["dependencies"]
+          if f"kibisis-native=={pep440}" not in deps:
+              problems.append(f"pyproject.toml dependencies lack kibisis-native=={pep440}: {deps}")
           for init in pathlib.Path("src").glob("*/__init__.py"):
               found = re.search(r'^__version__ = "([^"]+)"', init.read_text(), re.M)
               if found and found.group(1) != python:
@@ -66,11 +120,14 @@ jobs:
       - name: Package crate
         run: cargo package
 
-      - name: Build the kibisis_native extension wheel
+      # The tests run against a wheel built here with --locked (same source as the published ones); the
+      # published extension wheels come from the `native` job above.
+      - name: Build and install the kibisis_native extension for the tests
         run: |
           python -m pip install --upgrade pip maturin
-          (cd bindings/python && maturin build --release --locked --out dist)
-          python -m pip install dist/kibisis_native-*.whl
+          (cd bindings/python && maturin build --release --locked --out "$RUNNER_TEMP/native-wheel")
+          python -m pip install "$RUNNER_TEMP"/native-wheel/*.whl
+          python -c "import kibisis_native as n; print('kibisis_native', n.crate_version())"
 
       - name: Run Python tests
         run: |
@@ -80,10 +137,18 @@ jobs:
       - name: Build sdist and wheel
         run: python -m build
 
+      - name: Download the extension distributions
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: native-*
+          path: native-dist
+          merge-multiple: true
+
       - name: Collect release files and checksums
         run: |
           mkdir release
-          cp dist/*.whl dist/*.tar.gz target/package/*.crate release/
+          cp dist/*.whl dist/*.tar.gz native-dist/*.whl native-dist/*.tar.gz target/package/*.crate release/
+          ls release
           cd release && sha256sum * > SHA256SUMS && cat SHA256SUMS
 
       - name: Attest build provenance
@@ -122,7 +187,8 @@ jobs:
           name: release-files
           path: release
 
-      # No --no-deps: dependencies resolve from PyPI exactly as `pip install kibisis` would.
+      # No --no-deps: dependencies resolve from PyPI exactly as `pip install kibisis` would; kibisis_native,
+      # not yet on PyPI at this point of the run, resolves from the release files for this platform.
       - name: Install the wheel and open an encrypted vault
         shell: bash
         run: |
@@ -133,14 +199,17 @@ jobs:
           "$PY" - <<'EOF'
           import pathlib, platform, tempfile
           import sqlcipher3
-          import kibisis
-          from kibisis import SQLiteMemoryVault
+          import kibisis, kibisis_native
+          from kibisis import FileLeaseCoordinator, SQLiteMemoryVault
           with tempfile.TemporaryDirectory() as tmp:
               vault = SQLiteMemoryVault(pathlib.Path(tmp) / "smoke.db", passphrase="release install smoke test")
               vault.put("smoke", "check", "installed from the release wheel")
               assert vault.get("smoke", "check").content == "installed from the release wheel"
               vault.close()
-          print(platform.system(), platform.machine(), "kibisis", kibisis.__version__, "with", sqlcipher3.__name__)
+              lease = FileLeaseCoordinator(pathlib.Path(tmp) / "leases").acquire("smoke", "holder-a", ttl_seconds=5)
+              assert lease.fencing_token == 1, lease
+          print(platform.system(), platform.machine(), "kibisis", kibisis.__version__, "kibisis_native",
+                kibisis_native.crate_version(), "with", sqlcipher3.__name__)
           EOF
 
   github-release:
@@ -190,12 +259,25 @@ jobs:
           name: release-files
           path: release
 
-      - name: Keep only the Python distributions
-        run: mkdir dist && cp release/*.whl release/*.tar.gz dist/
+      - name: Keep only the Python distributions, one project per directory
+        run: |
+          mkdir dist-native dist
+          cp release/kibisis_native-*.whl release/kibisis_native-*.tar.gz dist-native/
+          cp release/kibisis-*.whl release/kibisis-*.tar.gz dist/
+          ls dist-native dist
 
-      # Trusted publishing: no stored token. PyPI records the repository, workflow and commit.
-      - name: Publish
+      # Trusted publishing: no stored token. PyPI records the repository, workflow and commit. Both projects
+      # (kibisis-native, kibisis) carry this workflow + environment as their trusted publisher; the extension
+      # publishes first so `pip install kibisis==<version>` resolves the moment the second upload lands.
+      - name: Publish kibisis-native
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist-native
+
+      - name: Publish kibisis
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist
 
   publish-crates:
     name: Publish to crates.io
