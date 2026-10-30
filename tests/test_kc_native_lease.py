@@ -111,3 +111,39 @@ def test_journal_hashes_come_from_the_crate():
 
     assert vmod._event_hash is kibisis_native.event_hash_v3 or getattr(vmod._event_hash, "__wrapped_native__", None) is kibisis_native.event_hash_v3
     assert vmod._head_mac is kibisis_native.head_mac_v1 or getattr(vmod._head_mac, "__wrapped_native__", None) is kibisis_native.head_mac_v1
+
+
+def _hammer(args):
+    """One holder process: acquire/release the same resource in a tight loop; return the tokens it saw."""
+    lease_dir, holder, rounds = args
+    from kibisis.lease import FileLeaseCoordinator
+    from kibisis import LeaseConflictError
+    c = FileLeaseCoordinator(lease_dir)
+    tokens = []
+    while len(tokens) < rounds:
+        try:
+            lease = c.acquire("shared", holder, ttl_seconds=5)
+        except LeaseConflictError:
+            continue
+        tokens.append(lease.fencing_token)
+        assert c.validate_fencing_token("shared", holder, lease.fencing_token)
+        assert c.release(lease)
+    return tokens
+
+
+def test_fencing_tokens_are_strictly_monotonic_under_8_concurrent_holders(tmp_path):
+    """P7.3 prereg bar: eight holder processes contend on one resource through the file coordinator;
+    every token handed out is unique and the sequence is strictly increasing."""
+    import multiprocessing as mp
+
+    d = str(tmp_path / "leases")
+    FileLeaseCoordinator(d)
+    rounds = 25
+    with mp.get_context("spawn").Pool(8) as pool:
+        per_holder = pool.map(_hammer, [(d, f"h{i}", rounds) for i in range(8)])
+    all_tokens = sorted(t for toks in per_holder for t in toks)
+    assert len(all_tokens) == 8 * rounds
+    assert len(set(all_tokens)) == len(all_tokens), "a fencing token was handed out twice"
+    assert all_tokens == list(range(all_tokens[0], all_tokens[0] + len(all_tokens))), "a token was skipped or reused"
+    for toks in per_holder:
+        assert toks == sorted(toks) and len(set(toks)) == len(toks)
