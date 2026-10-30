@@ -8,9 +8,11 @@ write lock, and a refused call changes nothing: no entry, no tombstone, no audit
 
 import time
 
+import tempfile
+
 import pytest
 
-from kibisis import LeaseConflictError, SQLiteLeaseCoordinator, SQLiteMemoryVault
+from kibisis import LeaseConflictError, FileLeaseCoordinator, SQLiteMemoryVault
 
 RESOURCE = "memory/shared"
 
@@ -23,7 +25,7 @@ def _no_passphrase(monkeypatch):
 
 @pytest.fixture
 def coordinator():
-    coord = SQLiteLeaseCoordinator(":memory:")
+    coord = FileLeaseCoordinator(tempfile.mkdtemp())
     yield coord
     coord.close()
 
@@ -91,7 +93,7 @@ def test_stale_token_after_a_takeover_is_refused(vault, coordinator, with_holder
 
 def test_expired_lease_is_refused(vault, coordinator):
     lease = coordinator.acquire(RESOURCE, "worker-a", ttl_seconds=0.05)
-    time.sleep(0.1)
+    time.sleep(1.1)  # the shared deadline is a whole second, rounded up (K-C)
     with pytest.raises(LeaseConflictError):
         vault.put("notes", "k", "v", **fence(lease))
     assert vault.get("notes", "k") is None
@@ -120,11 +122,12 @@ def test_without_enforce_fencing_a_token_that_is_passed_is_still_checked(coordin
     assert v.get("notes", "k") is None
 
 
-class _SpyCoordinator(SQLiteLeaseCoordinator):
+class _SpyCoordinator(FileLeaseCoordinator):
     """Records whether the vault had its write transaction open when the token was checked."""
 
     def __init__(self):
-        super().__init__(":memory:")
+        self._tmp = tempfile.TemporaryDirectory()
+        super().__init__(self._tmp.name)
         self.vault = None
         self.in_transaction = []
 
@@ -152,11 +155,11 @@ def test_token_is_checked_while_the_vault_holds_its_write_lock(with_holder):
 
 
 def test_vault_and_coordinators_sharing_one_encrypted_file(tmp_path):
-    """The Hermes plugin's layout: vault and leases in one encrypted file, two workers' coordinators."""
+    """The Hermes plugin's layout: encrypted vault file plus a lease directory beside it, two workers' coordinators."""
     path = str(tmp_path / "vault.sqlite")
     secret = "fencing-test-passphrase"
-    coord_a = SQLiteLeaseCoordinator(path, passphrase=secret)
-    coord_b = SQLiteLeaseCoordinator(path, passphrase=secret)
+    coord_a = FileLeaseCoordinator(str(tmp_path / "leases"))
+    coord_b = FileLeaseCoordinator(str(tmp_path / "leases"))
     v = SQLiteMemoryVault(path, passphrase=secret, coordinator=coord_a, enforce_fencing=True)
 
     a = coord_a.acquire(RESOURCE, "worker-a", ttl_seconds=30)

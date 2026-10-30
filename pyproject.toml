@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kibisis"
-version = "0.1.0a11"
+version = "0.1.0a12"
 description = "Local-first encrypted cognitive memory vault with atomic concurrency leases."
 readme = "README.md"
 authors = [
@@ -24,6 +24,7 @@ classifiers = [
 requires-python = ">=3.11"
 dependencies = [
     "cryptography>=42",
+    "kibisis-native==0.1.0a12",
     "pydantic>=2",
     "sqlcipher3>=0.5",
 ]

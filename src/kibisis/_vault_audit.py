@@ -19,6 +19,8 @@ from typing import Any, Dict, List, Optional
 from .models import AuditEvent
 
 # The vault's logger: records keep the name callers filter on.
+import kibisis_native as _native
+
 logger = logging.getLogger("kibisis.vault")
 
 
@@ -74,17 +76,12 @@ def _event_hash(
     if fmt < 3:
         payload = f"{sequence}:{timestamp:.6f}:{action}:{category}:{key}:{scope}:{value_sha256}:{prev_hash}:{author_id or ''}"
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-    # A digest of the canonical metadata, not the metadata itself, keeps the payload bounded and makes
-    # the hash independent of how the stored JSON happens to be spaced.
-    meta_digest = hashlib.sha256(
-        json.dumps(metadata or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    ).hexdigest()
-    fields = [
-        int(sequence), f"{timestamp:.6f}", action, category, key, scope, value_sha256, prev_hash, author_id or "",
-        meta_digest,
-    ]
-    payload = json.dumps(fields, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    # Format 3 is hashed by the crate (one implementation for the Python vault and the Rust verifier).
+    # The metadata goes in canonical form; the crate digests it so the payload stays bounded and
+    # independent of how the stored JSON happens to be spaced.
+    canonical = json.dumps(metadata or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return _native.event_hash_v3(int(sequence), float(timestamp), action, category, key, scope, value_sha256,
+                                 prev_hash, author_id or None, canonical)
 
 
 def _head_mac(signing_key: bytes, sequence: int, event_hash: str) -> str:
@@ -93,8 +90,7 @@ def _head_mac(signing_key: bytes, sequence: int, event_hash: str) -> str:
     Without a passphrase the signing key is not secret (it is derived from the path), so the head
     then catches accidental truncation only; with a passphrase it is derived from the passphrase.
     """
-    payload = json.dumps([int(sequence), event_hash], separators=(",", ":")).encode("utf-8")
-    return hmac.new(signing_key, b"kibisis audit head v1:" + payload, hashlib.sha256).hexdigest()
+    return _native.head_mac_v1(bytes(signing_key), int(sequence), event_hash)
 
 
 class AuditJournalMixin:
@@ -243,3 +239,9 @@ class AuditJournalMixin:
         if not events:
             return False  # a signed head with no rows: the whole journal was removed
         return head["sequence"] == events[-1].sequence and head["event_hash"] == events[-1].event_hash
+
+
+# K-C: the format-3 path is the crate's; the Python wrappers only canonicalise metadata and keep the
+# legacy (format 1/2) layout for rows written before format 3.
+_event_hash.__wrapped_native__ = _native.event_hash_v3  # type: ignore[attr-defined]
+_head_mac.__wrapped_native__ = _native.head_mac_v1  # type: ignore[attr-defined]

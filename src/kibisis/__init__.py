@@ -11,7 +11,7 @@ from .protocols import (
 )
 from .admission import AdmissionDecision, FactDisposition, MemoryAdmissionGate
 from .crypto import AESGCMCryptoEnvelopeProvider
-from .lease import SQLiteLeaseCoordinator
+from .lease import FileLeaseCoordinator
 from .keys import generate_keyfile, resolve_passphrase
 from .vault import (
     ORIGINS,
@@ -24,7 +24,7 @@ from .vault import (
 )
 from .mcp_server import KibisisMCPServer
 
-__version__ = "0.1.0a11"
+__version__ = "0.1.0a12"
 
 __all__ = [
     "AuditEvent",
@@ -46,7 +46,7 @@ __all__ = [
     "LeaseError",
     "MemoryVault",
     "AESGCMCryptoEnvelopeProvider",
-    "SQLiteLeaseCoordinator",
+    "FileLeaseCoordinator",
     "SQLiteMemoryVault",
     "Probe",
     "ReviewedEntryError",

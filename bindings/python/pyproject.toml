@@ -1,0 +1,20 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "kibisis-native"
+version = "0.1.0a12"
+description = "Python extension exposing the kibisis Rust lease coordinator (file leases with fencing tokens) and journal hashing."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+]
+
+[tool.maturin]
+module-name = "kibisis_native"

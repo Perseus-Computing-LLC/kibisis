@@ -1,11 +1,12 @@
 """Unit tests for Kibisis memory vault, AES-GCM envelope, and concurrency leases."""
 
+import tempfile
 import unittest
 from kibisis import (
     AESGCMCryptoEnvelopeProvider,
     LeaseConflictError,
     MemoryEntity,
-    SQLiteLeaseCoordinator,
+    FileLeaseCoordinator,
     SQLiteMemoryVault,
 )
 
@@ -13,12 +14,14 @@ from kibisis import (
 class TestKibisisContracts(unittest.TestCase):
     def setUp(self):
         self.vault = SQLiteMemoryVault(":memory:")
-        self.coordinator = SQLiteLeaseCoordinator(":memory:")
+        self._leases = tempfile.TemporaryDirectory()
+        self.coordinator = FileLeaseCoordinator(self._leases.name)
         self.crypto = AESGCMCryptoEnvelopeProvider()
 
     def tearDown(self):
         self.vault.close()
         self.coordinator.close()
+        self._leases.cleanup()
 
     def test_vault_crud_and_fts_search(self):
         entity = self.vault.put(

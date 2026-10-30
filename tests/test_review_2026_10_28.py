@@ -260,10 +260,10 @@ def test_envelope_iteration_count_is_bounded(monkeypatch):
 # K-07: lease TTLs are bounded and the holder gets a monotonic deadline of its own.
 
 
-def test_lease_ttl_is_bounded_and_lease_carries_monotonic_deadline():
-    from kibisis.lease import MAX_TTL_SECONDS, SQLiteLeaseCoordinator
+def test_lease_ttl_is_bounded_and_lease_carries_monotonic_deadline(tmp_path):
+    from kibisis.lease import MAX_TTL_SECONDS, FileLeaseCoordinator
 
-    coord = SQLiteLeaseCoordinator(":memory:")
+    coord = FileLeaseCoordinator(str(tmp_path))
     for bad in (0, -1, MAX_TTL_SECONDS + 1):
         with pytest.raises(ValueError):
             coord.acquire("r", "holder", ttl_seconds=bad)

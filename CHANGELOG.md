@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- K-C (telarch P7.3): one lease coordinator. `kibisis.FileLeaseCoordinator` adapts the crate's
+  `FileLeaseCoordinator` through the new `kibisis_native` extension (`bindings/python`, pyo3, abi3):
+  one lock file and one state file per resource under a `0700` directory, fencing tokens that only go
+  up. The Python SQLite lease table (`SQLiteLeaseCoordinator`) is gone, and the format-3 journal hash
+  and head MAC are the crate's functions, so the Python vault and the Rust verifier share one
+  implementation. The shared `expires_at` is a whole second rounded up (the crate's resolution).
+  `kibisis` now requires `kibisis-native` (same version); there is no pure-Python fallback.
+
 ## [0.1.0-alpha.11] - 2026-10-29
 
 ### Added

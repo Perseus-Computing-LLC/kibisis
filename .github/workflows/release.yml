@@ -66,9 +66,14 @@ jobs:
       - name: Package crate
         run: cargo package
 
+      - name: Build the kibisis_native extension wheel
+        run: |
+          python -m pip install --upgrade pip maturin
+          (cd bindings/python && maturin build --release --locked --out dist)
+          python -m pip install dist/kibisis_native-*.whl
+
       - name: Run Python tests
         run: |
-          python -m pip install --upgrade pip
           python -m pip install build pytest .
           python -m pytest tests -q
 
@@ -124,7 +129,7 @@ jobs:
           python -m venv "$RUNNER_TEMP/venv"
           PY="$RUNNER_TEMP/venv/bin/python"
           "$PY" -m pip install --upgrade pip
-          "$PY" -m pip install release/*.whl
+          "$PY" -m pip install --find-links release release/kibisis-*.whl
           "$PY" - <<'EOF'
           import pathlib, platform, tempfile
           import sqlcipher3

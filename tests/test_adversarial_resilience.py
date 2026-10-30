@@ -7,7 +7,7 @@ import unittest
 import sqlcipher3
 
 from kibisis.vault import SQLiteMemoryVault
-from kibisis.lease import SQLiteLeaseCoordinator
+from kibisis.lease import FileLeaseCoordinator
 
 PASS = "adversarial_testing_passphrase_2026"
 
@@ -80,15 +80,15 @@ class TestAdversarialResilience(unittest.TestCase):
         self.assertEqual(res_del, [(1,)])
         v.close()
 
-    def test_lease_coordinator_memory_security_active(self):
-        """Verify that SQLiteLeaseCoordinator configures memory security and secure delete."""
-        lease_db = os.path.join(self.tmp.name, "lease.db")
-        coord = SQLiteLeaseCoordinator(lease_db, passphrase=PASS)
-        res_mem = [tuple(r) for r in coord._conn.execute("PRAGMA cipher_memory_security;").fetchall()]
-        res_del = [tuple(r) for r in coord._conn.execute("PRAGMA secure_delete;").fetchall()]
-        self.assertEqual(res_mem, [('1',)])
-        self.assertEqual(res_del, [(1,)])
-
+    def test_lease_coordinator_files_are_private(self):
+        """K-C: leases live in files the crate creates 0700/0600; nothing of them is readable to others."""
+        import stat
+        lease_dir = os.path.join(self.tmp.name, "leases")
+        coord = FileLeaseCoordinator(lease_dir)
+        coord.acquire("vault", "worker", ttl_seconds=5)
+        self.assertEqual(stat.S_IMODE(os.stat(lease_dir).st_mode), 0o700)
+        for name in os.listdir(lease_dir):
+            self.assertEqual(stat.S_IMODE(os.stat(os.path.join(lease_dir, name)).st_mode), 0o600)
 
 if __name__ == "__main__":
     unittest.main()

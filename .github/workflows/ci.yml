@@ -24,10 +24,14 @@ jobs:
           components: rustfmt, clippy
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path bindings/python/Cargo.toml -- --check
 
       - name: Clippy linter
-        run: cargo clippy --all-targets -- -D warnings
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo clippy --manifest-path bindings/python/Cargo.toml --all-targets -- -D warnings
 
       - name: Run unit & doc tests
         run: cargo test --verbose
@@ -82,12 +86,24 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pydantic cryptography sqlcipher3 pytest hatchling build
+          pip install pydantic cryptography sqlcipher3 pytest hatchling build maturin
+
+      # K-C: the lease coordinator and the format-3 journal hashes are the crate's; the Python package
+      # requires the kibisis_native extension (no fallback), so it is built and installed first.
+      - name: Build and install the kibisis_native extension
+        run: |
+          (cd bindings/python && maturin build --release --locked --out "$RUNNER_TEMP/native-wheel")
+          pip install "$RUNNER_TEMP"/native-wheel/*.whl
+          python -c "import kibisis_native as n; print('kibisis_native', n.crate_version())"
 
       # Installs the built wheel the way a user would: dependencies resolved from PyPI, no --no-deps.
+      # The native wheel is not on PyPI yet, so it is offered from the local directory with --find-links.
       - name: Install the wheel with its dependencies in a clean venv
         shell: bash
         run: |
@@ -95,7 +111,7 @@ jobs:
           python -m venv "$RUNNER_TEMP/smoke"
           PY="$RUNNER_TEMP/smoke/bin/python"
           "$PY" -m pip install --upgrade pip
-          "$PY" -m pip install dist/*.whl
+          "$PY" -m pip install --find-links "$RUNNER_TEMP/native-wheel" dist/*.whl
           "$PY" -c "import platform, sqlcipher3, kibisis; print(platform.system(), platform.machine(), 'kibisis', kibisis.__version__, 'with', sqlcipher3.__name__)"
 
       - name: Run pytest
