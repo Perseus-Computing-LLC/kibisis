@@ -9,6 +9,7 @@ without the extension fails at import, loudly, instead of silently coordinating 
 from __future__ import annotations
 
 import os
+import pathlib
 import stat
 import time
 
@@ -113,43 +114,40 @@ def test_journal_hashes_come_from_the_crate():
     assert vmod._head_mac is kibisis_native.head_mac_v1 or getattr(vmod._head_mac, "__wrapped_native__", None) is kibisis_native.head_mac_v1
 
 
-def _hammer(args):
-    """One holder process: acquire/release the same resource in a tight loop; return the tokens it saw."""
-    lease_dir, holder, rounds = args
-    import random
-    import time
-    from kibisis.lease import FileLeaseCoordinator
-    from kibisis import LeaseConflictError
-    c = FileLeaseCoordinator(lease_dir)
-    tokens = []
-    deadline = time.monotonic() + 90
-    while len(tokens) < rounds:
-        if time.monotonic() > deadline:
-            return tokens   # the caller's count assertion names the shortfall instead of a hung job
+def _run_holders(lease_dir, holders, rounds, timeout=150):
+    """Start one OS process per holder as a script (no pickling: under the spawn start method a child
+    cannot re-import a test module that pytest loaded as `tests.test_kc_native_lease`; at 6d26d53 the
+    children died with ModuleNotFoundError and pool.map waited forever, hanging CI >1 h on every platform).
+    Every wait is bounded so a repeat fails with the shortfall instead of hanging."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    script = str(pathlib.Path(__file__).with_name("_kc_hammer.py"))
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
+    procs = [subprocess.Popen([sys.executable, script, lease_dir, h, str(rounds)], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, env=env, text=True) for h in holders]
+    results = []
+    for proc in procs:
         try:
-            lease = c.acquire("shared", holder, ttl_seconds=5)
-        except LeaseConflictError:
-            # Back off between retries. At 6d26d53 this test (tight retry, no deadline) hung for over an
-            # hour on every CI platform while passing in 4 s locally, even pinned to one core; the
-            # deadline above and the pool timeout below turn a repeat into a failure that says where.
-            time.sleep(random.uniform(0.001, 0.005))
-            continue
-        tokens.append(lease.fencing_token)
-        assert c.validate_fencing_token("shared", holder, lease.fencing_token)
-        assert c.release(lease)
-    return tokens
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            pytest.fail(f"holder process did not finish in {timeout}s: {err[-2000:]}")
+        assert proc.returncode == 0, err[-2000:]
+        results.append(json.loads(out))
+    return results
 
 
 def test_fencing_tokens_are_strictly_monotonic_under_8_concurrent_holders(tmp_path):
     """P7.3 prereg bar: eight holder processes contend on one resource through the file coordinator;
     every token handed out is unique and the sequence is strictly increasing."""
-    import multiprocessing as mp
-
     d = str(tmp_path / "leases")
     FileLeaseCoordinator(d)
     rounds = 25
-    with mp.get_context("spawn").Pool(8) as pool:
-        per_holder = pool.map_async(_hammer, [(d, f"h{i}", rounds) for i in range(8)]).get(timeout=150)
+    per_holder = _run_holders(d, [f"h{i}" for i in range(8)], rounds)
     all_tokens = sorted(t for toks in per_holder for t in toks)
     assert len(all_tokens) == 8 * rounds
     assert len(set(all_tokens)) == len(all_tokens), "a fencing token was handed out twice"
