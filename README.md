@@ -99,10 +99,10 @@ Medians of five runs of [telarch-benchmarks](https://github.com/Perseus-Computin
 | --- | --- |
 | Times two holders had the same lease, in 64,000 contended attempts from 16 and 32 threads | 0 |
 | Fencing tokens that went backwards | 0 |
-| Times two processes held the lease at once, 2 to 32 processes sharing one SQLite file | 0 |
+| Times two processes held the lease at once, 2 to 32 processes sharing one lease directory | 0 |
 | Late write from a paused holder | rejected |
-| Lease database after its holder is killed with SIGKILL while holding the lease | intact |
-| Lease decisions per second under contention, 16 threads, in memory (Rust coordinator; counts every acquire attempt, about 95% of which were rejected, so this is not acquire-release cycles and not the Python vault, whose leases are SQLite transactions) | 1,303,318 |
+| Lease state after its holder is killed with SIGKILL while holding the lease | intact |
+| Lease decisions per second under contention, 16 threads, in memory (Rust coordinator; counts every acquire attempt, about 95% of which were rejected, so this is not acquire-release cycles and not the Python package's file coordinator, which crosses processes) | 1,303,318 |
 
 ## How it works
 
@@ -124,7 +124,7 @@ Medians of five runs of [telarch-benchmarks](https://github.com/Perseus-Computin
 - **Scopes:** A library caller names the scope. Kibisis keeps scopes apart but does not decide which caller may use which scope. The MCP server serves only the scope it was started with.
 - **Review:** `python -m kibisis.review` records the operating-system user name (or `--reviewer`) as the reviewer. It is not an authentication boundary: anything that can run commands as that user can run it.
 - **Fencing:** The Python vault checks fencing tokens only when it is opened with `enforce_fencing=True` or a call passes a token. `migrate_plaintext`, which re-encrypts stored rows without changing them, and `adopt_unsigned_entries` take no token. The MCP server opens its vault without a coordinator, and the Rust vault does not check tokens. Storage outside Kibisis must compare tokens itself.
-- **Lease coordination scope:** Leases coordinate threads in one process, or processes on one machine that share a local filesystem: through SQLite transactions in Python, or through operating-system file locks on a shared directory with the Rust `FileLeaseCoordinator`. They are not a distributed consensus service, and network filesystems are not supported.
+- **Lease coordination scope:** Leases coordinate threads in one process, or processes on one machine that share a local filesystem: through operating-system file locks on a shared directory with `FileLeaseCoordinator` (the Rust one, which the Python package reaches through the `kibisis_native` extension). They are not a distributed consensus service, and network filesystems are not supported.
 - **TTL resolution:** The Rust coordinators track deadlines in whole seconds and round up, so a lease is held for at least its TTL and at most one second longer. The Python SQLite coordinator uses floating-point second timestamps.
 - **Upgrade from 0.1.0a5 or earlier:** The first open with the passphrase upgrades the vault in one transaction: entries are re-sealed, bound to their entry, and re-signed; digests in the journal and in tombstones are keyed; the journal's hashes are recomputed; and a `migrate` event records the counts and the old chain head. It refuses to run under a wrong passphrase. Older versions cannot read an upgraded vault, so upgrade every process that opens it at the same time. An entry without a signature, in a vault that was not already SQLCipher-encrypted, cannot be told apart from a tampered one, so it is refused until `adopt_unsigned_entries()` accepts it; `integrity_status()` counts such entries. Tombstones in a snapshot from a vault with a different passphrase are not applied, and the import journals that.
 - **Upgrade from 0.1.0a6 or earlier (search index):** The first open of a SQLCipher vault with its passphrase builds the search index by opening each entry once. Older versions keep working on the vault: triggers queue the rows they write, and the next search indexes them. The same holds for the keyed term index of a vault without SQLCipher: the first open builds it, and rows written by an older version are indexed before the next search.
