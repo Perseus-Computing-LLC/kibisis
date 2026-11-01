@@ -232,6 +232,59 @@ def test_re_export_into_a_previous_bundle_keeps_its_log(tmp_path, probe):
     assert leftovers == []
 
 
+_COUNTS_ONLY = re.compile(r"\* \*\*Export\*\*: exported \d+; withheld \d+(?: \([a-z_]+ \d+(?:, [a-z_]+ \d+)*\))?\.")
+
+
+def test_the_log_carries_counts_only(tmp_path, probe):
+    # P13.1: "a log.md entry per run (counts only: exported, and withheld by reason)". The profile digest
+    # belongs to index.md alone.
+    out = tmp_path / "b"
+    export_bundle(probe, _profile(), out, at=AT, ungated=True)
+    export_bundle(probe, _profile(), out, at="2026-11-02", ungated=True)
+    log = (out / "log.md").read_text(encoding="utf-8")
+    bullets = [line for line in log.splitlines() if line.startswith("* ")]
+    assert len(bullets) == 2
+    assert all(_COUNTS_ONLY.fullmatch(line) for line in bullets), bullets
+    assert _profile().digest not in log
+    assert not re.search(r"[0-9a-fA-F]{32,}", log)
+
+
+_EXCHANGE_PLATFORM = sys.platform.startswith("linux") or sys.platform == "darwin"
+
+
+@pytest.mark.skipif(not _EXCHANGE_PLATFORM, reason="one-call directory exchange is Linux/macOS only")
+def test_exchange_swaps_two_directories(tmp_path):
+    from kibisis.okf.export import _exchange_dirs
+
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    (a / "x").write_text("a")
+    (b / "y").write_text("b")
+    assert _exchange_dirs(str(a), str(b)) is True
+    assert os.listdir(a) == ["y"]
+    assert os.listdir(b) == ["x"]
+
+
+@pytest.mark.skipif(not _EXCHANGE_PLATFORM, reason="one-call directory exchange is Linux/macOS only")
+def test_re_export_replaces_the_bundle_in_one_exchange(tmp_path, probe, monkeypatch):
+    # P13.1: the bundle is replaced "by an atomic directory swap", so --out never goes missing mid-replace.
+    out = tmp_path / "b"
+    export_bundle(probe, _profile(), out, at="2026-10-31", ungated=True)
+    real_rename = os.rename
+
+    def guarded(src, dst, *args, **kwargs):
+        if os.path.abspath(os.fspath(src)) == str(out):
+            raise AssertionError("--out was renamed away: the replace was not one exchange")
+        return real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rename", guarded)
+    export_bundle(probe, _profile(), out, at=AT, ungated=True)
+    assert "## 2026-11-01" in (out / "log.md").read_text(encoding="utf-8")
+    assert oct(out.stat().st_mode & 0o777) == "0o700"
+    assert [p for p in os.listdir(tmp_path) if "okf-" in p] == []
+
+
 # ---------------------------------------------------------------- content gate: withheld, never redacted
 
 
