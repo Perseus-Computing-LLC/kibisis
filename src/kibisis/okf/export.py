@@ -20,13 +20,19 @@ The bundle root gets ``index.md`` (frontmatter ``okf_version`` and ``telarch_exp
 and ``log.md`` (one entry per run, counts only). Concept files and ``index.md`` carry no run time;
 ``at`` fixes only the log date, so the same vault, profile and ``at`` give the same bytes.
 
-The bundle is written to a fresh staging directory beside ``out`` and moved into place by rename.
+The bundle is written to a fresh staging directory beside ``out`` and moved into place by rename, or,
+when ``out`` already holds a bundle, by one exchange call (renameat2 / renamex_np) so ``out`` never
+goes missing; other platforms fall back to two renames.
 ``out`` must be absent, empty, or a bundle this exporter wrote; anything else is refused untouched.
 The library refuses to write without a gate choice: ``row_gate``, ``bundle_gate`` or an explicit
 ``ungated=True`` (synthetic fixtures).
 """
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
+import errno
+import functools
 import math
 import os
 import re
@@ -327,11 +333,11 @@ def _index_text(kept: Dict[str, _Concept], digest: str) -> str:
 _LOG_HEADING = re.compile(r"## (\d{4}-\d{2}-\d{2})[ \t]*\Z")
 
 
-def _log_bullet(exported: int, withheld: Dict[str, int], digest: str) -> str:
+def _log_bullet(exported: int, withheld: Dict[str, int]) -> str:
+    """Counts only: rows exported, and withheld by reason (the profile digest lives in index.md)."""
     parts = ", ".join("%s %d" % (k, withheld[k]) for k in sorted(withheld))
     detail = " (%s)" % parts if parts else ""
-    return "* **Export**: exported %d; withheld %d%s; profile sha256 %s." % (
-        exported, sum(withheld.values()), detail, digest)
+    return "* **Export**: exported %d; withheld %d%s." % (exported, sum(withheld.values()), detail)
 
 
 def _log_text(prior: Optional[str], day: str, bullet: str) -> str:
@@ -447,6 +453,47 @@ def _prepare_out(out: Path) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
+#: Linux renameat2 RENAME_EXCHANGE and macOS renamex_np RENAME_SWAP share the value 2.
+_EXCHANGE_FLAG = 2
+_AT_FDCWD = -100
+
+
+@functools.lru_cache(maxsize=1)
+def _libc() -> Optional[Any]:
+    try:
+        name = ctypes.util.find_library("c")
+        return ctypes.CDLL(name, use_errno=True) if name else ctypes.CDLL(None, use_errno=True)
+    except OSError:
+        return None
+
+
+def _exchange_dirs(a: str, b: str) -> bool:
+    """Swap two existing paths in one atomic call: renameat2(RENAME_EXCHANGE) on Linux, renamex_np(RENAME_SWAP)
+    on macOS. False when the platform, libc or filesystem has no such call; any other failure raises OSError."""
+    libc = _libc()
+    if libc is None:
+        return False
+    src, dst = os.fsencode(a), os.fsencode(b)
+    if sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
+        fn = libc.renameat2
+        fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        fn.restype = ctypes.c_int
+        rc = fn(_AT_FDCWD, src, _AT_FDCWD, dst, _EXCHANGE_FLAG)
+    elif sys.platform == "darwin" and hasattr(libc, "renamex_np"):
+        fn = libc.renamex_np
+        fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        fn.restype = ctypes.c_int
+        rc = fn(src, dst, _EXCHANGE_FLAG)
+    else:
+        return False
+    if rc == 0:
+        return True
+    err = ctypes.get_errno()
+    if err in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP):
+        return False
+    raise OSError(err, os.strerror(err), a)
+
+
 def _write_stage(parent: Path, files: Dict[str, str]) -> Path:
     stage = Path(tempfile.mkdtemp(prefix=".okf-stage-", dir=str(parent)))
     try:
@@ -475,8 +522,15 @@ def _write_stage(parent: Path, files: Dict[str, str]) -> Path:
 
 
 def _swap_into_place(stage: Path, out: Path, existed: bool) -> None:
+    """Move the staged bundle to ``out``: one rename when ``out`` is new, one exchange call when it exists.
+
+    Without an exchange call (other platforms or filesystems) it falls back to two renames, which
+    leaves a moment with no ``out``; the previous bundle is restored if the second rename fails."""
     if not existed:
         os.rename(stage, out)
+        return
+    if _exchange_dirs(str(stage), str(out)):
+        shutil.rmtree(stage, ignore_errors=True)  # the staging path now holds the previous bundle
         return
     old = out.parent / (".okf-old-" + secrets.token_hex(8))
     os.rename(out, old)
@@ -609,7 +663,7 @@ def export_bundle(
         counts = {k: v for k, v in withheld.items() if v}
         files = dict(docs)
         files["index.md"] = _index_text(kept, profile.digest)
-        files["log.md"] = _log_text(prior_log, day, _log_bullet(len(kept), counts, profile.digest))
+        files["log.md"] = _log_text(prior_log, day, _log_bullet(len(kept), counts))
         stage = _write_stage(out_path.parent, files)
         try:
             if bundle_gate is not None:
