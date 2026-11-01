@@ -1,8 +1,13 @@
-"""``python -m kibisis`` — operator commands that need a person at the keyboard."""
+"""``python -m kibisis`` — operator commands.
+
+``admit`` needs a person at the keyboard. ``okf-export`` and ``okf-check`` (P13.1) project the
+vault into an OKF v0.2 bundle and check one; they read the vault and never change it.
+"""
 from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import os
 import sys
 
@@ -56,6 +61,58 @@ def _admit(args: argparse.Namespace) -> int:
     return 0
 
 
+def _okf_export(args: argparse.Namespace) -> int:
+    from .okf.export import ExportError, GateRefused, command_gate, export_bundle
+    from .okf.profile import ProfileError, load_profile
+
+    try:
+        profile = load_profile(args.profile)
+    except ProfileError as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 2
+    try:
+        gate = command_gate(args.gate_cmd) if args.gate_cmd is not None else None
+    except (ExportError, ValueError) as exc:
+        print(f"refused: --gate-cmd: {exc}", file=sys.stderr)
+        return 2
+    # SQLiteMemoryVault creates a missing file; an export never creates a vault.
+    if not os.path.isfile(args.db):
+        print(f"error: no vault at {args.db}", file=sys.stderr)
+        return 1
+    try:
+        vault = SQLiteMemoryVault(args.db)
+    except Exception as exc:  # wrong or missing passphrase, not a vault, unreadable
+        print(f"error: cannot open the vault at {args.db}: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    try:
+        report = export_bundle(vault, profile, args.out, at=args.at, ungated=args.ungated, bundle_gate=gate)
+    except GateRefused as exc:
+        print(f"refused: {exc}; nothing was written to {args.out}", file=sys.stderr)
+        return 4
+    except ExportError as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        vault.close()
+    print(json.dumps(report.summary(), sort_keys=True))
+    return 0
+
+
+def _okf_check(args: argparse.Namespace) -> int:
+    from .okf.check import check_bundle
+
+    result = check_bundle(args.bundle)
+    if args.json:
+        print(json.dumps(result.as_dict(), sort_keys=True, indent=2))
+    else:
+        for f in result.errors:
+            print(f"error: {f.path}: [{f.code}] {f.message}")
+        for f in result.notes:
+            print(f"note: {f.path}: [{f.code}] {f.message}")
+        print(f"okf-check: {result.files_checked} files, {len(result.errors)} errors, {len(result.notes)} notes")
+    return 0 if result.ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m kibisis")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -68,6 +125,23 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--reviewer", default=getpass.getuser(), help="reviewer name recorded in the journal")
     a.add_argument("--note", default=None)
     a.set_defaults(func=_admit)
+
+    e = sub.add_parser("okf-export", help="write allowlisted vault rows as an OKF v0.2 bundle (reads the vault only)")
+    e.add_argument("--profile", required=True, help="export profile (JSON, kibisis.okf_export_profile/1)")
+    e.add_argument("--out", required=True, help="bundle directory: absent, empty, or a bundle okf-export wrote")
+    e.add_argument("--db", default=DEFAULT_DB_PATH, help="vault path (default: $KIBISIS_DB_PATH)")
+    e.add_argument("--at", default=None, help="ISO date or datetime for the log entry (default: today, UTC)")
+    g = e.add_mutually_exclusive_group(required=True)
+    g.add_argument("--gate-cmd", default=None,
+                   help="command run over the staged files (paths appended); non-zero aborts the bundle")
+    g.add_argument("--ungated", action="store_true", help="write without a content gate (synthetic fixtures only)")
+    e.set_defaults(func=_okf_export)
+
+    c = sub.add_parser("okf-check", help="check a bundle against the OKF v0.2 producer MUSTs")
+    c.add_argument("bundle", help="bundle directory")
+    c.add_argument("--json", action="store_true", help="print the result as JSON")
+    c.set_defaults(func=_okf_check)
+
     args = parser.parse_args(argv)
     return int(args.func(args))
 

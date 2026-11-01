@@ -17,7 +17,11 @@ from kibisis.okf.export import ExportError, GateRefused, export_bundle, iso_utc
 from kibisis.okf.frontmatter import parse_frontmatter, split_document
 from kibisis.okf.profile import load_profile, parse_profile
 
-from _okf_fixtures import (
+# --import-mode=importlib (pyproject) does not put tests/ on sys.path; append it for the shared fixtures.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.append(str(Path(__file__).resolve().parent))
+
+from _okf_fixtures import (  # noqa: E402
     DEFAULT_PROFILE_JSON,
     EXPORTABLE,
     PASSPHRASE,
@@ -46,6 +50,7 @@ def _profile():
 
 def _read(out: Path, rel: str):
     fm, body = split_document((out / rel).read_text(encoding="utf-8"))
+    assert fm is not None, f"{rel} has no frontmatter block"
     return parse_frontmatter(fm), body
 
 
