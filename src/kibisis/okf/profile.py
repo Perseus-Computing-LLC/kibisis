@@ -204,6 +204,17 @@ def parse_profile(text: str) -> ExportProfile:
     )
 
 
+def default_profile() -> ExportProfile:
+    """Owner decision 3 (P13): scope ``default`` and :data:`DEFAULT_CATEGORIES`; nothing named or excluded."""
+    return parse_profile(json.dumps({
+        "schema": SCHEMA,
+        "audience": "owner",
+        "allow": {"scopes": ["default"], "categories": list(DEFAULT_CATEGORIES)},
+        "named": [],
+        "exclude": {"keys": [], "categories": []},
+    }))
+
+
 def load_profile(path: Union[str, Path]) -> ExportProfile:
     """Read and validate a profile file (UTF-8 JSON)."""
     try:

@@ -2,13 +2,22 @@
 
 Stdlib only. Nothing here reaches the network or a third-party binary.
 """
-from .profile import DEFAULT_CATEGORIES, SCHEMA, ExportProfile, ProfileError, load_profile, parse_profile
+from .profile import (
+    DEFAULT_CATEGORIES,
+    SCHEMA,
+    ExportProfile,
+    ProfileError,
+    default_profile,
+    load_profile,
+    parse_profile,
+)
 
 __all__ = [
     "DEFAULT_CATEGORIES",
     "SCHEMA",
     "ExportProfile",
     "ProfileError",
+    "default_profile",
     "load_profile",
     "parse_profile",
 ]

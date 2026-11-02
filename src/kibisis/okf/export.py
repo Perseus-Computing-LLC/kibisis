@@ -22,6 +22,12 @@ out of ``index.md`` (``okf_version`` alone) for callers whose content gate flags
 still returned in the report, and every other file is unchanged. Concept files and ``index.md`` carry
 no run time; ``at`` fixes only the log date, so the same vault, profile and ``at`` give the same bytes.
 
+Unknown keys. A row whose metadata ``okf_extra`` (written by okf-import, P13.2) holds a JSON object gets
+those keys after the field map's own, in stored order, in the frontmatter writer's canonical form. A
+field-map key, or a key the vault owns (:func:`is_vault_owned_key`), is never written from it, so
+``okf_extra`` cannot add a stamp, a state, an identity or a lineage mark to a concept. A malformed ``okf_extra`` (not a
+JSON object, or a non-finite number) withholds the row as ``render_error``.
+
 The bundle is written to a fresh staging directory beside ``out`` and moved into place by rename, or,
 when ``out`` already holds a bundle, by one exchange call (renameat2 / renamex_np) so ``out`` never
 goes missing; other platforms fall back to two renames.
@@ -35,6 +41,7 @@ import ctypes
 import ctypes.util
 import errno
 import functools
+import json
 import math
 import os
 import re
@@ -51,21 +58,26 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 from .frontmatter import FrontmatterError, parse_frontmatter, render_document, split_document
+from ..vault import RESERVED_METADATA_KEYS, RESERVED_METADATA_PREFIX
 from .profile import ExportProfile
 
 __all__ = [
     "BundleGate",
     "ExportError",
     "ExportReport",
+    "FIELD_MAP_KEYS",
     "GateRefused",
     "LOG_TITLE",
     "OKF_VERSION",
     "PROFILE_DIGEST_KEY",
     "RowGate",
     "command_gate",
+    "dump_extra",
     "export_bundle",
     "first_sentence",
+    "is_vault_owned_key",
     "iso_utc",
+    "load_extra",
     "safe_segment",
     "type_name",
 ]
@@ -75,6 +87,24 @@ PROFILE_DIGEST_KEY = "telarch_export_profile_sha256"
 LOG_TITLE = "# Export Log"
 #: OKF reserved filenames (section 3.1) without the extension; compared case-insensitively.
 RESERVED_STEMS = frozenset({"index", "log"})
+#: Frontmatter keys the field map writes from vault state (INTEGRATION.md section 5). okf-import reads
+#: none of them back except ``verified``, whose stamps it keeps as claims, never as trust.
+FIELD_MAP_KEYS = frozenset({
+    "type", "title", "description", "status", "stale_after", "generated", "verified", "sources",
+    "kibisis_state", "kibisis_origin", "kibisis_superseded_by",
+})
+#: Keys the vault owns besides its reserved metadata: identity, state, sensitivity, lineage and
+#: supersession marks, per-write annotations, and the importer's own.
+_OWNED_KEYS = frozenset({
+    "author_id", "writer_id", "writer_class", "epistemic_state", "origin", "trust_ceiling", "reviewer_id",
+    "reviewer_origin", "confidential", "sensitivity",
+    "derived_from", "supersedes", "superseded_by", "supersession", "supersession_approved_by",
+    "proposed_supersedes", "pending_supersession_by", "revived_from", "invalidated_by",
+    "admission_disposition", "admission_provenance", "trust_capped_from",
+    "okf_extra", "okf_verified_claims",
+})
+_OWNED_LOWER = frozenset(k.lower() for k in RESERVED_METADATA_KEYS | _OWNED_KEYS)
+_OWNED_PREFIXES = (RESERVED_METADATA_PREFIX.lower(), "kibisis_", "telarch_")
 _ALL_EVENTS = 2 ** 62
 
 #: ``row_gate(rel_path, rendered_text)`` returns findings; any truthy result withholds the row.
@@ -269,6 +299,56 @@ class _Concept:
         return (self.row.scope, self.row.category, self.row.key)
 
 
+def is_vault_owned_key(key: Any) -> bool:
+    """True for a frontmatter key that names vault state rather than content, compared case-insensitively:
+    the vault's reserved metadata (and the ``lineage_`` prefix), identity, state and sensitivity keys, the
+    importer's own keys, any ``kibisis_`` or ``telarch_`` key, and a field-map key spelled in another case.
+    The field-map keys themselves are not owned; the field map handles them."""
+    if not isinstance(key, str):
+        return True
+    if key in FIELD_MAP_KEYS:
+        return False
+    low = key.lower()
+    return low in FIELD_MAP_KEYS or low in _OWNED_LOWER or low.startswith(_OWNED_PREFIXES)
+
+
+def dump_extra(items: Iterable[Tuple[str, Any]]) -> str:
+    """Unknown frontmatter keys as the JSON object okf-import stores in metadata ``okf_extra``, in order."""
+    obj: Dict[str, Any] = {}
+    for key, value in items:
+        if not isinstance(key, str) or key in obj:
+            raise ValueError(f"okf_extra: a bad or repeated key {key!r}")
+        obj[key] = value
+    return json.dumps(obj, allow_nan=False, separators=(",", ":"))
+
+
+def _no_repeats(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"okf_extra: repeated key {key!r}")
+        out[key] = value
+    return out
+
+
+def _non_finite(name: str) -> Any:
+    raise ValueError(f"okf_extra: non-finite number {name}")
+
+
+def load_extra(raw: Any) -> List[Tuple[str, Any]]:
+    """Metadata ``okf_extra`` as (key, value) pairs in stored order; ValueError unless it is a JSON object
+    with no repeated keys and no non-finite numbers."""
+    if not isinstance(raw, str):
+        raise ValueError("okf_extra: not a string")
+    try:
+        obj = json.loads(raw, object_pairs_hook=_no_repeats, parse_constant=_non_finite)
+    except RecursionError as exc:
+        raise ValueError("okf_extra: nested too deeply") from exc
+    if not isinstance(obj, dict):
+        raise ValueError("okf_extra: not a JSON object")
+    return list(obj.items())
+
+
 def _render(concept: _Concept, producer: str, link: Optional[str]) -> str:
     row = concept.row
     state = _state(row)
@@ -290,6 +370,11 @@ def _render(concept: _Concept, producer: str, link: Optional[str]) -> str:
         doc["kibisis_origin"] = str(row.origin)
     if link:
         doc["kibisis_superseded_by"] = link
+    meta = row.metadata if isinstance(row.metadata, dict) else {}
+    if meta.get("okf_extra") is not None:
+        for key, value in load_extra(meta["okf_extra"]):
+            if key not in doc and not is_vault_owned_key(key) and key not in FIELD_MAP_KEYS:
+                doc[key] = value
     text = render_document(doc, row.content)
     text.encode("utf-8")  # a lone surrogate cannot be written; the caller withholds the row
     return text

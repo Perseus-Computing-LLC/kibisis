@@ -1,7 +1,8 @@
 """``python -m kibisis`` — operator commands.
 
 ``admit`` needs a person at the keyboard. ``okf-export`` and ``okf-check`` (P13.1) project the
-vault into an OKF v0.2 bundle and check one; they read the vault and never change it.
+vault into an OKF v0.2 bundle and check one; they read the vault and never change it. ``okf-import``
+(P13.2) diffs a bundle into the vault as model-origin candidates; ``--dry-run`` writes nothing.
 """
 from __future__ import annotations
 
@@ -113,6 +114,38 @@ def _okf_check(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+def _okf_import(args: argparse.Namespace) -> int:
+    from .okf.importer import BundleImportError, import_bundle
+    from .okf.profile import ProfileError, default_profile, load_profile
+
+    try:
+        profile = load_profile(args.profile) if args.profile is not None else default_profile()
+    except ProfileError as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 2
+    if os.path.islink(args.bundle) or not os.path.isdir(args.bundle):
+        print(f"refused: no bundle directory at {args.bundle}", file=sys.stderr)
+        return 2
+    # SQLiteMemoryVault creates a missing file; an import never creates a vault.
+    if not os.path.isfile(args.db):
+        print(f"error: no vault at {args.db}", file=sys.stderr)
+        return 1
+    try:
+        vault = SQLiteMemoryVault(args.db)
+    except Exception as exc:  # wrong or missing passphrase, not a vault, unreadable
+        print(f"error: cannot open the vault at {args.db}: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    try:
+        report = import_bundle(vault, args.bundle, profile=profile, dry_run=args.dry_run)
+    except BundleImportError as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        vault.close()
+    print(json.dumps(report.summary(), sort_keys=True))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m kibisis")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -141,6 +174,14 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("bundle", help="bundle directory")
     c.add_argument("--json", action="store_true", help="print the result as JSON")
     c.set_defaults(func=_okf_check)
+
+    i = sub.add_parser("okf-import", help="diff an OKF v0.2 bundle into the vault as model-origin candidates")
+    i.add_argument("--bundle", required=True, help="bundle directory to read")
+    i.add_argument("--db", default=DEFAULT_DB_PATH, help="vault path (default: $KIBISIS_DB_PATH)")
+    i.add_argument("--profile", default=None,
+                   help="allowlist (export profile JSON); default: scope default, the four P13 categories")
+    i.add_argument("--dry-run", action="store_true", help="report what would change and write nothing")
+    i.set_defaults(func=_okf_import)
 
     args = parser.parse_args(argv)
     return int(args.func(args))
