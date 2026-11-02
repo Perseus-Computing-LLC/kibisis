@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.13] - 2026-11-02
+
+### Added
+- `kibisis.okf` (telarch P13): Open Knowledge Format v0.2 bundles out of and back into the vault.
+  - P13.4: the export profile `kibisis.okf_export_profile/1` (`kibisis.okf.profile`), loaded default-deny,
+    with a canonical digest.
+  - P13.1: `okf-export` writes allowlisted vault rows as an OKF v0.2 bundle and reads the vault only;
+    `kibisis.okf.frontmatter` is the stdlib frontmatter subset it writes and parses; `okf-check` checks a
+    bundle against the OKF v0.2 producer MUSTs. `log.md` carries counts only, and a bundle is replaced in
+    one exchange. `export_bundle(index_profile_digest=False)` leaves the profile digest out of `index.md`.
+    `kibisis.okf.export.first_sentence(content)` is the description an exported row carries.
+  - P13.2: `okf-import` diffs an OKF v0.2 bundle into the vault as model-origin candidates.
+
+### Changed
+- README: the lease rows and scope describe the file coordinator; benchmark figures from
+  telarch-benchmarks v0.1.0-alpha.11 (EC2 m8azn.metal, 2026-10-31).
+- Tests: the K-C 8-holder contention test runs its holders as script subprocesses with bounded waits
+  (`tests/_kc_hammer.py`); a spawned pool hung CI for over an hour.
+- CI: the github-actions group bumped (#22).
+
 ## [0.1.0-alpha.12] - 2026-10-30
 
 ### Changed
