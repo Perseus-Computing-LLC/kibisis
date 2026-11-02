@@ -17,8 +17,10 @@ A row is kept only if it passes, in this order (the first failure is the reason 
 
 Each kept row becomes ``<scope>/<category>/<key>.md`` under the INTEGRATION.md section 5 field map.
 The bundle root gets ``index.md`` (frontmatter ``okf_version`` and ``telarch_export_profile_sha256``)
-and ``log.md`` (one entry per run, counts only). Concept files and ``index.md`` carry no run time;
-``at`` fixes only the log date, so the same vault, profile and ``at`` give the same bytes.
+and ``log.md`` (one entry per run, counts only). ``index_profile_digest=False`` leaves the digest key
+out of ``index.md`` (``okf_version`` alone) for callers whose content gate flags it; the digest is
+still returned in the report, and every other file is unchanged. Concept files and ``index.md`` carry
+no run time; ``at`` fixes only the log date, so the same vault, profile and ``at`` give the same bytes.
 
 The bundle is written to a fresh staging directory beside ``out`` and moved into place by rename, or,
 when ``out`` already holds a bundle, by one exchange call (renameat2 / renamex_np) so ``out`` never
@@ -311,7 +313,7 @@ def _render_all(kept: Dict[str, _Concept], producer: str) -> Dict[str, str]:
 
 # ------------------------------------------------------------------------------- index and log
 
-def _index_text(kept: Dict[str, _Concept], digest: str) -> str:
+def _index_text(kept: Dict[str, _Concept], digest: Optional[str]) -> str:
     lines: List[str] = []
     group: Optional[Tuple[str, str]] = None
     for c in sorted(kept.values(), key=lambda x: x.sort_key):
@@ -327,7 +329,10 @@ def _index_text(kept: Dict[str, _Concept], digest: str) -> str:
         lines.append(entry)
     if not lines:
         lines = ["# Concepts", "", "No rows were exported."]
-    return render_document({"okf_version": OKF_VERSION, PROFILE_DIGEST_KEY: digest}, "\n".join(lines) + "\n")
+    meta: Dict[str, Any] = {"okf_version": OKF_VERSION}
+    if digest is not None:
+        meta[PROFILE_DIGEST_KEY] = digest
+    return render_document(meta, "\n".join(lines) + "\n")
 
 
 _LOG_HEADING = re.compile(r"## (\d{4}-\d{2}-\d{2})[ \t]*\Z")
@@ -404,8 +409,11 @@ def _category_dir_ok(path: str) -> bool:
     return True
 
 
-def _is_previous_bundle(out: Path) -> bool:
-    """Empty, or exactly the shape this exporter writes with an index.md naming a profile digest."""
+def _is_previous_bundle(out: Path, require_digest: bool = True) -> bool:
+    """Empty, or exactly the shape this exporter writes with an index.md naming a profile digest.
+
+    With ``require_digest=False`` an index without the digest key (a digest-less export) also counts.
+    """
     with os.scandir(out) as it:
         top = list(it)
     if not top:
@@ -425,10 +433,14 @@ def _is_previous_bundle(out: Path) -> bool:
         meta = parse_frontmatter(fm_text) if fm_text is not None else {}
     except (OSError, UnicodeDecodeError, FrontmatterError):
         return False
-    return "okf_version" in meta and isinstance(meta.get(PROFILE_DIGEST_KEY), str)
+    if "okf_version" not in meta:
+        return False
+    if PROFILE_DIGEST_KEY not in meta:
+        return not require_digest
+    return isinstance(meta[PROFILE_DIGEST_KEY], str)
 
 
-def _prepare_out(out: Path) -> Tuple[bool, Optional[str]]:
+def _prepare_out(out: Path, require_digest: bool = True) -> Tuple[bool, Optional[str]]:
     """(out exists, previous log text); raise ExportError when ``out`` may not be replaced."""
     if out.is_symlink():
         raise ExportError("--out %s is a symbolic link; refusing" % out)
@@ -439,7 +451,7 @@ def _prepare_out(out: Path) -> Tuple[bool, Optional[str]]:
     if not out.is_dir():
         raise ExportError("--out %s exists and is not a directory" % out)
     try:
-        previous = _is_previous_bundle(out)
+        previous = _is_previous_bundle(out, require_digest)
     except OSError as exc:
         raise ExportError("cannot inspect --out %s: %s" % (out, exc)) from None
     if not previous:
@@ -610,6 +622,7 @@ def export_bundle(
     ungated: bool = False,
     row_gate: Optional[RowGate] = None,
     bundle_gate: Optional[BundleGate] = None,
+    index_profile_digest: bool = True,
 ) -> ExportReport:
     """Write the OKF bundle for ``vault`` under ``profile`` to ``out``; see the module docstring."""
     if not (ungated or row_gate is not None or bundle_gate is not None):
@@ -619,7 +632,7 @@ def export_bundle(
         raise ExportError("profile must be an ExportProfile from load_profile or parse_profile")
     day = _log_day(at)
     out_path = Path(os.path.abspath(os.fspath(out)))
-    existed, prior_log = _prepare_out(out_path)
+    existed, prior_log = _prepare_out(out_path, require_digest=index_profile_digest)
 
     withheld: Counter = Counter()
     kept = _plan(vault, profile, withheld)
@@ -662,7 +675,7 @@ def export_bundle(
 
         counts = {k: v for k, v in withheld.items() if v}
         files = dict(docs)
-        files["index.md"] = _index_text(kept, profile.digest)
+        files["index.md"] = _index_text(kept, profile.digest if index_profile_digest else None)
         files["log.md"] = _log_text(prior_log, day, _log_bullet(len(kept), counts))
         stage = _write_stage(out_path.parent, files)
         try:
