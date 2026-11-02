@@ -201,6 +201,49 @@ def test_index_and_log_at_the_bundle_root(tmp_path, probe):
         assert word not in log
 
 
+def test_the_index_can_leave_out_the_profile_digest(tmp_path, probe):
+    # For callers whose content gate flags the digest line (a 64-hex value under a long key): the
+    # digest stays in the report, the index carries okf_version alone, every other file is unchanged.
+    with_digest, without = tmp_path / "a", tmp_path / "b"
+    export_bundle(probe, _profile(), with_digest, at=AT, ungated=True)
+    report = export_bundle(probe, _profile(), without, at=AT, ungated=True, index_profile_digest=False)
+    index_fm, index_body = _read(without, "index.md")
+    assert index_fm == {"okf_version": "0.2"}
+    assert "telarch_export_profile_sha256" not in (without / "index.md").read_text(encoding="utf-8")
+    assert report.profile_digest == _profile().digest
+    assert index_body == _read(with_digest, "index.md")[1]
+    ta, tb = tree_bytes(with_digest), tree_bytes(without)
+    assert ta.keys() == tb.keys()
+    assert [k for k in ta if ta[k] != tb[k]] == ["index.md"]
+    result = check_bundle(without)
+    assert result.ok, result.as_dict()
+    assert not any("telarch_export_profile_sha256" in str(n) for n in result.notes)
+
+
+def test_re_export_without_the_digest_replaces_its_own_bundle(tmp_path, probe):
+    out = tmp_path / "b"
+    export_bundle(probe, _profile(), out, at="2026-10-31", ungated=True, index_profile_digest=False)
+    export_bundle(probe, _profile(), out, at=AT, ungated=True, index_profile_digest=False)
+    log = (out / "log.md").read_text(encoding="utf-8")
+    assert log.index("## 2026-11-01") < log.index("## 2026-10-31")
+    assert oct(out.stat().st_mode & 0o777) == "0o700"
+    # A digest-less export also replaces a bundle that carries the digest (both are this exporter's shape).
+    other = tmp_path / "c"
+    export_bundle(probe, _profile(), other, at="2026-10-31", ungated=True)
+    export_bundle(probe, _profile(), other, at=AT, ungated=True, index_profile_digest=False)
+    assert _read(other, "index.md")[0] == {"okf_version": "0.2"}
+
+
+def test_a_default_export_still_refuses_a_digest_less_index(tmp_path, probe):
+    # The default keeps its rule: replace only an index that names a profile digest.
+    out = tmp_path / "b"
+    export_bundle(probe, _profile(), out, at="2026-10-31", ungated=True, index_profile_digest=False)
+    before = tree_bytes(out)
+    with pytest.raises(ExportError, match="not a bundle okf-export wrote"):
+        export_bundle(probe, _profile(), out, at=AT, ungated=True)
+    assert tree_bytes(out) == before
+
+
 def test_concept_files_and_the_index_carry_no_run_time(tmp_path, probe):
     a, b = tmp_path / "a", tmp_path / "b"
     export_bundle(probe, _profile(), a, at="2026-11-01", ungated=True)
