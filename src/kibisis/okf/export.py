@@ -78,6 +78,9 @@ __all__ = [
     "is_vault_owned_key",
     "iso_utc",
     "load_extra",
+    "name_tokens",
+    "named_rows",
+    "names_at",
     "safe_segment",
     "type_name",
 ]
@@ -194,6 +197,62 @@ def first_sentence(content: str) -> Optional[str]:
             cut = cut[:cut.rindex(" ")]
         text = cut.rstrip() + "\u2026"
     return text or None
+
+
+# ---- Naming (telarch P14.3, roadmap 17.2 Pass 2) ----
+# A turn's query names a row when the row's key appears in it (case-folded, not inside a longer word) or when
+# the row's title's token sequence appears among the query's tokens. A vault row's title is its key: that is
+# the title okf-export writes. One tokenizer serves titles and queries, runs of letters and digits, so "_",
+# "-", "/" and every other non-word character separate tokens.
+_NAME_TOKEN = re.compile(r"[^\W_]+")
+
+
+def name_tokens(text: str) -> List[str]:
+    """The case-folded tokens of a key, title or query: its runs of letters and digits, in order."""
+    return _NAME_TOKEN.findall(str(text).casefold())
+
+
+def _key_at(folded_query: str, key: str) -> Optional[int]:
+    folded = str(key).casefold()
+    if not folded:
+        return None
+    head = r"(?<!\w)" if re.match(r"\w", folded[0]) else ""
+    tail = r"(?!\w)" if re.match(r"\w", folded[-1]) else ""
+    match = re.search(head + re.escape(folded) + tail, folded_query)
+    return match.start() if match else None
+
+
+def _tokens_at(folded_query: str, title: str) -> Optional[int]:
+    wanted = name_tokens(title)
+    if not wanted:
+        return None
+    tokens = [(m.group(0), m.start()) for m in _NAME_TOKEN.finditer(folded_query)]
+    width = len(wanted)
+    for i in range(len(tokens) - width + 1):
+        if all(tokens[i + j][0] == wanted[j] for j in range(width)):
+            return tokens[i][1]
+    return None
+
+
+def names_at(query: str, key: str, title: Optional[str] = None) -> Optional[int]:
+    """Where ``query`` first names a row, or None: the earliest offset, in the case-folded query, of the row's
+    key (case-folded, not inside a longer word) or of the start of its title's token sequence among the query's
+    tokens. ``title`` defaults to the key, the title okf-export writes for a row."""
+    folded = str(query).casefold()
+    found = [at for at in (_key_at(folded, key), _tokens_at(folded, key if title is None else title)) if at is not None]
+    return min(found) if found else None
+
+
+def named_rows(query: str, rows: Iterable[Union[str, Tuple[str, Optional[str]]]]) -> List[int]:
+    """The indices of the rows ``query`` names, in request order: by where the query first names each row, ties
+    in ``rows`` order, each row once. A row is its key or a ``(key, title)`` pair."""
+    found: List[Tuple[int, int]] = []
+    for index, row in enumerate(rows):
+        key, title = (row, None) if isinstance(row, str) else (row[0], row[1])
+        at = names_at(query, key, title)
+        if at is not None:
+            found.append((at, index))
+    return [index for _, index in sorted(found)]
 
 
 _SEGMENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,199}\Z")
