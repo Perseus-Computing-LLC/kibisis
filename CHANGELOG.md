@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.14] - 2026-11-03
+
+### Added
+- `kibisis.okf.export` naming helpers (telarch P14.3, roadmap 17.2 Pass 2): the rule that says when a turn's
+  query names a vault row. `name_tokens(text)` is the one tokenizer (case-folded runs of letters and digits)
+  for keys, titles and queries. `names_at(query, key, title=None)` is the earliest offset at which the query
+  names the row, by its key (case-folded, not inside a longer word) or by its title's token sequence among
+  the query's tokens; the title defaults to the key, which is the title okf-export writes.
+  `named_rows(query, rows)` returns the indices of the named rows in request order, ties in row order, each
+  row once; a row is its key or a `(key, title)` pair. Pure functions, no vault access
+  (`tests/test_okf_names.py`).
+
 ## [0.1.0-alpha.13] - 2026-11-02
 
 ### Added
