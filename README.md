@@ -137,6 +137,7 @@ Report a vulnerability to contact@perseuscomputing.com with `[SECURITY]` in the 
 ## Links
 
 - [telarch.ai/kibisis](https://telarch.ai/kibisis): overview and a live demo of the lease coordinator
+- [telarch.ai/chatgpt](https://telarch.ai/chatgpt): Telarch as an app for ChatGPT and a plugin for Codex
 - [Documentation (docs.rs)](https://docs.rs/kibisis)
 - [Changelog](CHANGELOG.md)
 
