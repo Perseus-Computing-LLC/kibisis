@@ -146,6 +146,12 @@ def _okf_import(args: argparse.Namespace) -> int:
     return 0
 
 
+def _aml_serve(args: argparse.Namespace) -> int:
+    from .aml_adapter import run_server
+    run_server(host=args.host, port=args.port, db_path=args.db, api_key=args.key)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m kibisis")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -182,6 +188,13 @@ def main(argv: list[str] | None = None) -> int:
                    help="allowlist (export profile JSON); default: scope default, the four P13 categories")
     i.add_argument("--dry-run", action="store_true", help="report what would change and write nothing")
     i.set_defaults(func=_okf_import)
+
+    s = sub.add_parser("aml-serve", help="run the Agent Memory Leaderboard (AML) Add/Search HTTP adapter")
+    s.add_argument("--host", default="0.0.0.0", help="bind host (default: 0.0.0.0)")
+    s.add_argument("--port", type=int, default=8080, help="bind port (default: 8080)")
+    s.add_argument("--db", default=DEFAULT_DB_PATH, help="vault path (default: $KIBISIS_DB_PATH)")
+    s.add_argument("--key", default=os.environ.get("KIBISIS_AML_KEY"), help="Memory System Key for token auth")
+    s.set_defaults(func=_aml_serve)
 
     args = parser.parse_args(argv)
     return int(args.func(args))
