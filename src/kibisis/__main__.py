@@ -146,9 +146,49 @@ def _okf_import(args: argparse.Namespace) -> int:
     return 0
 
 
+def _aml_key_sha256(args: argparse.Namespace) -> str | None:
+    """SHA-256 of the Memory System Key: given as a digest, or hashed from a key file or the environment."""
+    from .aml_adapter import key_digest
+    from .keys import _read_keyfile
+
+    digest = args.key_sha256 or os.environ.get("KIBISIS_AML_KEY_SHA256")
+    if digest:
+        return digest
+    path = os.environ.get("KIBISIS_AML_KEY_FILE")
+    key = _read_keyfile(path) if path else os.environ.get("KIBISIS_AML_KEY")
+    return key_digest(key) if key else None
+
+
 def _aml_serve(args: argparse.Namespace) -> int:
-    from .aml_adapter import run_server
-    run_server(host=args.host, port=args.port, db_path=args.db, api_key=args.key)
+    import logging
+
+    from .aml_adapter import AMLConfig, run_server
+    from .keys import resolve_passphrase
+
+    # Evaluation traffic is not mirrored into an operator's Argus ledger unless ARGUS_LEDGER_PATH says so.
+    os.environ.setdefault("ARGUS_LEDGER_PATH", "")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    digest = _aml_key_sha256(args)
+    if not digest:
+        print("aml-serve: no Memory System Key: set KIBISIS_AML_KEY_SHA256 (hex SHA-256 of the key), "
+              "KIBISIS_AML_KEY_FILE (a mode-600 file holding the key) or KIBISIS_AML_KEY", file=sys.stderr)
+        return 2
+    passphrase = None
+    if not args.plaintext:
+        passphrase = resolve_passphrase()
+        if not passphrase:
+            print("aml-serve: no vault key: set KIBISIS_PASSPHRASE_FILE or KIBISIS_PASSPHRASE, "
+                  "or pass --plaintext to store evaluation data unencrypted", file=sys.stderr)
+            return 2
+    try:
+        config = AMLConfig(data_dir=args.data_dir, key_sha256=digest, passphrase=passphrase,
+                           candidates=args.candidates, context_before=args.context_before,
+                           max_inflight=args.max_inflight, max_open_vaults=args.max_open_vaults,
+                           retention_days=args.retention_days)
+    except ValueError as exc:
+        print(f"aml-serve: {exc}", file=sys.stderr)
+        return 2
+    run_server(config, host=args.host, port=args.port)
     return 0
 
 
@@ -189,11 +229,23 @@ def main(argv: list[str] | None = None) -> int:
     i.add_argument("--dry-run", action="store_true", help="report what would change and write nothing")
     i.set_defaults(func=_okf_import)
 
-    s = sub.add_parser("aml-serve", help="run the Agent Memory Leaderboard (AML) Add/Search HTTP adapter")
+    s = sub.add_parser("aml-serve", help="run the Agent Memory Leaderboard (AML) Add/Search HTTP adapter",
+                       description="Serve the AML Add/Search contract over per-user Kibisis vaults. The Memory "
+                                   "System Key comes from KIBISIS_AML_KEY_SHA256, KIBISIS_AML_KEY_FILE or "
+                                   "KIBISIS_AML_KEY; the vault key from KIBISIS_PASSPHRASE_FILE or KIBISIS_PASSPHRASE.")
     s.add_argument("--host", default="0.0.0.0", help="bind host (default: 0.0.0.0)")
     s.add_argument("--port", type=int, default=8080, help="bind port (default: 8080)")
-    s.add_argument("--db", default=DEFAULT_DB_PATH, help="vault path (default: $KIBISIS_DB_PATH)")
-    s.add_argument("--key", default=os.environ.get("KIBISIS_AML_KEY"), help="Memory System Key for token auth")
+    s.add_argument("--data-dir", default=os.environ.get("KIBISIS_AML_DATA_DIR", "aml-data"),
+                   help="directory for the per-user vaults (default: $KIBISIS_AML_DATA_DIR or ./aml-data)")
+    s.add_argument("--key-sha256", default=None, help="hex SHA-256 of the Memory System Key (not the key itself)")
+    s.add_argument("--plaintext", action="store_true", help="store vaults unencrypted (no vault key needed)")
+    s.add_argument("--candidates", type=int, default=200, help="BM25 hits fetched per search (default: 200)")
+    s.add_argument("--context-before", type=int, default=1,
+                   help="earlier messages of the same Add request shown before each hit (default: 1)")
+    s.add_argument("--max-inflight", type=int, default=32, help="requests served at once; more get 429 (default: 32)")
+    s.add_argument("--max-open-vaults", type=int, default=64, help="per-user vaults kept open (default: 64)")
+    s.add_argument("--retention-days", type=float, default=28.0,
+                   help="delete vaults with no write for this many days; 0 keeps them (default: 28)")
     s.set_defaults(func=_aml_serve)
 
     args = parser.parse_args(argv)

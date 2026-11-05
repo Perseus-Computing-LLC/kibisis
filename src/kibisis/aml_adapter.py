@@ -1,276 +1,599 @@
-"""AML (Agent Memory Leaderboard) HTTP Adapter for Kibisis.
+"""Agent Memory Leaderboard (AML) Add/Search adapter for Kibisis.
 
-Implements the official AML Add and Search API specification:
-- GET  / or /health or /v1/health -> 200 OK (unauthenticated health probe)
-- POST /v1/memories/add or /add   -> Ingest episodic memories
-- POST /v1/memories/search or /search -> Retrieve relevant memories within user scope
-Supports Token, Bearer, and X-Api-Key authentication.
+Serves the AML Textual-track HTTP contract (https://agentmemoryleaderboard.ai/api-guide)::
+
+    GET  /   /health   /v1/health             200, no authentication
+    POST /v1/memories/add     (alias /add)    store messages for one user_id
+    POST /v1/memories/search  (alias /search) ranked memories for one user_id
+
+Method, which is what a leaderboard entry for this adapter measures:
+
+* Storage. One Kibisis vault per ``user_id`` (SQLCipher-encrypted unless run with
+  ``--plaintext``), one entry per message, content stored exactly as received. The message
+  timestamp and role are kept as entry metadata.
+* Add. A request is written in one transaction together with a marker keyed on its
+  ``request_id``, so it is all-or-nothing and a retried request (same id, same payload, per the
+  contract) is acknowledged without being written twice. ``success`` is returned after commit,
+  when the messages are durable and searchable.
+* Search. One Kibisis BM25 query (``match="any"``) over the user's messages; the query is the
+  question plus any answer options. Hits are grouped by the Add request (conversation chunk) they
+  came from and each hit brings the message before it as context. Every group becomes one memory:
+  its lines in conversation order under the message timestamp, ``...`` where lines are skipped.
+  Groups are returned best hit first, at most ``top_k`` of them; the platform's Answer step keeps
+  the token-counted prefix that fits its context budget.
+
+No model calls, no summarisation, no rewriting of stored text.
+
+Concurrency: a vault is used by one request at a time (``SQLiteMemoryVault`` shares one SQLite
+connection), different users run in parallel, and requests beyond ``max_inflight`` get 429 with
+``Retry-After``. Evaluation data is never logged; vaults idle for ``retention_days`` are deleted.
 """
+
 from __future__ import annotations
 
-import argparse
-import datetime
+import datetime as _dt
+import hashlib
+import hmac
 import json
 import logging
 import os
-import re
-import sys
-from http import HTTPStatus
-from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
-from typing import Any, Dict, List, Optional
+import signal
+import threading
+import time
+from collections import OrderedDict
+from contextlib import contextmanager
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, cast
 
 from .vault import SQLiteMemoryVault
-from .models import EpistemicState
 
-logger = logging.getLogger("kibisis.aml_adapter")
+LOG = logging.getLogger("kibisis.aml")
 
-# Precompiled regex for basic token extraction
-_STRIP_PUNCT = re.compile(r"^[^\w]+|[^\w]+$")
-
-
-def _format_created_at(ts: Optional[float]) -> str:
-    if ts is None:
-        dt = datetime.datetime.now(datetime.timezone.utc)
-    else:
-        # Check if ts is in milliseconds (> 10^11)
-        if ts > 1e11:
-            ts = ts / 1000.0
-        dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
-    return dt.isoformat()
+ADAPTER_REVISION = "aml-1"
+MESSAGE_CATEGORY = "aml_message"
+REQUEST_CATEGORY = "aml_request"
+SCOPE = "aml"
+VAULT_SUFFIX = ".kib"
+DEFAULT_TOP_K = 100
+MAX_TOP_K = 1000
+GAP = "..."
 
 
-def _extract_text_content(content: Any) -> str:
-    """Extract plain text from string or multimodal ContentPart array."""
+class ContractError(Exception):
+    """A request the contract says to refuse, with the status to refuse it with."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def key_digest(key: str) -> str:
+    """Hex SHA-256 of a Memory System Key; the server stores and compares only this."""
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+@dataclass
+class AMLConfig:
+    data_dir: str
+    key_sha256: str
+    passphrase: Optional[str] = None  # None: plaintext vaults
+    candidates: int = 200
+    context_before: int = 1
+    max_open_vaults: int = 64
+    max_inflight: int = 32
+    max_body_bytes: int = 64 * 1024 * 1024
+    retention_days: float = 28.0
+    retry_after_s: int = 2
+
+    def __post_init__(self) -> None:
+        digest = (self.key_sha256 or "").strip().lower()
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ValueError("key_sha256 must be the 64-character hex SHA-256 of the Memory System Key")
+        self.key_sha256 = digest
+        if self.candidates < 1 or self.context_before < 0 or self.max_inflight < 1 or self.max_open_vaults < 1:
+            raise ValueError("candidates, max_inflight and max_open_vaults must be >= 1; context_before >= 0")
+
+
+# --------------------------------------------------------------------------- value helpers
+
+
+def _digest(value: str, n: int = 32) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:n]
+
+
+def _required_str(body: Dict[str, Any], name: str) -> str:
+    value = body.get(name)
+    if not isinstance(value, str) or not value.strip():
+        raise ContractError(422, f"{name} must be a non-empty string")
+    return value
+
+
+def _text_of(content: Any, where: str) -> str:
+    """Text of a Textual-track content field: a string, or text ContentParts in order."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
         parts = []
-        for part in content:
-            if isinstance(part, dict):
-                if part.get("type") == "text" and "text" in part:
-                    parts.append(str(part["text"]))
-                elif part.get("type") == "image_url":
-                    parts.append("[IMAGE]")
-            elif isinstance(part, str):
-                parts.append(part)
+        for n, part in enumerate(content):
+            kind = part.get("type") if isinstance(part, dict) else None
+            if kind == "text" and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+            elif kind == "image_url":
+                raise ContractError(422, f"{where}[{n}]: image parts are not supported (Textual track adapter)")
+            else:
+                raise ContractError(422, f"{where}[{n}]: unsupported content part")
         return "\n".join(parts)
-    if isinstance(content, dict):
-        return json.dumps(content, ensure_ascii=False)
-    return str(content or "")
+    raise ContractError(422, f"{where} must be a string or an array of text parts")
 
 
-class KibisisAMLHandler(BaseHTTPRequestHandler):
-    vault: SQLiteMemoryVault
-    api_key: Optional[str] = None
+def _timestamp_ms(value: Any, where: str) -> Optional[int]:
+    """Milliseconds since the epoch from the contract's ms integer (seconds and ISO 8601 also accepted)."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ContractError(422, f"{where} must be a number of milliseconds")
+    if isinstance(value, (int, float)):
+        ms = float(value)
+        if abs(ms) < 1e11:  # a value this small is seconds, not milliseconds
+            ms *= 1000.0
+        return int(ms)
+    if isinstance(value, str) and value.strip():
+        text = value.strip().replace("Z", "+00:00")
+        try:
+            moment = _dt.datetime.fromisoformat(text)
+        except ValueError:
+            raise ContractError(422, f"{where} is not a timestamp") from None
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=_dt.timezone.utc)
+        return int(moment.timestamp() * 1000)
+    raise ContractError(422, f"{where} must be a number of milliseconds")
 
-    def _send_json(self, status: int, data: Dict[str, Any]) -> None:
-        payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+
+def _package_version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version("kibisis")
+    except Exception:  # pragma: no cover - source checkout without metadata
+        return "unknown"
+
+
+def _utc(ms: int) -> _dt.datetime:
+    return _dt.datetime.fromtimestamp(ms / 1000.0, tz=_dt.timezone.utc)
+
+
+def _iso(ms: Optional[int]) -> Optional[str]:
+    return None if ms is None else _utc(ms).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _stamp(ms: int) -> str:
+    return _utc(ms).strftime("%Y-%m-%d (%a) %H:%M UTC")
+
+
+# --------------------------------------------------------------------------- vault pool
+
+
+class _Slot:
+    __slots__ = ("path", "lock", "vault", "refs")
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.vault: Optional[SQLiteMemoryVault] = None
+        self.refs = 0
+
+
+class VaultPool:
+    """Open per-user vaults, least recently used first out; one request at a time per vault."""
+
+    def __init__(self, data_dir: str, passphrase: Optional[str], max_open: int):
+        self.data_dir = Path(data_dir)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.passphrase = passphrase
+        self.max_open = max_open
+        self._slots: "OrderedDict[str, _Slot]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def path_for(self, user_id: str) -> Path:
+        return self.data_dir / f"{_digest(user_id)}{VAULT_SUFFIX}"
+
+    def _open(self, path: Path) -> SQLiteMemoryVault:
+        if self.passphrase is None:
+            return SQLiteMemoryVault(str(path), allow_plaintext=True, auto_gate=False)
+        return SQLiteMemoryVault(str(path), passphrase=self.passphrase, auto_gate=False)
+
+    @staticmethod
+    def _close(slot: _Slot) -> None:
+        with slot.lock:
+            if slot.vault is not None:
+                try:
+                    slot.vault.close()
+                finally:
+                    slot.vault = None
+
+    def _evict_locked(self) -> List[_Slot]:
+        excess = len(self._slots) - self.max_open
+        evicted: List[_Slot] = []
+        for name, slot in list(self._slots.items()):
+            if excess <= 0:
+                break
+            if slot.refs == 0:  # nobody holds or waits on it, and nobody can reach it once removed
+                del self._slots[name]
+                evicted.append(slot)
+                excess -= 1
+        return evicted
+
+    @contextmanager
+    def use(self, user_id: str, create: bool) -> Iterator[Optional[SQLiteMemoryVault]]:
+        """Yield the user's vault under its lock; None when it does not exist and create is False."""
+        path = self.path_for(user_id)
+        with self._lock:
+            slot = self._slots.get(path.name)
+            if slot is None and (create or path.exists()):
+                slot = self._slots[path.name] = _Slot(path)
+            if slot is not None:
+                self._slots.move_to_end(path.name)
+                slot.refs += 1
+            evicted = self._evict_locked()
+        for old in evicted:
+            self._close(old)
+        if slot is None:
+            yield None
+            return
+        try:
+            with slot.lock:
+                if slot.vault is None:
+                    slot.vault = self._open(slot.path)
+                yield slot.vault
+        finally:
+            with self._lock:
+                slot.refs -= 1
+
+    def open_count(self) -> int:
+        with self._lock:
+            return sum(1 for s in self._slots.values() if s.vault is not None)
+
+    def purge_idle(self, max_idle_s: float, now: Optional[float] = None) -> int:
+        """Delete vaults with no write for max_idle_s seconds; returns how many were deleted."""
+        now = time.time() if now is None else now
+        removed = 0
+        for path in sorted(self.data_dir.glob(f"*{VAULT_SUFFIX}")):
+            files = [Path(f"{path}{suffix}") for suffix in ("", "-wal", "-shm")]
+            try:
+                last_write = max(f.stat().st_mtime for f in files if f.exists())
+            except ValueError:
+                continue
+            if now - last_write < max_idle_s:
+                continue
+            with self._lock:  # no request can open this vault while the lock is held
+                slot = self._slots.get(path.name)
+                if slot is not None:
+                    if slot.refs:
+                        continue
+                    del self._slots[path.name]
+                    self._close(slot)
+                for f in files:
+                    try:
+                        f.unlink()
+                    except FileNotFoundError:
+                        pass
+            removed += 1
+        return removed
+
+    def close_all(self) -> None:
+        with self._lock:
+            slots = list(self._slots.values())
+            self._slots.clear()
+        for slot in slots:
+            self._close(slot)
+
+
+# --------------------------------------------------------------------------- Add / Search
+
+
+class AMLService:
+    """The contract's two operations over a VaultPool; transport-free so tests can call it directly."""
+
+    def __init__(self, config: AMLConfig):
+        self.config = config
+        self.pool = VaultPool(config.data_dir, config.passphrase, config.max_open_vaults)
+
+    def add(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        request_id = _required_str(body, "request_id")
+        user_id = _required_str(body, "user_id")
+        session_id = _required_str(body, "session_id")
+        messages = body.get("messages")
+        if not isinstance(messages, list) or not messages:
+            raise ContractError(422, "messages must be a non-empty array")
+        rows: List[Tuple[int, str, str, Optional[int]]] = []
+        for n, message in enumerate(messages):
+            if not isinstance(message, dict):
+                raise ContractError(422, f"messages[{n}] must be an object")
+            text = _text_of(message.get("content"), f"messages[{n}].content")
+            role = message.get("role", "user")
+            if not isinstance(role, str):
+                raise ContractError(422, f"messages[{n}].role must be a string")
+            rows.append((n, role.strip() or "user", text, _timestamp_ms(message.get("timestamp"), f"messages[{n}].timestamp")))
+
+        rid = _digest(request_id, 24)
+        items: List[Dict[str, Any]] = [
+            dict(category=MESSAGE_CATEGORY, key=f"{rid}:{n:05d}", content=text, scope=SCOPE,
+                 epistemic_state="candidate", origin="import", metadata={"r": rid, "i": n, "t": ts, "role": role})
+            for n, role, text, ts in rows if text.strip()
+        ]
+        items.append(dict(category=REQUEST_CATEGORY, key=rid, content=f"aml request {rid}", scope=SCOPE,
+                          epistemic_state="candidate", origin="import", metadata={"messages": len(rows)}))
+        with self.pool.use(user_id, create=True) as vault:
+            assert vault is not None  # create=True always yields a vault
+            if vault.get(REQUEST_CATEGORY, rid, scope=SCOPE) is None:  # a retry of a committed request is a no-op
+                with vault._write_tx():  # one transaction: the request lands whole or not at all
+                    vault.put_batch(items)
+        return {"success": True, "request_id": request_id, "user_id": user_id, "session_id": session_id}
+
+    def search(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        user_id = _required_str(body, "user_id")
+        query = _text_of(body.get("query"), "query").strip()
+        if not query:
+            raise ContractError(422, "query must be non-empty")
+        options = body.get("options")
+        if options is None:
+            options = []
+        if not isinstance(options, list):
+            raise ContractError(422, "options must be an array")
+        top_k = body.get("top_k", DEFAULT_TOP_K)
+        if top_k is None:
+            top_k = DEFAULT_TOP_K
+        if isinstance(top_k, str) and top_k.strip().isdigit():
+            top_k = int(top_k.strip())
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or not 1 <= top_k <= MAX_TOP_K:
+            raise ContractError(422, f"top_k must be an integer from 1 to {MAX_TOP_K}")
+        text = " ".join([query] + [_text_of(o, "options[]") for o in options])
+
+        groups: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        with self.pool.use(user_id, create=False) as vault:
+            if vault is None:
+                return {"data": []}
+            hits = vault.search(text, category=MESSAGE_CATEGORY, scope=SCOPE, limit=max(self.config.candidates, top_k),
+                                match="any", include_unverified=True)
+            for hit in hits:  # Kibisis returns best first; rank_score is BM25, lower is better
+                meta = hit.entity.metadata or {}
+                rid, n = meta.get("r"), meta.get("i")
+                if not isinstance(rid, str) or not isinstance(n, int):
+                    continue
+                group = groups.get(rid)
+                if group is None:
+                    if len(groups) >= top_k:
+                        continue
+                    group = groups[rid] = {"anchor": hit.entity, "score": -float(hit.rank_score), "lines": {}}
+                group["lines"][n] = hit.entity
+            for rid, group in groups.items():
+                lines = group["lines"]
+                for n in sorted(lines):
+                    for m in range(max(0, n - self.config.context_before), n):
+                        if m not in lines:
+                            entity = vault.get(MESSAGE_CATEGORY, f"{rid}:{m:05d}", scope=SCOPE)
+                            if entity is not None:
+                                lines[m] = entity
+
+        data: List[Dict[str, Any]] = []
+        last_score: Optional[float] = None
+        for group in groups.values():
+            score = group["score"] if last_score is None else min(group["score"], last_score)
+            last_score = score  # never rises down the list: higher score, earlier rank
+            anchor = group["anchor"]
+            item: Dict[str, Any] = {"id": f"kib_{anchor.key}", "content": _render(group["lines"]), "score": round(score, 6)}
+            created = _iso((anchor.metadata or {}).get("t"))
+            if created:
+                item["created_at"] = created
+            data.append(item)
+        return {"data": data}
+
+
+def _render(lines: Dict[int, Any]) -> str:
+    out: List[str] = []
+    previous_n, previous_stamp = None, None
+    for n in sorted(lines):
+        entity = lines[n]
+        meta = entity.metadata or {}
+        if previous_n is not None and n != previous_n + 1:
+            out.append(GAP)
+        ts = meta.get("t")
+        stamp = _stamp(ts) if isinstance(ts, int) else None
+        if stamp and stamp != previous_stamp:
+            out.append(f"[{stamp}]")
+            previous_stamp = stamp
+        out.append(f"{meta.get('role') or 'user'}: {entity.content}")
+        previous_n = n
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------- HTTP
+
+
+class AMLServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 128
+
+    def __init__(self, address: Tuple[str, int], config: AMLConfig):
+        self.config = config
+        self.service = AMLService(config)
+        self.inflight = threading.BoundedSemaphore(config.max_inflight)
+        super().__init__(address, AMLHandler)
+
+
+class AMLHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "kibisis-aml"
+    sys_version = ""
+
+    ROUTES: Dict[str, str] = {
+        "/v1/memories/add": "add",
+        "/add": "add",
+        "/v1/memories/search": "search",
+        "/search": "search",
+    }
+    HEALTH = ("/", "/health", "/v1/health")
+
+    @property
+    def aml(self) -> "AMLServer":
+        return cast(AMLServer, self.server)
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib signature
+        pass  # one line per request is written by _finish, without paths' query strings or bodies
+
+    def _path(self) -> str:
+        return self.path.split("?", 1)[0].rstrip("/") or "/"
+
+    def _send(self, status: int, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None) -> int:
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(payload)
+        if self.command != "HEAD":
+            self.wfile.write(body)
+        return status
 
-    def _check_auth(self) -> bool:
-        if not self.api_key:
-            return True
-        auth_header = self.headers.get("Authorization", "")
-        # Accepts 'Token <key>' or 'Bearer <key>'
-        if auth_header.startswith("Token "):
-            token = auth_header[6:].strip()
-            if token == self.api_key:
-                return True
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:].strip()
-            if token == self.api_key:
-                return True
-        # Accepts 'X-Api-Key: <key>'
-        x_api_key = self.headers.get("X-Api-Key", "").strip()
-        if x_api_key and x_api_key == self.api_key:
-            return True
-        return False
+    def _health(self) -> int:
+        if self._path() not in self.HEALTH:
+            return self._send(404, {"error": "not found"})
+        return self._send(200, {"status": "ok", "service": "kibisis-aml", "adapter": ADAPTER_REVISION,
+                                "version": _package_version(), "commit": os.environ.get("KIBISIS_AML_COMMIT") or None})
 
-    def do_GET(self) -> None:
-        # AML health checks use unauthenticated GET on root or health endpoints
-        path = self.path.split("?")[0].rstrip("/")
-        if path in ("", "/health", "/v1/health", "/v1/memories/health"):
-            self._send_json(HTTPStatus.OK, {
-                "status": "ok",
-                "service": "kibisis-aml-adapter",
-                "version": "v0.1.0-alpha.14"
-            })
-            return
-        self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+    def do_GET(self) -> None:  # noqa: N802 - stdlib naming
+        self._health()
 
-    def do_POST(self) -> None:
-        path = self.path.split("?")[0].rstrip("/")
-        
-        # Verify Authentication
-        if not self._check_auth():
-            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "Unauthorized", "detail": "Invalid or missing API key"})
-            return
+    def do_HEAD(self) -> None:  # noqa: N802
+        self._health()
 
-        # Read JSON body
-        content_length = int(self.headers.get("Content-Length", 0))
-        if content_length == 0:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Empty body"})
-            return
+    def _presented_key(self) -> Optional[str]:
+        auth = (self.headers.get("Authorization") or "").strip()
+        scheme, _, credential = auth.partition(" ")
+        if scheme.lower() in ("token", "bearer") and credential.strip():
+            return credential.strip()
+        key = (self.headers.get("X-Api-Key") or "").strip()
+        return key or None
+
+    def _authorized(self) -> bool:
+        key = self._presented_key()
+        return key is not None and hmac.compare_digest(key_digest(key), self.aml.config.key_sha256)
+
+    def _read_body(self) -> bytes:
+        limit = self.aml.config.max_body_bytes
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            out = bytearray()
+            while True:
+                size_line = self.rfile.readline(65537)
+                try:
+                    size = int(size_line.split(b";", 1)[0].strip(), 16)
+                except ValueError:
+                    self.close_connection = True
+                    raise ContractError(400, "malformed chunked body") from None
+                if size == 0:
+                    while self.rfile.readline(65537) not in (b"\r\n", b"\n", b""):
+                        pass
+                    return bytes(out)
+                if len(out) + size > limit:
+                    self.close_connection = True
+                    raise ContractError(413, f"body exceeds {limit} bytes")
+                out += self.rfile.read(size)
+                self.rfile.readline()
+        length = self.headers.get("Content-Length")
+        if length is None:
+            self.close_connection = True
+            raise ContractError(411, "Content-Length required")
         try:
-            raw_body = self.rfile.read(content_length).decode("utf-8")
-            body = json.loads(raw_body)
-        except Exception as exc:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Malformed JSON: {exc}"})
-            return
+            size = int(length)
+        except ValueError:
+            self.close_connection = True
+            raise ContractError(400, "bad Content-Length") from None
+        if size < 0 or size > limit:
+            self.close_connection = True
+            raise ContractError(413, f"body exceeds {limit} bytes")
+        return self.rfile.read(size)
 
-        if path in ("/v1/memories/add", "/add"):
-            self._handle_add(body)
-        elif path in ("/v1/memories/search", "/search"):
-            self._handle_search(body)
-        else:
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Unknown endpoint: {path}"})
-
-    def _handle_add(self, body: Dict[str, Any]) -> None:
-        """Handle Add API Request."""
-        request_id = body.get("request_id")
-        user_id = body.get("user_id")
-        session_id = body.get("session_id")
-        messages = body.get("messages", [])
-
-        if not request_id or not user_id:
-            self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {
-                "error": "Missing required fields: request_id and user_id are required"
-            })
-            return
-
-        if not isinstance(messages, list):
-            self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": "messages must be a list"})
-            return
-
-        # Store incoming messages
-        for idx, msg in enumerate(messages):
-            if not isinstance(msg, dict):
-                continue
-            role = msg.get("role", "user")
-            raw_content = msg.get("content", "")
-            text = _extract_text_content(raw_content).strip()
-            if not text:
-                continue
-
-            ts = msg.get("timestamp")
-            valid_from = (ts / 1000.0) if (ts is not None and ts > 1e11) else ts
-            
-            # Key identifies session, sequence, and request ID
-            key = f"{session_id or 's'}:{idx}:{request_id[-16:]}"
-            category = f"chat_{role}"
-            
+    def do_POST(self) -> None:  # noqa: N802
+        started = time.perf_counter()
+        op = self.ROUTES.get(self._path())
+        status = 500
+        try:
+            if op is None:
+                self.close_connection = True
+                status = self._send(404, {"error": "not found"})
+                return
+            if not self._authorized():
+                self.close_connection = True
+                status = self._send(401, {"error": "invalid or missing credentials"})
+                return
+            if not self.aml.inflight.acquire(blocking=False):
+                self.close_connection = True
+                retry = str(self.aml.config.retry_after_s)
+                status = self._send(429, {"error": "busy, retry later"}, {"Retry-After": retry})
+                return
             try:
-                self.vault.put(
-                    category=category,
-                    key=key,
-                    content=text,
-                    scope=str(user_id),
-                    valid_from=valid_from,
-                    epistemic_state=EpistemicState.VERIFIED.value,
-                    origin="user" if role == "user" else "external"
-                )
-            except Exception as exc:
-                logger.warning("Failed to store entity %s: %s", key, exc)
-
-        # Successful response conforming to AML contract
-        self._send_json(HTTPStatus.OK, {
-            "success": True,
-            "request_id": request_id,
-            "user_id": user_id,
-            "session_id": session_id or ""
-        })
-
-    def _handle_search(self, body: Dict[str, Any]) -> None:
-        """Handle Search API Request."""
-        raw_query = body.get("query")
-        user_id = body.get("user_id")
-        top_k = body.get("top_k", 100)
-        options = body.get("options")
-
-        if raw_query is None or user_id is None:
-            self._send_json(HTTPStatus.UNPROCESSABLE_ENTITY, {
-                "error": "query and user_id are required"
-            })
-            return
-
-        query_text = _extract_text_content(raw_query).strip()
-        scope = str(user_id)
-        limit = max(1, int(top_k))
-
-        # Query Kibisis using match='any' for natural language questions
-        try:
-            results = self.vault.search(
-                query=query_text,
-                scope=scope,
-                limit=limit,
-                match="any",
-                include_unverified=True
-            )
-        except Exception as exc:
-            logger.error("Search failed: %s", exc)
-            results = []
-
-        data = []
-        for r in results:
-            # BM25 rank_score in SQLite FTS5 is negative (lower = better).
-            # Convert so higher values indicate greater relevance.
-            raw_score = r.rank_score if r.rank_score is not None else 0.0
-            relevance_score = round(max(0.001, -float(raw_score)), 4)
-            data.append({
-                "id": str(r.entity.key),
-                "content": str(r.entity.content),
-                "score": relevance_score,
-                "created_at": _format_created_at(r.entity.valid_from or r.entity.created_at)
-            })
-
-        self._send_json(HTTPStatus.OK, {"data": data})
-
-    def log_message(self, format: str, *args: Any) -> None:
-        # Minimal quiet logging
-        logger.info("%s - - [%s] %s", self.client_address[0], self.log_date_time_string(), format % args)
+                raw = self._read_body()
+                try:
+                    body = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    raise ContractError(400, "body is not valid UTF-8 JSON") from None
+                if not isinstance(body, dict):
+                    raise ContractError(422, "body must be a JSON object")
+                result = getattr(self.aml.service, op)(body)
+                status = self._send(200, result)
+            finally:
+                self.aml.inflight.release()
+        except ContractError as exc:
+            status = self._send(exc.status, {"error": exc.message})
+        except Exception as exc:  # never echo evaluation content; the type is enough to find the bug
+            LOG.error("%s failed: %s", op, type(exc).__name__)
+            self.close_connection = True
+            status = self._send(500, {"error": "internal error"})
+        finally:
+            LOG.info("%s %s %d %.1fms", self.command, op or "-", status, (time.perf_counter() - started) * 1000)
 
 
-def run_server(
-    host: str = "0.0.0.0",
-    port: int = 8080,
-    db_path: str = ":memory:",
-    api_key: Optional[str] = None
-) -> None:
-    vault = SQLiteMemoryVault(db_path, allow_plaintext=True)
-    
-    class BoundHandler(KibisisAMLHandler):
-        pass
-    
-    BoundHandler.vault = vault
-    BoundHandler.api_key = api_key
+def run_server(config: AMLConfig, host: str = "0.0.0.0", port: int = 8080,
+               ready: Optional[Callable[[AMLServer], None]] = None) -> None:
+    """Serve until SIGTERM/SIGINT; deletes vaults idle past config.retention_days once an hour."""
+    server = AMLServer((host, port), config)
+    stop = threading.Event()
 
-    server = ThreadingHTTPServer((host, port), BoundHandler)
-    print(f"Kibisis AML Adapter listening on http://{host}:{port}")
-    print(f"Database: {db_path}")
-    print(f"Auth token: {'[CONFIGURED]' if api_key else '[NONE]'}")
+    def _shutdown(signum: int, frame: Any) -> None:
+        stop.set()
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _shutdown)
+        signal.signal(signal.SIGINT, _shutdown)
+
+    def _retention() -> None:
+        while not stop.wait(3600 if config.retention_days > 0 else 86400):
+            if config.retention_days > 0:
+                removed = server.service.pool.purge_idle(config.retention_days * 86400)
+                if removed:
+                    LOG.info("retention: deleted %d vaults idle > %.0f days", removed, config.retention_days)
+
+    if config.retention_days > 0:
+        removed = server.service.pool.purge_idle(config.retention_days * 86400)
+        if removed:
+            LOG.info("retention: deleted %d vaults idle > %.0f days", removed, config.retention_days)
+    threading.Thread(target=_retention, name="aml-retention", daemon=True).start()
+    LOG.info("kibisis-aml %s listening on %s:%d (encrypted=%s, candidates=%d, max_inflight=%d)", ADAPTER_REVISION,
+             host, server.server_address[1], config.passphrase is not None, config.candidates, config.max_inflight)
+    if ready is not None:
+        ready(server)
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        server.serve_forever(poll_interval=0.5)
     finally:
+        stop.set()
         server.server_close()
-        vault.close()
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Kibisis AML Adapter Service")
-    parser.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=8080, help="Bind port (default: 8080)")
-    parser.add_argument("--db", default=os.environ.get("KIBISIS_AML_DB", "/tmp/kibisis_aml.db"), help="Vault SQLite path")
-    parser.add_argument("--key", default=os.environ.get("KIBISIS_AML_KEY"), help="Memory system key for token authentication")
-    args = parser.parse_args()
-
-    run_server(host=args.host, port=args.port, db_path=args.db, api_key=args.key)
-
-
-if __name__ == "__main__":
-    main()
+        server.service.pool.close_all()

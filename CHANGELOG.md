@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `kibisis aml-serve`: an HTTP adapter for the [Agent Memory Leaderboard](https://agentmemoryleaderboard.ai)
+  Add/Search contract (Textual track), in `kibisis.aml_adapter`, using only the standard library. Each
+  `user_id` gets its own vault, encrypted with SQLCipher unless `--plaintext` is passed. Each message is stored
+  verbatim as its own entry, with its role and timestamp in the entry metadata.
+  - **Add** writes the whole request in one transaction, together with a marker keyed on `request_id`. A failed
+    write leaves nothing behind, and a retried request is acknowledged without being stored twice.
+  - **Search** runs one BM25 query (`match="any"`) over the question and any answer options. It groups hits by
+    the Add request they came from, shows each hit with the message before it, and returns up to `top_k` groups,
+    best first, with stable ids and scores that never rise down the list.
+  - **Auth** accepts `Token`, `Bearer` or `X-Api-Key`. The server needs only the key's SHA-256 digest
+    (`--key-sha256`, `KIBISIS_AML_KEY_SHA256`), or reads the key from `KIBISIS_AML_KEY_FILE` or `KIBISIS_AML_KEY`.
+  - **Limits:** above `--max-inflight` requests are refused with `429` and `Retry-After`. Per-user vaults are kept
+    open up to `--max-open-vaults`, and vaults with no write for `--retention-days` are deleted.
+  - **Deployment:** `deploy/aml/` has a Dockerfile and a README.
+  - Tests are in `tests/test_aml_adapter.py`.
+
 ## [0.1.0-alpha.14] - 2026-11-03
 
 ### Added

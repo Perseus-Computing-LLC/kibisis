@@ -139,6 +139,7 @@ Report a vulnerability to contact@perseuscomputing.com with `[SECURITY]` in the 
 - [telarch.ai/kibisis](https://telarch.ai/kibisis): overview and a live demo of the lease coordinator
 - [telarch.ai/chatgpt](https://telarch.ai/chatgpt): Telarch as an app for ChatGPT and a plugin for Codex
 - [Documentation (docs.rs)](https://docs.rs/kibisis)
+- [Agent Memory Leaderboard adapter](deploy/aml/README.md): `kibisis aml-serve`, the AML Add/Search API over Kibisis vaults
 - [Changelog](CHANGELOG.md)
 
 ## License
