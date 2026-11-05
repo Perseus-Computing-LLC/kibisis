@@ -370,6 +370,7 @@ def test_over_capacity_gets_429_with_retry_after(http_server):
 
 def test_cli_help_and_missing_key(tmp_path):
     env = {k: v for k, v in os.environ.items() if not k.startswith(("KIBISIS_AML_KEY", "KIBISIS_PASSPHRASE"))}
+    env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)  # CI runs from src/ without installing
     help_run = subprocess.run([sys.executable, "-m", "kibisis", "aml-serve", "--help"], capture_output=True, text=True,
                               env=env, timeout=60)
     assert help_run.returncode == 0 and "--data-dir" in help_run.stdout
@@ -380,6 +381,23 @@ def test_cli_help_and_missing_key(tmp_path):
                              capture_output=True, text=True, env={**env, "KIBISIS_AML_KEY_SHA256": key_digest(KEY)},
                              timeout=60)
     assert no_pass.returncode == 2 and "vault key" in no_pass.stderr
+
+
+def test_cli_runs_under_a_uid_without_a_passwd_entry(monkeypatch):
+    """`docker run --user <uid>` has no passwd entry; building the CLI parser must not need one."""
+    import getpass
+
+    from kibisis import __main__ as cli
+    from kibisis.config import login_name
+
+    def no_passwd_entry():
+        raise KeyError("getpwuid(): uid not found: 1002")
+
+    monkeypatch.setattr(getpass, "getuser", no_passwd_entry)
+    assert login_name() == f"uid-{os.getuid()}"
+    with pytest.raises(SystemExit) as done:
+        cli.main(["aml-serve", "--help"])
+    assert done.value.code == 0
 
 
 def test_config_rejects_a_raw_key_in_place_of_its_digest(tmp_path):

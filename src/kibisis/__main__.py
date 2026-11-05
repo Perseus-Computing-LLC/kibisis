@@ -7,11 +7,11 @@ vault into an OKF v0.2 bundle and check one; they read the vault and never chang
 from __future__ import annotations
 
 import argparse
-import getpass
 import json
 import os
 import sys
 
+from .config import login_name
 from .vault import ORIGINS, AdmissionRefused, SQLiteMemoryVault
 
 DEFAULT_DB_PATH = os.environ.get("KIBISIS_DB_PATH", os.path.expanduser("~/.hermes/kibisis/vault.sqlite"))
@@ -201,7 +201,7 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--key", required=True)
     a.add_argument("--scope", default="default")
     a.add_argument("--by", required=True, choices=ORIGINS, help="who is reviewing; only 'user' can admit")
-    a.add_argument("--reviewer", default=getpass.getuser(), help="reviewer name recorded in the journal")
+    a.add_argument("--reviewer", default=login_name(), help="reviewer name recorded in the journal")
     a.add_argument("--note", default=None)
     a.set_defaults(func=_admit)
 

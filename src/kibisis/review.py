@@ -20,11 +20,10 @@ The vault, key and scope come from the same environment variables as the MCP ser
 from __future__ import annotations
 
 import argparse
-import getpass
 import sys
 from typing import List, Optional
 
-from .config import ConfigError, open_vault, resolve_scope
+from .config import ConfigError, login_name, open_vault, resolve_scope
 from .models import EpistemicState
 from .protocols import EncryptionRequiredError
 
@@ -72,7 +71,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"    {line}")
         return 0
 
-    reviewer = args.reviewer or getpass.getuser()
+    reviewer = args.reviewer or login_name()
     try:
         entity = vault.review_entity(
             category=args.category,

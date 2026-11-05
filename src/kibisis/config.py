@@ -57,6 +57,16 @@ def default_db_path(env: Optional[Mapping[str, str]] = None, platform: Optional[
     return str(default_data_dir(env, platform) / "vault.sqlite")
 
 
+def login_name() -> str:
+    """The login name, or ``uid-<n>`` when this uid has no passwd entry (``docker run --user``, for one)."""
+    import getpass
+
+    try:
+        return getpass.getuser()
+    except (KeyError, OSError):  # pwd lookup failed: KeyError up to 3.12, OSError from 3.13
+        return f"uid-{os.getuid()}" if hasattr(os, "getuid") else "unknown"
+
+
 def validate_scope(scope: str) -> str:
     """Return ``scope`` if it names exactly one scope; raise :class:`ConfigError` otherwise."""
     if not isinstance(scope, str) or not _SCOPE_RE.match(scope):

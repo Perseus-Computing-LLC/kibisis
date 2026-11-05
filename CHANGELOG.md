@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Deployment:** `deploy/aml/` has a Dockerfile and a README.
   - Tests are in `tests/test_aml_adapter.py`.
 
+### Fixed
+- The CLI no longer crashes when its uid has no passwd entry, as under `docker run --user <uid>`.
+  Building the parser called `getpass.getuser()` for the `admit --reviewer` default, which raises there, so
+  every subcommand failed. The default reviewer is now `kibisis.config.login_name()`, which falls back to
+  `uid-<n>`; `kibisis review` uses the same fallback.
+
 ## [0.1.0-alpha.14] - 2026-11-03
 
 ### Added
