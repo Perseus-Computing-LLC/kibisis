@@ -271,6 +271,23 @@ def http_server(tmp_path):
     thread.join(10)
 
 
+def test_server_starts_without_a_reverse_dns_lookup(tmp_path, monkeypatch):
+    """HTTPServer.server_bind calls socket.getfqdn(host); on macOS runners that lookup stalled startup for 35 s."""
+    import socket
+
+    def no_lookup(*args, **kwargs):
+        raise AssertionError("server start must not do a reverse DNS lookup")
+
+    monkeypatch.setattr(socket, "getfqdn", no_lookup)
+    server = aml_adapter.AMLServer(("127.0.0.1", 0), _config(tmp_path))
+    try:
+        assert server.server_port == server.server_address[1] > 0
+        assert server.server_name == "127.0.0.1"
+    finally:
+        server.server_close()
+        server.service.pool.close_all()
+
+
 def _call(server, method, path, body=None, headers=None, raw=None):
     conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
     try:

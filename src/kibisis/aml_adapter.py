@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import signal
+import socketserver
 import threading
 import time
 from collections import OrderedDict
@@ -194,7 +195,7 @@ class VaultPool:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.passphrase = passphrase
         self.max_open = max_open
-        self._slots: "OrderedDict[str, _Slot]" = OrderedDict()
+        self._slots: OrderedDict[str, _Slot] = OrderedDict()
         self._lock = threading.Lock()
 
     def path_for(self, user_id: str) -> Path:
@@ -352,7 +353,7 @@ class AMLService:
             raise ContractError(422, f"top_k must be an integer from 1 to {MAX_TOP_K}")
         text = " ".join([query] + [_text_of(o, "options[]") for o in options])
 
-        groups: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        groups: OrderedDict[str, Dict[str, Any]] = OrderedDict()
         with self.pool.use(user_id, create=False) as vault:
             if vault is None:
                 return {"data": []}
@@ -424,6 +425,14 @@ class AMLServer(ThreadingHTTPServer):
         self.inflight = threading.BoundedSemaphore(config.max_inflight)
         super().__init__(address, AMLHandler)
 
+    def server_bind(self) -> None:
+        # HTTPServer.server_bind sets server_name from socket.getfqdn(host), a reverse DNS lookup that can stall
+        # startup for half a minute (seen on macOS runners). Nothing here reads server_name, so skip the lookup.
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = int(port)
+
 
 class AMLHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -439,7 +448,7 @@ class AMLHandler(BaseHTTPRequestHandler):
     HEALTH = ("/", "/health", "/v1/health")
 
     @property
-    def aml(self) -> "AMLServer":
+    def aml(self) -> AMLServer:
         return cast(AMLServer, self.server)
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib signature
