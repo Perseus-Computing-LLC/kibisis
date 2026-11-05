@@ -228,7 +228,8 @@ class TestDistractors:
 
 
 class TestSearchCallers:
-    def test_mcp_recall_and_library_search_agree(self):
+    def test_mcp_recall_and_library_recall_agree(self):
+        """kibisis_recall goes through the gated recall(), and the gate costs no answer here."""
         vault = seeded_vault()
         # An agent-written candidate: the MCP server's recall shows candidates by default.
         vault.remember("insight", "agent_note", "Agent note: the nightly export job retries twice before failing.",
@@ -248,18 +249,30 @@ class TestSearchCallers:
             return recalled_refs(resp["result"]["content"][0]["text"])
 
         def through_library(query):
-            # The arguments kibisis_recall passes to search() with its defaults.
+            # The arguments kibisis_recall passes to the gated recall() with its defaults.
+            return vault.recall(
+                query, category=None, limit=K, scope="default", match="any", channel="mcp", actor="mcp-agent"
+            ).results
+
+        def through_search(query):
+            # What kibisis_recall called before 0.1.0a15: search() alone, with no gate.
             return vault.search(query, category=None, limit=K, scope="default", include_unverified=True, match="any")
 
         via_mcp = vault.evaluate_abstention(probes, search_fn=through_mcp, k=K)
+        # Each MCP recall is recorded on the recall log, as the library's gated path records it.
+        assert [r["channel"] for r in vault.recent_recalls()] == ["mcp"] * len(probes)
         via_lib = vault.evaluate_abstention(probes, search_fn=through_library, k=K)
+        via_search = vault.evaluate_abstention(probes, search_fn=through_search, k=K)
         assert figures(via_mcp) == figures(via_lib)
         assert via_mcp["false_accepts"] == via_lib["false_accepts"]
         assert via_mcp["false_rejects"] == via_lib["false_rejects"]
         assert via_mcp["store_size"] == len(ENTRIES) + 1
         assert via_mcp["answered_count"] == len(ANSWERABLE) + 1  # the candidate is recalled too
-        assert via_mcp["false_accept_count"] >= 1  # the near-miss chat leaks through match="any"
-        assert via_mcp["perfect"] is False
+        # search() alone lets the near-miss chat through with match="any"; the gate turns it away
+        # and answers every probe search() answered.
+        assert via_search["false_accept_count"] >= 1
+        assert via_mcp["false_accept_count"] == 0
+        assert via_mcp["answered_count"] == via_search["answered_count"]
 
     def test_default_search_fn_is_the_natural_language_search(self):
         vault = seeded_vault()

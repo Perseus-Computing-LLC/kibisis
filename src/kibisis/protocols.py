@@ -190,8 +190,12 @@ class MemoryVault(Protocol):
         resource: Optional[str] = None,
         holder_id: Optional[str] = None,
         missing_ok: bool = False,
+        origin: Optional[str] = None,
     ) -> str:
-        """Tombstone entity value by SHA-256 digest and purge plaintext content."""
+        """Tombstone entity value by SHA-256 digest and purge plaintext content.
+
+        A non-principal ``origin`` (``model``, ``tool``, ``unknown``) may not delete a reviewed entry.
+        """
         ...
 
     def is_tombstoned(

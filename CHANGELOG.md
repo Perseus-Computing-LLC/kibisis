@@ -24,6 +24,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Deployment:** `deploy/aml/` has a Dockerfile and a README.
   - Tests are in `tests/test_aml_adapter.py`.
 
+### Changed
+These follow the [Agent Memory Atlas](https://neoneye.github.io/agent-memory-atlas/systems/kibisis/) reading
+of e9ddf61, which named each as a limit (`tests/test_atlas_limits_20261105.py`).
+- MCP `kibisis_recall` goes through the gated `recall()`, as the library's model-facing path does, instead of
+  `search()`. Two verified entries that conflict are both held back and named on `<withheld>` lines; matches that
+  contain under half of the query's words, or that do not stand out from four or more other matches, are left out
+  and counted; and each call is recorded on the recall log and mirrored to Argus as `kibisis.memory_recall`.
+- `kibisis-review approve`, `dispute` and `reject` need a terminal on stdin, as `kibisis admit` does, and refuse
+  (exit 3) before opening the vault without one. `list` still runs anywhere, and now also shows the agent's
+  refused requests to forget reviewed entries.
+- `kibisis-review` and `kibisis admit` record the operating-system account they run as, read from the process's
+  user id, as the reviewer. `--reviewer` is now a label stored beside it (`reviewer_label`), so one account
+  approving twice under two names is one approval, and the default quorum of two needs two accounts. Set
+  `KIBISIS_VERIFICATION_QUORUM=1` if you are the only reviewer. `review_entity` and `admit` take `reviewer_label`.
+- `kibisis admit` opens the vault, key and scope the way the MCP server and `kibisis-review` do (`KIBISIS_DB_PATH`
+  or the per-user vault; `KIBISIS_PASSPHRASE_FILE` or `KIBISIS_PASSPHRASE`; `KIBISIS_SCOPE`, else the git
+  project's scope, else `default`), instead of `~/.hermes/kibisis/vault.sqlite` in scope `default`. It prints the
+  vault and scope it used, and the approvals still needed.
+
+### Security
+- `kibisis_forget` no longer deletes an entry a person verified, reviewed or wrote, or a value such an entry holds
+  under another key (its tombstone would have purged that copy too). The call is refused and journaled with the
+  agent's reason, `kibisis-review list` shows it, and a person carries it out by rejecting the entry; a later
+  review keeps the entry and settles the request. `tombstone()` takes `origin`: a non-principal origin may not
+  delete a reviewed entry, or one of a higher origin class (K-R1's rule for writes, applied to deletes), and
+  raises `ReviewedEntryError` with nothing changed. Without `origin`, library calls behave as before.
+- `review_entity(verdict="revoked")` passes its `reviewer_origin` to the tombstone, so a revocation recorded with a
+  model or tool origin cannot delete a reviewed entry.
+
 ### Fixed
 - The CLI no longer crashes when its uid has no passwd entry, as under `docker run --user <uid>`.
   Building the parser called `getpass.getuser()` for the `admit --reviewer` default, which raises there, so
@@ -31,6 +60,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `uid-<n>`; `kibisis review` uses the same fallback.
 - `aml-serve` no longer does a reverse DNS lookup of its bind address at startup. `HTTPServer.server_bind`
   calls `socket.getfqdn()`, which stalled startup for about 35 s on macOS runners.
+- `aml-serve` reads and drops the body of a request it refuses unread (413 over the size limit, 429 when busy)
+  for up to 2 s before closing. Closing with the body still arriving made the kernel reset the connection, so a
+  client still sending got a reset instead of the reply and its `Retry-After`; this failed a macOS runner.
+- Documentation that overstated what the code does: the README said search returns verified memories unless asked
+  for more (search returns candidates too, labeled; only `list_entities` defaults to verified and disputed), and
+  that the Rust vault matches tombstoned values the same way as the Python one (it does not apply NFKC, and
+  lowercases rather than case-folds). `kibisis.review`'s docstring said approving stores an entry as verified,
+  which holds only at a quorum of one. The README's limits now also cover tombstones that cannot be lifted,
+  validity windows that a rewrite replaces, and BM25 statistics shared across scopes.
 
 ## [0.1.0-alpha.14] - 2026-11-03
 

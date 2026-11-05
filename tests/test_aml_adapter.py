@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -342,6 +343,30 @@ def test_bad_bodies_get_clear_4xx(http_server):
     big = {"request_id": "big", "user_id": "hu", "session_id": "s",
            "messages": [{"role": "user", "content": "x" * 70_000}]}
     assert _call(http_server, "POST", "/v1/memories/add", big, AUTH)[0] == 413
+
+
+def test_a_refused_body_is_read_and_dropped_so_the_connection_closes_cleanly(http_server):
+    """The 413 goes out before the body is read. Closing then, with the body still arriving, makes the
+    kernel reset the connection, and a client still sending never reads the reply; the handler drains
+    the declared body first (this raced on macOS runners)."""
+    body = json.dumps({"request_id": "big2", "user_id": "hu", "session_id": "s",
+                       "messages": [{"role": "user", "content": "x" * 70_000}]}).encode()
+    head = ("POST /v1/memories/add HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\n"
+            + "".join(f"{name}: {value}\r\n" for name, value in AUTH.items())
+            + f"Content-Length: {len(body)}\r\n\r\n").encode()
+    with socket.create_connection(("127.0.0.1", http_server.server_address[1]), timeout=10) as conn:
+        # Part of the body goes with the headers, as http.client sends it: the server decides on the
+        # headers alone, so these bytes are still unread when it replies.
+        conn.sendall(head + body[:32_768])
+        reply = b""
+        while b"\r\n\r\n" not in reply:
+            reply += conn.recv(4096)
+        assert reply.startswith(b"HTTP/1.1 413")
+        time.sleep(0.2)  # without the drain the server has closed with data unread, which resets
+        conn.sendall(body[32_768:])
+        while chunk := conn.recv(65536):  # a clean close ends with b""; a reset raises here
+            reply += chunk
+    assert b"exceeds" in reply
 
 
 def test_chunked_request_body(http_server):
