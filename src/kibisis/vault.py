@@ -806,7 +806,8 @@ class SQLiteMemoryVault(
             ep_state = EpistemicState(epistemic_state) if epistemic_state else EpistemicState.CANDIDATE
 
         if trust_ceiling is not None and ep_state in (EpistemicState.VERIFIED, EpistemicState.DISPUTED):
-            # Default recall returns verified and disputed entries; a capped write is neither.
+            # A capped write cannot claim a reviewed state: verified and disputed come only from a
+            # person's review, and list_entities shows them by default.
             meta["trust_capped_from"] = ep_state.value
             ep_state = EpistemicState.CANDIDATE
 
@@ -1380,6 +1381,55 @@ class SQLiteMemoryVault(
                 author_id=author_id,
                 metadata=meta,
             )
+
+    def forget_requests(self, scope: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Refused requests to forget a reviewed entry in ``scope``, newest first, one per entry.
+
+        The MCP server refuses ``kibisis_forget`` on an entry a person reviewed and journals the
+        request; this is the review queue's view of those refusals. A request is left out once its
+        entry is gone or a person has reviewed the entry since it was made. Each item has
+        ``category``, ``key``, ``requested_at``, ``author_id`` and ``reason``.
+        """
+        cursor = self._conn.cursor()
+        cursor.execute(
+            "SELECT category, key, timestamp, author_id, metadata_json FROM audit_journal "
+            "WHERE action = 'refuse' AND scope = ? ORDER BY sequence DESC LIMIT 5000",
+            (scope,),
+        )
+        seen = set()
+        requests: List[Dict[str, Any]] = []
+        for row in cursor.fetchall():
+            try:
+                meta = json.loads(row["metadata_json"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            detail = meta.get("detail") or {}
+            if meta.get("reason") != "reviewed_entry" or detail.get("tool") != "kibisis_forget":
+                continue
+            ref = (row["category"], row["key"])
+            if ref in seen:
+                continue
+            seen.add(ref)
+            try:
+                entity = self.get(row["category"], row["key"], scope=scope)
+            except PermissionError:
+                entity = None  # an entry that fails its integrity check is not shown anywhere
+            if entity is None:
+                continue
+            reviews = (entity.metadata or {}).get("human_reviews") or []
+            last_review = max((float(r.get("timestamp") or 0) for r in reviews if isinstance(r, dict)), default=0.0)
+            if last_review > float(row["timestamp"]):
+                continue  # a person looked at the entry after the request and kept it
+            requests.append({
+                "category": row["category"],
+                "key": row["key"],
+                "requested_at": float(row["timestamp"]),
+                "author_id": row["author_id"] or "",
+                "reason": str(detail.get("requested_reason") or ""),
+            })
+            if len(requests) >= limit:
+                break
+        return requests
 
     def supersede(
         self,

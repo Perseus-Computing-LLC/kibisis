@@ -12,6 +12,12 @@ from typing import Any, Dict, List, Optional
 
 from ._vault_crypto import value_digests
 
+#: How a refused forget names the class of the entry it would have deleted (K-R1 classes above a requester).
+_WRITTEN_BY = {
+    "principal": "written by a person or an import (principal class)",
+    "agent": "written by an agent (agent class)",
+}
+
 
 class TombstoneMixin:
     """Tombstones values, purges entries and their copies, and scrubs the file."""
@@ -64,6 +70,36 @@ class TombstoneMixin:
         )
         return cursor.fetchone()
 
+    def _value_copies(self, cursor: Any, scope: str, val_hash: str, can_hash: str) -> List[Dict[str, Any]]:
+        """Every stored row in ``scope`` (every scope for ``'*'``) that holds the value, live or archived.
+
+        Each row comes back with its id, name, state, metadata and exact digest. A row that cannot be
+        opened cannot be compared, and is never returned by any read, so it is left out.
+        """
+        columns = (
+            "id, category, key, scope, content, is_encrypted, encrypted_envelope_json, tenant_sig, "
+            "epistemic_state, metadata_json, origin"
+        )
+        if scope == "*":
+            cursor.execute(f"SELECT {columns} FROM entities")
+        else:
+            cursor.execute(f"SELECT {columns} FROM entities WHERE scope = ?", (scope,))
+        copies: List[Dict[str, Any]] = []
+        for row in cursor.fetchall():
+            try:
+                content = self._open_entry(row)
+            except PermissionError:
+                continue
+            exact, canonical = self._digests(content)
+            if exact != val_hash and not (can_hash and canonical == can_hash):
+                continue
+            copies.append({
+                "id": row["id"], "category": row["category"], "key": row["key"], "scope": row["scope"],
+                "epistemic_state": row["epistemic_state"], "metadata_json": row["metadata_json"],
+                "origin": row["origin"], "exact": exact,
+            })
+        return copies
+
     def _purge_value_copies(
         self,
         cursor: Any,
@@ -72,29 +108,22 @@ class TombstoneMixin:
         can_hash: str,
         author_id: Optional[str],
         tombstoned: str,
+        copies: Optional[List[Dict[str, Any]]] = None,
     ) -> int:
         """Delete every stored copy of a tombstoned value in ``scope`` (every scope for ``'*'``).
 
         Copies under other categories or keys, live or archived, would otherwise keep a rejected
-        value retrievable. Each deletion is journaled in the caller's transaction.
+        value retrievable. Each deletion is journaled in the caller's transaction. ``copies`` is the
+        list :meth:`_value_copies` returned, when the caller already has it.
         """
-        if scope == "*":
-            cursor.execute("SELECT id, category, key, scope, content, is_encrypted, encrypted_envelope_json, tenant_sig FROM entities")
-        else:
-            cursor.execute(
-                "SELECT id, category, key, scope, content, is_encrypted, encrypted_envelope_json, tenant_sig FROM entities WHERE scope = ?",
-                (scope,),
-            )
+        if copies is None:
+            copies = self._value_copies(cursor, scope, val_hash, can_hash)
         purged = 0
-        for row in cursor.fetchall():
-            try:
-                content = self._open_entry(row)
-            except PermissionError:
-                continue  # an entry that cannot be opened cannot be compared, and is never returned
-            exact, canonical = self._digests(content)
-            if exact != val_hash and not (can_hash and canonical == can_hash):
-                continue
+        for row in copies:
+            exact = row["exact"]
             cursor.execute("DELETE FROM entities WHERE id = ?", (row["id"],))
+            if not cursor.rowcount:
+                continue  # the tombstoned entry itself, already deleted by the caller
             self._record_audit_event(
                 cursor=cursor,
                 action="purge",
@@ -119,6 +148,7 @@ class TombstoneMixin:
         fencing_token: Optional[int] = None,
         resource: Optional[str] = None,
         holder_id: Optional[str] = None,
+        origin: Optional[str] = None,
     ) -> str:
         """Tombstone a value by its exact and canonical SHA-256 digests within ``scope``.
 
@@ -126,24 +156,69 @@ class TombstoneMixin:
         (all scopes when ``scope`` is ``'*'``). Later writes of the value, or of a look-alike that
         canonicalizes to it, are refused under any category or key in the scope. Returns the value's
         SHA-256 hex digest; a vault with a passphrase stores it keyed (see :meth:`stored_digest`).
+
+        ``origin`` names who asked, as on :meth:`put`. A request from outside the principal class
+        (``model``, ``tool`` or ``unknown``) cannot delete what a person vouched for: when the entry, or
+        any other copy of the value the tombstone would purge, is verified, carries a person's review,
+        or belongs to a higher origin class than the request (an entry a person wrote, say, under
+        K-R1's rule for writes), :class:`~kibisis.vault.ReviewedEntryError` is raised and nothing
+        changes. A person deletes such an entry by rejecting it (``review_entity`` with
+        ``verdict="revoked"``). ``None`` leaves the check to the caller, as before: library code that
+        relays an agent's request passes its origin.
         """
+        from ._vault_review import _class_rank, _row_origin_class, origin_class_of
+        from .vault import ReviewedEntryError, _is_reviewed  # vault.py imports this module
+
+        def protected(row: Any, requester: str) -> Optional[str]:
+            """Why a ``requester``-class request may not delete ``row``, or ``None``."""
+            if _is_reviewed(row):
+                return "verified or reviewed by a person"
+            stored = _row_origin_class(row)
+            if _class_rank(stored) > _class_rank(requester):
+                return _WRITTEN_BY.get(stored, f"written by a {stored}-class writer")
+            return None
+
         now = time.time()
         with self._write_tx() as cursor:
             self._fence(cursor, fencing_token, resource, holder_id)
+            target = None
             if content is None:
                 cursor.execute(
-                    "SELECT category, key, scope, content, is_encrypted, encrypted_envelope_json, tenant_sig FROM entities "
-                    "WHERE category = ? AND key = ? AND scope = ?",
+                    "SELECT category, key, scope, content, is_encrypted, encrypted_envelope_json, tenant_sig, "
+                    "epistemic_state, metadata_json, origin FROM entities WHERE category = ? AND key = ? AND scope = ?",
                     (category, key, scope),
                 )
                 row = cursor.fetchone()
                 if row is None:
                     raise KeyError(f"Entity not found: {category}:{key} [scope={scope}]")
                 content = self._open_entry(row)
+                target = row
 
             assert content is not None
             plain_exact, plain_canonical = value_digests(content)
             val_hash, can_hash = self._stored_digests(plain_exact, plain_canonical)
+
+            copies = None
+            requester = origin_class_of(origin) if origin is not None else "principal"
+            if requester != "principal":
+                why = protected(target, requester) if target is not None else None
+                if why:
+                    raise ReviewedEntryError(
+                        f"'{category}:{key}' [scope={scope}] was {why}, so a {origin} request cannot delete it. "
+                        "A person can, by rejecting it in the review CLI."
+                    )
+                copies = self._value_copies(cursor, scope, val_hash, can_hash)
+                for copy in copies:
+                    if (copy["category"], copy["key"], copy["scope"]) == (category, key, scope):
+                        continue  # the entry itself, checked above
+                    why = protected(copy, requester)
+                    if why:
+                        raise ReviewedEntryError(
+                            f"'{category}:{key}' [scope={scope}] holds the same value as "
+                            f"'{copy['category']}:{copy['key']}' [scope={copy['scope']}], which was {why}, so a "
+                            f"{origin} request cannot delete the value. A person can, by rejecting it in the "
+                            "review CLI."
+                        )
 
             cursor.execute(
                 """
@@ -172,7 +247,7 @@ class TombstoneMixin:
                 author_id=author_id,
                 metadata={"reason": reason, "canonical_sha256": can_hash},
             )
-            self._purge_value_copies(cursor, scope, val_hash, can_hash, author_id, f"{category}:{key}")
+            self._purge_value_copies(cursor, scope, val_hash, can_hash, author_id, f"{category}:{key}", copies=copies)
             return plain_exact
 
     def is_tombstoned(

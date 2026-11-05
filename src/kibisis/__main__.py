@@ -11,14 +11,15 @@ import json
 import os
 import sys
 
-from .config import login_name
+from .config import ConfigError, open_vault, resolve_scope, validate_scope
+from ._operator import NotInteractive, account_identity, require_terminal
+from .protocols import EncryptionRequiredError
 from .vault import ORIGINS, AdmissionRefused, SQLiteMemoryVault
 
+#: Default vault for the ``okf-*`` commands. ``admit`` resolves its vault like the MCP server does.
 DEFAULT_DB_PATH = os.environ.get("KIBISIS_DB_PATH", os.path.expanduser("~/.hermes/kibisis/vault.sqlite"))
 
-
-class NotInteractive(RuntimeError):
-    """``admit`` was invoked without a terminal on stdin."""
+__all__ = ["NotInteractive", "main"]
 
 
 def _require_tty() -> None:
@@ -29,8 +30,7 @@ def _require_tty() -> None:
     agent can set a variable as easily as a person can, so one would turn the gate into a
     convention. The test suite drives this through a pseudo-terminal instead.
     """
-    if not sys.stdin.isatty():
-        raise NotInteractive("admit requires an interactive terminal (stdin is not a TTY); run it yourself in a shell")
+    require_terminal("admit")
 
 
 def _admit(args: argparse.Namespace) -> int:
@@ -39,26 +39,41 @@ def _admit(args: argparse.Namespace) -> int:
     except NotInteractive as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 3
-    vault = SQLiteMemoryVault(args.db)
+    # The same vault, key and scope the MCP server and the review CLI use, so a person admits the
+    # entry the agent wrote, not a namesake in another file or scope.
+    try:
+        scope = validate_scope(args.scope) if args.scope is not None else resolve_scope()
+        vault = open_vault(args.db)
+    except (ConfigError, EncryptionRequiredError) as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 2
+    reviewer = account_identity()
     try:
         entity = vault.admit(
             args.category,
             args.key,
-            reviewer=args.reviewer,
+            reviewer=reviewer,
             reviewer_origin=args.by,
             note=args.note,
-            scope=args.scope,
+            scope=scope,
+            reviewer_label=args.reviewer,
         )
     except AdmissionRefused as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
     except KeyError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {exc} in {vault.db_path}", file=sys.stderr)
         return 1
     finally:
         vault.close()
     state = entity.epistemic_state.value if hasattr(entity.epistemic_state, "value") else entity.epistemic_state
-    print(f"{args.category}:{args.key} [scope={args.scope}] is now {state} (origin={entity.origin}, reviewed by {args.reviewer}/{args.by})")
+    pending = (entity.metadata or {}).get("verification_pending")
+    waiting = f"; {pending['have']} of {pending['need']} approvals" if pending else ""
+    label = f" as {args.reviewer!r}" if args.reviewer and args.reviewer != reviewer else ""
+    print(
+        f"{args.category}:{args.key} [scope={scope}] in {vault.db_path} is now {state}{waiting} "
+        f"(origin={entity.origin}, reviewed by account {reviewer}{label}, --by {args.by})"
+    )
     return 0
 
 
@@ -196,12 +211,21 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m kibisis")
     sub = parser.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("admit", help="promote a candidate entry to verified (a person's action)")
-    a.add_argument("--db", default=DEFAULT_DB_PATH, help="vault path (default: $KIBISIS_DB_PATH)")
+    a.add_argument(
+        "--db", default=None,
+        help="vault path (default: $KIBISIS_DB_PATH, else the per-user vault the MCP server and kibisis-review use)",
+    )
     a.add_argument("--category", required=True)
     a.add_argument("--key", required=True)
-    a.add_argument("--scope", default="default")
+    a.add_argument(
+        "--scope", default=None,
+        help="scope (default: as for the MCP server: $KIBISIS_SCOPE, else the git project, else 'default')",
+    )
     a.add_argument("--by", required=True, choices=ORIGINS, help="who is reviewing; only 'user' can admit")
-    a.add_argument("--reviewer", default=login_name(), help="reviewer name recorded in the journal")
+    a.add_argument(
+        "--reviewer", default=None,
+        help="label recorded with the review; the quorum counts the operating-system account, not this",
+    )
     a.add_argument("--note", default=None)
     a.set_defaults(func=_admit)
 

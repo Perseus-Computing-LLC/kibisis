@@ -1,5 +1,6 @@
 """Tests for the Kibisis MCP server, its settings, the key generator and the review command."""
 
+import io
 import json
 import os
 import subprocess
@@ -7,8 +8,10 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from kibisis import KibisisMCPServer, SQLiteMemoryVault
+from kibisis._operator import account_identity
 from kibisis.config import ConfigError, default_data_dir, default_db_path, open_vault, resolve_scope, validate_scope
 from kibisis.keys import main as keys_main
 from kibisis.review import main as review_main
@@ -16,6 +19,13 @@ from kibisis.review import main as review_main
 SRC = str(Path(__file__).resolve().parents[1] / "src")
 TEST_KEY = "mcp server test key only, not a secret"
 _SAVED_ENV = {}
+
+
+class _Terminal(io.StringIO):
+    """A stdin that reports a terminal, for running the review CLI's verdicts in-process."""
+
+    def isatty(self):
+        return True
 
 
 def setUpModule():
@@ -145,8 +155,18 @@ class TestToolLifecycle(unittest.TestCase):
         self.assertEqual((health["status"], health["scope"], health["active_entities"]), ("healthy", "default", 1))
 
         is_error, text = _call(self.server, "kibisis_forget", {"category": "convention", "key": "formatting_style"})
-        self.assertFalse(is_error, text)
-        self.assertEqual(json.loads(text)["status"], "deleted")
+        # A person verified it, so the agent's forget is refused and kept as a request for a person.
+        self.assertTrue(is_error, text)
+        self.assertIn("Refused", text)
+        self.assertIn("kibisis.review reject convention formatting_style", text)
+        self.assertIsNotNone(self.vault.get("convention", "formatting_style"))
+        self.assertEqual(
+            [(r["category"], r["key"]) for r in self.vault.forget_requests("default")],
+            [("convention", "formatting_style")],
+        )
+        # The person carries it out by rejecting the entry, which settles the request.
+        self.vault.review_entity("convention", "formatting_style", verdict="revoked", reviewer_id="human:owner")
+        self.assertEqual(self.vault.forget_requests("default"), [])
         _, text = _call(self.server, "kibisis_recall", {"query": "deterministic snake_case", "include_candidates": True})
         self.assertIn('count="0"', text)
         _, text = _call(self.server, "kibisis_forget", {"category": "convention", "key": "formatting_style"})
@@ -277,16 +297,24 @@ class TestReviewCommand(unittest.TestCase):
                 _call(server, "kibisis_remember", {"category": "c", "key": "drop", "content": "Ship without tests"})
                 vault.close()
 
-                self.assertEqual(review_main(["approve", "c", "keep", "--reviewer", "human:owner"]), 0)
-                self.assertEqual(review_main(["reject", "c", "drop", "--reviewer", "human:owner"]), 0)
-                self.assertEqual(review_main(["approve", "c", "missing"]), 1)
+                # A verdict needs a terminal on stdin: from a pipe it is refused and nothing changes.
+                with mock.patch("sys.stdin", io.StringIO("")):
+                    self.assertEqual(review_main(["approve", "c", "keep", "--reviewer", "human:owner"]), 3)
+                with mock.patch("sys.stdin", _Terminal("")):
+                    self.assertEqual(review_main(["approve", "c", "keep", "--reviewer", "human:owner"]), 0)
+                    self.assertEqual(review_main(["reject", "c", "drop", "--reviewer", "human:owner"]), 0)
+                    self.assertEqual(review_main(["approve", "c", "missing"]), 1)
 
                 vault = open_vault()
                 try:
                     kept = vault.get("c", "keep")
                     self.assertEqual(kept.epistemic_state.value, "verified")
                     self.assertEqual(kept.metadata["author_id"], "mcp-agent")
-                    self.assertEqual(kept.metadata["human_reviews"][-1]["reviewer_id"], "human:owner")
+                    # The review is the account's; the typed name is only a label beside it.
+                    self.assertEqual(len(kept.metadata["human_reviews"]), 1)
+                    self.assertEqual(kept.metadata["human_reviews"][-1]["reviewer_id"], account_identity())
+                    self.assertEqual(kept.metadata["human_reviews"][-1]["reviewer_label"], "human:owner")
+                    self.assertEqual(kept.metadata["attestations"], [account_identity()])
                     self.assertIsNone(vault.get("c", "drop"))
                     with self.assertRaises(Exception):
                         vault.put("c", "drop-again", "Ship without tests")

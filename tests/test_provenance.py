@@ -164,7 +164,7 @@ def test_admit_cli_sets_reviewer_origin_user(tmp_path, monkeypatch):
     v = SQLiteMemoryVault(db, passphrase="test-passphrase")
     v.remember("c", "k", "fact", origin="model")
     v.close()
-    common = ["--db", db, "--category", "c", "--key", "k"]
+    common = ["--db", db, "--scope", "default", "--category", "c", "--key", "k"]
     r = _run_admit([*common, "--by", "user", "--note", "looked at it"], tty=True)
     assert r.returncode == 0, r.stdout + r.stderr
     r2 = _run_admit([*common, "--by", "model"], tty=True)

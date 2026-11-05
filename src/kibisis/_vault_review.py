@@ -311,11 +311,13 @@ class AdmissionReviewMixin:
         fencing_token: Optional[int] = None,
         resource: Optional[str] = None,
         holder_id: Optional[str] = None,
+        reviewer_label: Optional[str] = None,
     ) -> MemoryEntity:
         """Promote an entry to ``verified``. Only a person (``reviewer_origin="user"``) may do so.
 
         A model or tool asking to verify raises :class:`AdmissionRefused`; the entry is left as it is.
-        The human path is ``python -m kibisis admit --category C --key K --by user``.
+        The human path is ``python -m kibisis admit --category C --key K --by user``. ``reviewer`` is the
+        identity the quorum counts (see :meth:`review_entity`); ``reviewer_label`` is recorded beside it.
         """
         _validate_origin(reviewer_origin, "reviewer_origin")
         if reviewer_origin != "user":
@@ -336,6 +338,7 @@ class AdmissionReviewMixin:
             fencing_token=fencing_token,
             resource=resource,
             holder_id=holder_id,
+            reviewer_label=reviewer_label,
         )
 
     def _clear_pending_supersession(self, category: str, key: str, scope: str, proposer_ref: str) -> None:
@@ -371,11 +374,16 @@ class AdmissionReviewMixin:
         resource: Optional[str] = None,
         holder_id: Optional[str] = None,
         reviewer_origin: str = "user",
+        reviewer_label: Optional[str] = None,
     ) -> MemoryEntity:
         """Human review gate: update epistemic state based on review decision (verified, disputed, revoked).
 
         This is the person's API; callers that relay a model's request use :meth:`admit`, which refuses
         anything but ``reviewer_origin="user"``. The verdict's origin is kept in ``human_reviews``.
+
+        The verification quorum counts distinct ``reviewer_id`` values, so the caller vouches that each
+        one is a different person. The review CLI and ``admit`` pass the operating-system account they
+        run as, never a typed name; ``reviewer_label`` keeps a typed name alongside it without counting.
         """
         valid_verdicts = {EpistemicState.VERIFIED.value, EpistemicState.DISPUTED.value, EpistemicState.REVOKED.value}
         if verdict not in valid_verdicts:
@@ -386,7 +394,8 @@ class AdmissionReviewMixin:
         # entry the verdict lands on, and a concurrent write cannot slip in between the two.
         with self._write_tx():
             return self._review_locked(
-                category, key, verdict, scope, reviewer_id, notes, fencing_token, resource, holder_id, reviewer_origin
+                category, key, verdict, scope, reviewer_id, notes, fencing_token, resource, holder_id, reviewer_origin,
+                reviewer_label,
             )
 
     def _review_locked(
@@ -401,6 +410,7 @@ class AdmissionReviewMixin:
         resource: Optional[str],
         holder_id: Optional[str],
         reviewer_origin: str,
+        reviewer_label: Optional[str] = None,
     ) -> MemoryEntity:
         """Body of :meth:`review_entity`; runs inside the caller's write transaction."""
         entity = self.get(category=category, key=key, scope=scope)
@@ -417,6 +427,8 @@ class AdmissionReviewMixin:
             "previous_state": entity.epistemic_state.value,
             "reviewer_origin": reviewer_origin,
         })
+        if reviewer_label and reviewer_label != reviewer_id:
+            reviews[-1]["reviewer_label"] = reviewer_label
         meta["human_reviews"] = reviews
 
         if meta.get("proposed_supersedes") and verdict != EpistemicState.VERIFIED.value:
@@ -426,7 +438,8 @@ class AdmissionReviewMixin:
             self._clear_pending_supersession(dropped["category"], dropped["key"], scope, f"{category}:{key}")
 
         if verdict == EpistemicState.REVOKED.value:
-            # Revocation initiates tombstone recording and purges plaintext
+            # Revocation initiates tombstone recording and purges plaintext. The verdict's origin goes
+            # with it: a revocation that does not come from a person cannot delete a reviewed entry.
             self.tombstone(
                 category=category,
                 key=key,
@@ -436,6 +449,7 @@ class AdmissionReviewMixin:
                 fencing_token=fencing_token,
                 resource=resource,
                 holder_id=holder_id,
+                origin=reviewer_origin,
             )
             with self._write_tx() as cursor:
                 if entity.epistemic_state != EpistemicState.REVOKED:
