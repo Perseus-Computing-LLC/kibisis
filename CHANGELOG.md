@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.15] - 2026-11-05
+
 ### Added
 - `kibisis aml-serve`: an HTTP adapter for the [Agent Memory Leaderboard](https://agentmemoryleaderboard.ai)
   Add/Search contract (Textual track), in `kibisis.aml_adapter`, using only the standard library. Each

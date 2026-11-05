@@ -26,17 +26,17 @@ An agent that runs for hours learns things worth keeping: decisions, preferences
 
 ## Install
 
-This README describes 0.1.0-alpha.14 (0.1.0a14 on PyPI). It is a pre-release, so name the version.
+This README describes 0.1.0-alpha.15 (0.1.0a15 on PyPI). It is a pre-release, so name the version.
 
 ```toml
 # Rust: Cargo.toml
 [dependencies]
-kibisis = "0.1.0-alpha.14"
+kibisis = "0.1.0-alpha.15"
 ```
 
 ```bash
 # Python
-pip install kibisis==0.1.0a14
+pip install kibisis==0.1.0a15
 ```
 
 ## Quickstart
