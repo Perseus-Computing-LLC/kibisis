@@ -527,13 +527,45 @@ class AMLHandler(BaseHTTPRequestHandler):
             raise ContractError(400, "bad Content-Length") from None
         if size < 0 or size > limit:
             self.close_connection = True
+            self._body_unread = size > 0
             raise ContractError(413, f"body exceeds {limit} bytes")
         return self.rfile.read(size)
+
+    #: After refusing a request before reading its body (413, 429), the handler reads and drops the
+    #: declared body for at most this long, then closes. Closing a socket that still has unread data
+    #: makes the kernel reset the connection, and a client still sending its body then gets the reset
+    #: instead of the reply (macOS does this even for a body just over the limit).
+    DRAIN_SECONDS = 2.0
+
+    def _drain_body(self) -> None:
+        """Read and drop the request's declared body, for at most :attr:`DRAIN_SECONDS`.
+
+        Runs after the reply has gone out and before the connection closes. A chunked body is not
+        drained: its length is not known up front.
+        """
+        try:
+            remaining = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return
+        deadline = time.monotonic() + self.DRAIN_SECONDS
+        try:
+            while remaining > 0:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return
+                self.connection.settimeout(left)
+                chunk = self.rfile.read1(min(remaining, 65536))
+                if not chunk:
+                    return
+                remaining -= len(chunk)
+        except OSError:  # a timeout or a reset: the connection closes either way
+            return
 
     def do_POST(self) -> None:  # noqa: N802
         started = time.perf_counter()
         op = self.ROUTES.get(self._path())
         status = 500
+        self._body_unread = False
         try:
             if op is None:
                 self.close_connection = True
@@ -547,6 +579,7 @@ class AMLHandler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 retry = str(self.aml.config.retry_after_s)
                 status = self._send(429, {"error": "busy, retry later"}, {"Retry-After": retry})
+                self._drain_body()  # so the client reads the 429 and its Retry-After, not a reset
                 return
             try:
                 raw = self._read_body()
@@ -562,6 +595,8 @@ class AMLHandler(BaseHTTPRequestHandler):
                 self.aml.inflight.release()
         except ContractError as exc:
             status = self._send(exc.status, {"error": exc.message})
+            if self._body_unread:
+                self._drain_body()
         except Exception as exc:  # never echo evaluation content; the type is enough to find the bug
             LOG.error("%s failed: %s", op, type(exc).__name__)
             self.close_connection = True

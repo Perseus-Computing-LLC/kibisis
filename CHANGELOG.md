@@ -60,6 +60,9 @@ of e9ddf61, which named each as a limit (`tests/test_atlas_limits_20261105.py`).
   `uid-<n>`; `kibisis review` uses the same fallback.
 - `aml-serve` no longer does a reverse DNS lookup of its bind address at startup. `HTTPServer.server_bind`
   calls `socket.getfqdn()`, which stalled startup for about 35 s on macOS runners.
+- `aml-serve` reads and drops the body of a request it refuses unread (413 over the size limit, 429 when busy)
+  for up to 2 s before closing. Closing with the body still arriving made the kernel reset the connection, so a
+  client still sending got a reset instead of the reply and its `Retry-After`; this failed a macOS runner.
 - Documentation that overstated what the code does: the README said search returns verified memories unless asked
   for more (search returns candidates too, labeled; only `list_entities` defaults to verified and disputed), and
   that the Rust vault matches tombstoned values the same way as the Python one (it does not apply NFKC, and
