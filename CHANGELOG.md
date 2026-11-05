@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.16] - 2026-11-05
+
+### Changed
+- `kibisis aml-serve` and `kibisis.aml_adapter.run_server` now bind `127.0.0.1` by default instead of `0.0.0.0`,
+  so a server started without `--host` is reachable from this machine only. Pass `--host 0.0.0.0` to listen on every
+  interface; the `deploy/aml` Docker image already does, so containers are unaffected.
+- README: the "Local only" line said Kibisis contains no network code, which stopped being true when alpha.15 added
+  `aml-serve`. It now says Kibisis makes no outbound connections and names the opt-in server.
+
 ## [0.1.0-alpha.15] - 2026-11-05
 
 ### Added

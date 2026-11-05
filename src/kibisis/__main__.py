@@ -257,7 +257,8 @@ def main(argv: list[str] | None = None) -> int:
                        description="Serve the AML Add/Search contract over per-user Kibisis vaults. The Memory "
                                    "System Key comes from KIBISIS_AML_KEY_SHA256, KIBISIS_AML_KEY_FILE or "
                                    "KIBISIS_AML_KEY; the vault key from KIBISIS_PASSPHRASE_FILE or KIBISIS_PASSPHRASE.")
-    s.add_argument("--host", default="0.0.0.0", help="bind host (default: 0.0.0.0)")
+    s.add_argument("--host", default="127.0.0.1",
+                   help="bind host (default: 127.0.0.1, this machine only; pass 0.0.0.0 to listen on every interface)")
     s.add_argument("--port", type=int, default=8080, help="bind port (default: 8080)")
     s.add_argument("--data-dir", default=os.environ.get("KIBISIS_AML_DATA_DIR", "aml-data"),
                    help="directory for the per-user vaults (default: $KIBISIS_AML_DATA_DIR or ./aml-data)")

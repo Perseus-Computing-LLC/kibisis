@@ -605,7 +605,7 @@ class AMLHandler(BaseHTTPRequestHandler):
             LOG.info("%s %s %d %.1fms", self.command, op or "-", status, (time.perf_counter() - started) * 1000)
 
 
-def run_server(config: AMLConfig, host: str = "0.0.0.0", port: int = 8080,
+def run_server(config: AMLConfig, host: str = "127.0.0.1", port: int = 8080,
                ready: Optional[Callable[[AMLServer], None]] = None) -> None:
     """Serve until SIGTERM/SIGINT; deletes vaults idle past config.retention_days once an hour."""
     server = AMLServer((host, port), config)

@@ -442,6 +442,22 @@ def test_cli_runs_under_a_uid_without_a_passwd_entry(monkeypatch):
     assert done.value.code == 0
 
 
+def test_cli_binds_loopback_unless_given_a_host(monkeypatch, tmp_path):
+    """A server started without --host must not listen on every interface."""
+    import inspect
+
+    from kibisis import __main__ as cli
+
+    bound = []
+    monkeypatch.setattr(aml_adapter, "run_server", lambda config, host, port: bound.append((host, port)))
+    monkeypatch.setenv("KIBISIS_AML_KEY_SHA256", key_digest(KEY))
+    monkeypatch.setenv("ARGUS_LEDGER_PATH", "")
+    assert cli.main(["aml-serve", "--plaintext", "--data-dir", str(tmp_path)]) == 0
+    assert cli.main(["aml-serve", "--plaintext", "--data-dir", str(tmp_path), "--host", "0.0.0.0"]) == 0
+    assert bound == [("127.0.0.1", 8080), ("0.0.0.0", 8080)]
+    assert inspect.signature(run_server).parameters["host"].default == "127.0.0.1"
+
+
 def test_config_rejects_a_raw_key_in_place_of_its_digest(tmp_path):
     with pytest.raises(ValueError):
         AMLConfig(data_dir=str(tmp_path), key_sha256=KEY)

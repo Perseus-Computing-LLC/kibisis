@@ -22,21 +22,21 @@ An agent that runs for hours learns things worth keeping: decisions, preferences
 - **A journal of every change.** Every write, archive, tombstone and purge is recorded in a hash chain, in the same transaction as the change.
 - **One writer at a time.** Leases carry fencing tokens that only go up. They coordinate processes on one machine through a shared directory (one lock file and one state file per resource; the Python `FileLeaseCoordinator` is the Rust one, through the `kibisis_native` extension), and threads within one Rust process. A Python vault opened with `enforce_fencing=True` refuses writes that do not carry the current token.
 - **Ready for agents.** An MCP server over stdio offers remember, recall, forget, verify-ledger and health tools. It serves one scope fixed at startup, stores what an agent writes as an unreviewed candidate, returns recall as escaped data, not instructions, and will not delete what a person wrote or reviewed.
-- **Local only.** Kibisis contains no network code.
+- **Local by default.** Kibisis makes no outbound network connections. The one network feature is opt-in: `kibisis aml-serve`, the [Agent Memory Leaderboard adapter](deploy/aml/README.md), is an HTTP server that runs only when started and listens on `127.0.0.1` unless given `--host`.
 
 ## Install
 
-This README describes 0.1.0-alpha.15 (0.1.0a15 on PyPI). It is a pre-release, so name the version.
+This README describes 0.1.0-alpha.16 (0.1.0a16 on PyPI). It is a pre-release, so name the version.
 
 ```toml
 # Rust: Cargo.toml
 [dependencies]
-kibisis = "0.1.0-alpha.15"
+kibisis = "0.1.0-alpha.16"
 ```
 
 ```bash
 # Python
-pip install kibisis==0.1.0a15
+pip install kibisis==0.1.0a16
 ```
 
 ## Quickstart

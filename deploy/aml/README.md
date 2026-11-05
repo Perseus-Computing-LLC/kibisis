@@ -46,6 +46,9 @@ The server never needs the Memory System Key itself, only its SHA-256 digest
 
 Options (`python -m kibisis aml-serve --help`):
 
+* `--host`: bind address. Default `127.0.0.1` (this machine only). The Docker image passes `--host 0.0.0.0` so the
+  published port reaches it; run it that way outside a container only behind a firewall or reverse proxy.
+* `--port` (default 8080)
 * `--candidates` (default 200)
 * `--context-before` (default 1)
 * `--max-inflight`: requests served at once. Further requests get `429` with `Retry-After`. Default 32.
