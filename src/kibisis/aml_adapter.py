@@ -146,14 +146,14 @@ def _text_of(content: Any, where: str) -> str:
 
 
 #: Numeric timestamps at or above this are milliseconds (1973-03-03T09:46:40Z). Numbers in
-#: [:data:`SECONDS_FLOOR`, :data:`SECONDS_CEILING`) are read as seconds (2001-09-09 .. 2286-11-20);
+#: [:data:`SECONDS_FLOOR`, :data:`SECONDS_CEILING`) are read as seconds (2001-09-09 .. 2096-10-02);
 #: this is the only other form, and nothing in it can also be a millisecond value the adapter
-#: accepts. Anything else (below 1e9, in [1e10, 1e11), negative, non-finite, past year 9999) is
+#: accepts. Anything else (below 1e9, in [4e9, 1e11), negative, non-finite, past year 9999) is
 #: refused with 422: the contract's unit is milliseconds, and such a value cannot be told apart
 #: from a unit mistake.
 MS_FLOOR = 100_000_000_000
 SECONDS_FLOOR = 1_000_000_000
-SECONDS_CEILING = 10_000_000_000
+SECONDS_CEILING = 4_000_000_000
 #: 9999-12-31T23:59:59.999Z, the last instant ``datetime`` can render.
 MS_CEILING = 253_402_300_799_999
 
