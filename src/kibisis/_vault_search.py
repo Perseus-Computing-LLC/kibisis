@@ -23,6 +23,7 @@ except ImportError:
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ._vault_audit import _argus_append
+from ._vault_crypto import EntryIntegrityError
 from ._vault_review import origin_class_of
 from .models import EpistemicState, MemoryEntity, RecallResult, SearchHit, SearchResult, WithheldEntry
 from .protocols import EncryptionRequiredError
@@ -713,7 +714,7 @@ class SearchRecallMixin:
                 logger.warning("kibisis: sealed entries are searched without an index: %s", exc)
                 return
         self._search_index = True
-        self._drain_search_queue()
+        self._drain_search_queue(at_open=True)
 
     def _ensure_term_index(self) -> None:
         """Keep a keyed term index in a file that SQLCipher does not encrypt, so that search on a vault
@@ -750,7 +751,7 @@ class SearchRecallMixin:
                 self._set_meta(cursor, "term_index_format", TERM_INDEX_FORMAT)
                 self._write_meta_mac(cursor)  # the format is one of the values the meta MAC covers
         self._term_index = True
-        self._drain_search_queue()
+        self._drain_search_queue(at_open=True)
 
     @staticmethod
     def _create_index_queue(cursor: Any, on_delete: str) -> None:
@@ -822,17 +823,24 @@ class SearchRecallMixin:
             cursor.execute("INSERT OR REPLACE INTO entities_terms_docs (id, ntok) VALUES (?, ?)", (entity_id, len(rows)))
         cursor.execute("DELETE FROM entities_search_dirty WHERE id = ?", (entity_id,))
 
-    def _unindex_entry(self, cursor: Any, entity_id: int) -> None:
-        """Take an entry out of the entry index and the queue: deleted, or failed its integrity check."""
+    def _unindex_entry(self, cursor: Any, entity_id: int, *, keep_queued: bool = False) -> None:
+        """Take an entry out of the entry index and (unless ``keep_queued``) the queue: deleted, or
+        failed its integrity check."""
         if self._search_index:
             cursor.execute("DELETE FROM entities_search WHERE rowid = ?", (entity_id,))
         elif self._term_index:
             cursor.execute("DELETE FROM entities_terms WHERE id = ?", (entity_id,))
             cursor.execute("DELETE FROM entities_terms_docs WHERE id = ?", (entity_id,))
-        cursor.execute("DELETE FROM entities_search_dirty WHERE id = ?", (entity_id,))
+        if not keep_queued:
+            cursor.execute("DELETE FROM entities_search_dirty WHERE id = ?", (entity_id,))
 
-    def _index_queued(self, cursor: Any) -> int:
-        """Index the rows the triggers queued, within the caller's write transaction. Returns how many."""
+    def _index_queued(self, cursor: Any, *, at_open: bool = False) -> int:
+        """Index the rows the triggers queued, within the caller's write transaction. Returns how many.
+
+        A row that fails its integrity check is logged, counted and kept out of the index. Under
+        ``strict`` it raises, except ``at_open`` (the open never raises for an entry): then it is left
+        in the queue, so the first read that catches the index up raises.
+        """
         ids = [row[0] for row in cursor.execute("SELECT id FROM entities_search_dirty ORDER BY id").fetchall()]
         for entity_id in ids:
             r = cursor.execute(
@@ -840,21 +848,30 @@ class SearchRecallMixin:
                 "FROM entities WHERE id = ?",
                 (entity_id,),
             ).fetchone()
-            content = None if r is None else self._readable_content(r)
-            if content is None:  # deleted, or failed its integrity check: keep it out of the index
-                self._unindex_entry(cursor, entity_id)
-            else:
-                self._index_entry(cursor, entity_id, r["category"], r["key"], content, r["scope"])
+            if r is None:
+                self._unindex_entry(cursor, entity_id)  # deleted
+                continue
+            try:
+                content = self._open_entry(r)
+            except EntryIntegrityError as exc:
+                self._note_integrity_failure(r, exc)
+                if self.strict and not at_open:
+                    raise
+                self._unindex_entry(cursor, entity_id, keep_queued=self.strict)  # kept out of the index
+                continue
+            except PermissionError:
+                content = "[ENCRYPTED]"
+            self._index_entry(cursor, entity_id, r["category"], r["key"], content, r["scope"])
         return len(ids)
 
-    def _drain_search_queue(self) -> None:
+    def _drain_search_queue(self, *, at_open: bool = False) -> None:
         """Index the rows written since the last search by a process that did not feed the index."""
         if not (self._search_index or self._term_index):
             return
         if not self._conn.execute("SELECT EXISTS (SELECT 1 FROM entities_search_dirty)").fetchone()[0]:
             return
         with self._write_tx() as cursor:
-            self._index_queued(cursor)
+            self._index_queued(cursor, at_open=at_open)
 
     def _rebuild_search_index(self) -> None:
         """Build the entry index again from the entries, so that no deleted or replaced terms stay in it."""

@@ -126,6 +126,11 @@ class ChainVerifier:
         if ev.format < self.format_floor:
             self.error = f"row {ev.sequence} is in journal format {ev.format}, below this vault's floor {self.format_floor}"
             return False
+        if ev.format > JOURNAL_FORMAT:
+            # The crate refuses an unknown format (UnsupportedFormat); so does this verifier, so the two
+            # agree and a row cannot be relabelled upward (the hash would still be format 3's).
+            self.error = f"row {ev.sequence} claims journal format {ev.format}, which this version does not know"
+            return False
         if ev.prev_hash != self.expected_prev:
             self.error = f"row {ev.sequence} does not link to the row before it"
             return False
@@ -319,10 +324,19 @@ class AuditJournalMixin:
                 (after, page),
             ).fetchall()
             for r in rows:
+                try:
+                    metadata = json.loads(r["metadata_json"])
+                    if not isinstance(metadata, dict):
+                        raise ValueError("metadata is not a JSON object")
+                except (TypeError, ValueError) as exc:
+                    # A row whose metadata is not JSON cannot be hashed; that is a failed verification,
+                    # not an exception for the caller to sort out.
+                    self.last_chain_error = f"row {r['sequence']} has unreadable metadata_json ({exc})"
+                    return False
                 ev = AuditEvent(
                     sequence=r["sequence"], timestamp=r["timestamp"], action=r["action"], category=r["category"],
                     key=r["key"], scope=r["scope"], value_sha256=r["value_sha256"], prev_hash=r["prev_hash"],
-                    event_hash=r["event_hash"], author_id=r["author_id"], metadata=json.loads(r["metadata_json"]),
+                    event_hash=r["event_hash"], author_id=r["author_id"], metadata=metadata,
                     format=r["format"],
                 )
                 if not verifier.feed(ev):
@@ -337,10 +351,15 @@ class AuditJournalMixin:
         return ok
 
     def _chain_verifier(self) -> ChainVerifier:
-        """A verifier set up with this vault's floor and anchoring (see :meth:`verify_audit_chain`)."""
+        """A verifier set up with this vault's floor and anchoring (see :meth:`verify_audit_chain`).
+
+        The floor and the anchoring flag are read whenever the vault is keyed (a ``kdf_salt`` is
+        present and keys were derived from it), not only once it reports integrity format 3: a file
+        whose ``integrity_format`` was edited down still pins its journal to the floor it recorded.
+        """
         floor = 1
         anchored = False
-        if self._keyed and self._integrity_format >= 3:
+        if self._keyed:
             floor = int(self._meta("journal_format_floor") or 1)
             anchored = getattr(self, "_journal_anchored", False) or bool(int(self._meta("journal_anchored") or 0))
         return ChainVerifier(self._signing_key, format_floor=floor, head_required=anchored)

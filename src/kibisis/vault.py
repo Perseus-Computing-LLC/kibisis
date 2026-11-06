@@ -23,10 +23,18 @@ from pathlib import Path
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple, Union
 from .admission import AdmissionDecision, FactDisposition, MemoryAdmissionGate
-from .crypto import AESGCMCryptoEnvelopeProvider, derive_vault_keys, verify_entry, verify_tenant_payload
+from .crypto import (
+    ENTRY_BINDING,
+    AESGCMCryptoEnvelopeProvider,
+    derive_vault_keys,
+    entry_aad,
+    verify_entry,
+    verify_tenant_payload,
+)
 from .keys import MIN_PASSPHRASE_LENGTH, resolve_passphrase
 from .models import (  # noqa: F401  (the search models are re-exported)
     AuditEvent,
+    EncryptedEnvelope,
     EpistemicState,
     MemoryEntity,
     RecallResult,
@@ -291,7 +299,9 @@ class SQLiteMemoryVault(
 
         ``strict=True`` makes every read raise :class:`EntryIntegrityError` for an entry that fails its
         integrity check instead of leaving it out; either way each such entry is logged at WARNING and
-        counted in :attr:`integrity_failures`.
+        counted in :attr:`integrity_failures`. The open itself never raises for such an entry: when the
+        entry index is built or caught up at open, a failing row is logged, counted, kept out of the
+        index and (under ``strict``) left queued, so the first read that touches the index raises.
 
         With ``enforce_fencing=True`` (which needs ``coordinator``), every call that adds, changes or
         removes entries must pass the caller's current ``fencing_token`` and ``resource``, and may
@@ -407,6 +417,7 @@ class SQLiteMemoryVault(
                 "sealed, but categories, keys and metadata are stored in plain text",
                 self.db_path,
             )
+        converted_temp: Optional[str] = None  # a SQLCipher copy of a plain file, adopted only after the upgrade succeeds
         if (
             on_disk
             and passphrase
@@ -418,9 +429,11 @@ class SQLiteMemoryVault(
                 hdr = f.read(16)
             if hdr.startswith(b"SQLite format 3"):
                 # Migrate an existing plain SQLite database to SQLCipher: only after the passphrase has been
-                # checked against the plain file's own key check, so a wrong passphrase leaves it untouched.
+                # checked against the plain file (its key check, or for a 0.1.0a5 file one of its sealed
+                # entries), so a wrong passphrase leaves it untouched. The copy is opened and upgraded
+                # first; the plain file is replaced only once that has succeeded (see below).
                 self._prechecked_keys = self._check_plain_file_passphrase(self.db_path, passphrase)
-                self._migrate_file_to_sqlcipher(self.db_path, passphrase)
+                converted_temp = self._migrate_file_to_sqlcipher(self.db_path, passphrase)
                 self._converted_to_sqlcipher = True
 
         self._search_index = False  # True once a SQLCipher vault's entry index is in use
@@ -429,10 +442,67 @@ class SQLiteMemoryVault(
         self._recent_recalls: Deque[Dict[str, Any]] = deque(maxlen=1000)  # K-R5 in-process recall log
         self._tokenizer: Optional[sqlite3.Connection] = None  # FTS5's tokenizer, for the term index
         self._tokenizer_lock = threading.Lock()
-        self._conn = sqlcipher3.connect(self.db_path, timeout=30.0, check_same_thread=False)
-        self._conn.row_factory = sqlcipher3.Row
         self._sqlcipher_active = False
         self._cache_mb = int(cache_mb) if cache_mb is not None else None
+        try:
+            self._connect(converted_temp or self.db_path, passphrase, memory_security)
+        except BaseException:
+            if converted_temp is not None:
+                self._discard_converted(converted_temp)
+            raise
+        self._init_schema()
+        if not passphrase:
+            try:
+                self._persist_verification_quorum()
+            except BaseException:
+                self._conn.close()
+                raise
+        if passphrase:
+            try:
+                self._was_keyed = self._has_meta_key("kdf_salt")  # written by an earlier open with a passphrase
+                salt = self._vault_salt()
+                if crypto_provider is None:
+                    self.crypto_provider = AESGCMCryptoEnvelopeProvider(salt=salt)
+                if self._prechecked_keys is not None and self._prechecked_keys[0] == salt:
+                    self._signing_key, self._digest_key, self._term_key = self._prechecked_keys[1]
+                else:
+                    self._signing_key, self._digest_key, self._term_key = derive_vault_keys(passphrase, salt)
+                self._prechecked_keys = None
+                self._keyed = True
+                self._upgrade_integrity()
+                # After the integrity records are checked: the stored quorum is one of the values the meta
+                # MAC covers, so it is adopted, compared or raised (and re-signed) only once the MAC held.
+                self._persist_verification_quorum()
+                if self._sqlcipher_active:
+                    self._ensure_search_index()
+                elif term_index:
+                    self._ensure_term_index()
+                elif self._has_meta_key("term_index_format"):
+                    with self._write_tx() as cursor:  # opened with term_index=False: leave no tokens behind
+                        for trigger in ("entities_search_ai", "entities_search_au", "entities_search_ad"):
+                            cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                        cursor.execute("DROP TABLE IF EXISTS entities_search_dirty")
+                        self._drop_term_index(cursor)
+                        self._write_meta_mac(cursor)  # term_index_format is one of the values the meta MAC covers
+            except BaseException:
+                self._conn.close()
+                if converted_temp is not None:
+                    self._discard_converted(converted_temp)  # the plain file was never touched
+                raise
+            if converted_temp is not None:
+                # The converted copy opened, authenticated and upgraded: now it takes the plain file's place.
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                self._conn.close()
+                self._adopt_converted(converted_temp, self.db_path)
+                self._connect(self.db_path, passphrase, memory_security)
+        if on_disk:
+            self._restrict_permissions()
+
+    def _connect(self, path: str, passphrase: Optional[str], memory_security: bool) -> None:
+        """Open ``path`` as this vault's connection; with a passphrase, key it (SQLCipher) and check it."""
+        self._conn = sqlcipher3.connect(path, timeout=30.0, check_same_thread=False)
+        self._conn.row_factory = sqlcipher3.Row
+        self._sqlcipher_active = False
         if passphrase:
             escaped_pass = passphrase.replace("'", "''")
             if memory_security:
@@ -451,41 +521,25 @@ class SQLiteMemoryVault(
         self._configure_db()
         if self._cache_mb is not None:
             self._conn.execute(f"PRAGMA cache_size = -{self._cache_mb * 1024}")
-        self._init_schema()
-        try:
-            self._persist_verification_quorum()
-        except BaseException:
-            self._conn.close()
-            raise
-        if passphrase:
-            self._was_keyed = self._has_meta_key("kdf_salt")  # written by an earlier open with a passphrase
-            salt = self._vault_salt()
-            if crypto_provider is None:
-                self.crypto_provider = AESGCMCryptoEnvelopeProvider(salt=salt)
-            if self._prechecked_keys is not None and self._prechecked_keys[0] == salt:
-                self._signing_key, self._digest_key, self._term_key = self._prechecked_keys[1]
-            else:
-                self._signing_key, self._digest_key, self._term_key = derive_vault_keys(passphrase, salt)
-            self._prechecked_keys = None
-            self._keyed = True
-            try:
-                self._upgrade_integrity()
-                if self._sqlcipher_active:
-                    self._ensure_search_index()
-                elif term_index:
-                    self._ensure_term_index()
-                elif self._has_meta_key("term_index_format"):
-                    with self._write_tx() as cursor:  # opened with term_index=False: leave no tokens behind
-                        for trigger in ("entities_search_ai", "entities_search_au", "entities_search_ad"):
-                            cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-                        cursor.execute("DROP TABLE IF EXISTS entities_search_dirty")
-                        self._drop_term_index(cursor)
-                        self._write_meta_mac(cursor)  # term_index_format is one of the values the meta MAC covers
-            except BaseException:
-                self._conn.close()
-                raise
-        if on_disk:
-            self._restrict_permissions()
+
+    @staticmethod
+    def _discard_converted(temp_path: str) -> None:
+        """Remove a converted copy (and its WAL files) that will not be adopted."""
+        for suffix in ("", "-wal", "-shm"):
+            with contextlib.suppress(OSError):
+                os.unlink(temp_path + suffix)
+
+    @staticmethod
+    def _adopt_converted(temp_path: str, path: str) -> None:
+        """Put the converted copy in the plain file's place (``os.replace``) and drop the plain file's
+        WAL files. The copy's connection was checkpointed and closed before this runs."""
+        for ext in ("-wal", "-shm"):
+            with contextlib.suppress(OSError):
+                os.unlink(path + ext)
+        os.replace(temp_path, path)
+        for ext in ("-wal", "-shm"):
+            with contextlib.suppress(OSError):
+                os.unlink(temp_path + ext)
 
     @property
     def encrypted_at_rest(self) -> bool:
@@ -495,17 +549,22 @@ class SQLiteMemoryVault(
 
     @staticmethod
     def _check_plain_file_passphrase(path: str, passphrase: str) -> Optional[Tuple[bytes, Tuple[bytes, bytes, bytes]]]:
-        """Check ``passphrase`` against the key check a plain SQLite vault file stores, before it is converted.
+        """Check ``passphrase`` against what a plain SQLite vault file stores, before it is converted.
 
         The file is opened read-only with the standard sqlite3 module; nothing is written. With a key
         check, the keys are derived from the file's own ``kdf_salt`` and compared: a mismatch raises
         ``ValueError`` ("Failed to authenticate ...") and the file stays as it is. A keyed file (integrity
-        format 2 or higher) without a key check raises :class:`VaultIntegrityError`. Returns the salt and
-        the derived keys so the open that follows need not derive them again, or None when the file has
-        no vault_meta yet (a vault never opened with a passphrase).
+        format 2 or higher) without a key check raises :class:`VaultIntegrityError`. A file with a salt
+        but no key check that claims format 1 (Kibisis 0.1.0a5 or earlier wrote no key check) is
+        authenticated the way its migration will be: one of its sealed entries must open under the
+        passphrase, or, when none is sealed, one of its format 1 signatures must verify; otherwise
+        ``ValueError`` is raised and the file is untouched. Returns the salt and the derived keys so the
+        open that follows need not derive them again, or None when the file has no vault_meta yet (a
+        vault never opened with a passphrase).
         """
         uri = "file:" + Path(path).resolve().as_uri()[len("file://"):] + "?mode=ro"
         conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
         try:
             try:
                 rows = conn.execute(
@@ -513,23 +572,58 @@ class SQLiteMemoryVault(
                 ).fetchall()
             except sqlite3.OperationalError:
                 return None  # no vault_meta table: nothing to check against
-        finally:
-            conn.close()
-        meta = {k: v for k, v in rows}
-        salt = meta.get("kdf_salt")
-        stored = meta.get("key_check")
-        if salt is None:
-            return None
-        salt = bytes(salt)
-        keys = derive_vault_keys(passphrase, salt)
-        if stored is None:
+            meta = {r["key"]: r["value"] for r in rows}
+            salt = meta.get("kdf_salt")
+            stored = meta.get("key_check")
+            if salt is None:
+                return None
+            salt = bytes(salt)
+            keys = derive_vault_keys(passphrase, salt)
+            if stored is not None:
+                expected = hmac.new(keys[0], b"kibisis key check v2", hashlib.sha256).hexdigest()
+                if not hmac.compare_digest(str(stored), expected):
+                    raise ValueError("Failed to authenticate or decrypt vault database with provided passphrase")
+                return salt, keys
             if int(meta.get("integrity_format") or 0) >= 2:
                 raise VaultIntegrityError(f"{path}: the vault is keyed but has no key check; refusing to open")
+            if not SQLiteMemoryVault._plain_file_opens_under(conn, passphrase, salt):
+                raise ValueError("Failed to authenticate or decrypt vault database with provided passphrase")
             return salt, keys
-        expected = hmac.new(keys[0], b"kibisis key check v2", hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(str(stored), expected):
-            raise ValueError("Failed to authenticate or decrypt vault database with provided passphrase")
-        return salt, keys
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _plain_file_opens_under(conn: sqlite3.Connection, passphrase: str, salt: bytes) -> bool:
+        """Whether a format 1 file's entries authenticate ``passphrase``: at least one sealed entry opens
+        under keys derived from ``salt`` (its binding honoured when it has one), or, when no entry is
+        sealed, at least one format 1 signature verifies under the passphrase's legacy signing key. A
+        file with no entries has nothing to check against and passes (its migration then decides)."""
+        try:
+            rows = conn.execute(
+                "SELECT category, key, scope, content, is_encrypted, encrypted_envelope_json, tenant_sig FROM entities"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return True  # not a vault yet
+        sealed = [r for r in rows if r["is_encrypted"] == 1]
+        if sealed:
+            provider = AESGCMCryptoEnvelopeProvider(salt=salt)
+            for r in sealed:
+                try:
+                    envelope = EncryptedEnvelope.model_validate_json(r["encrypted_envelope_json"] or "")
+                    aad = entry_aad(r["scope"], r["category"], r["key"]) if envelope.binding == ENTRY_BINDING else None
+                    provider.decrypt(envelope, passphrase, aad=aad)
+                    return True
+                except Exception:
+                    continue
+            return False
+        signed = [r for r in rows if r["tenant_sig"]]
+        if signed:
+            legacy_key = hashlib.sha256(f"kibisis-tenant-sig:{passphrase}".encode("utf-8")).digest()
+            return any(
+                verify_tenant_payload(legacy_key, r["scope"], f"{r['category']}:{r['key']}", r["content"] or "", r["tenant_sig"])
+                for r in signed
+            )
+        return True
 
     # --- read-only open (area C) -------------------------------------------------------------------
     def _open_read_only(
@@ -580,6 +674,8 @@ class SQLiteMemoryVault(
                 self._conn.execute(f"PRAGMA cache_size = -{self._cache_mb * 1024}")
             if not self._conn.execute("SELECT name FROM sqlite_master WHERE name = 'entities'").fetchone():
                 raise ValueError(f"{self.db_path} is not a kibisis vault (no entities table)")
+            if not self._has_meta_key("kdf_salt"):
+                self._refuse_keyed_records_without_salt()
             if passphrase and self._has_meta_key("kdf_salt"):
                 self._was_keyed = True
                 salt = bytes(self._meta("kdf_salt"))
@@ -697,17 +793,21 @@ class SQLiteMemoryVault(
         self._conn.commit()
 
     @staticmethod
-    def _migrate_file_to_sqlcipher(path: str, passphrase: str) -> None:
-        """Convert a plain SQLite vault file to SQLCipher in place.
+    def _migrate_file_to_sqlcipher(path: str, passphrase: str) -> str:
+        """Export a plain SQLite vault file to a SQLCipher copy beside it and return the copy's path.
 
-        The export goes to a sibling temp file; that file is then opened with the key and read, and only
-        after that succeeds does it replace the original (``os.replace``). A failure at any step leaves
-        the plain file as it was. The passphrase was checked against the file's key check before this runs
+        The export goes to a sibling temp file (``<path>.tmp_enc``); that file is then opened with the
+        key and read. A failure at any step removes the copy and leaves the plain file as it was. The
+        copy does not replace the plain file here: the caller opens it, authenticates the passphrase
+        against its records and upgrades it, and only then adopts it (:meth:`_adopt_converted`), so a
+        passphrase that fails any check later leaves the plain file untouched. The passphrase was
+        checked against the file's key check (or one of its sealed entries) before this runs
         (:meth:`_check_plain_file_passphrase`).
         """
         temp_enc = path + ".tmp_enc"
-        if os.path.exists(temp_enc):
-            os.unlink(temp_enc)
+        for suffix in ("", "-wal", "-shm"):
+            with contextlib.suppress(OSError):
+                os.unlink(temp_enc + suffix)
         escaped_pass = passphrase.replace("'", "''")
         try:
             conn_raw = sqlcipher3.connect(path)
@@ -727,14 +827,7 @@ class SQLiteMemoryVault(
             with contextlib.suppress(OSError):
                 os.unlink(temp_enc)
             raise
-        for ext in ("-wal", "-shm"):
-            p = path + ext
-            if os.path.exists(p):
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
-        os.replace(temp_enc, path)
+        return temp_enc
 
     def _restrict_permissions(self) -> None:
         for suffix in ("", "-wal", "-shm"):
@@ -1015,6 +1108,7 @@ class SQLiteMemoryVault(
         if stored is None or self.verification_quorum > stored:
             with self._write_tx() as cursor:
                 self._set_meta(cursor, "verification_quorum", str(self.verification_quorum))
+                self._write_meta_mac(cursor)  # the stored quorum is one of the values the meta MAC covers
 
     def _resolve_attester(self, origin: Optional[str], attester: Optional[str]) -> Optional[str]:
         """The account an attestation is recorded for, or ``None`` when nothing is recorded.
@@ -1911,8 +2005,14 @@ class SQLiteMemoryVault(
             seen.add(ref)
             try:
                 entity = self.get(row["category"], row["key"], scope=scope)
+            except EntryIntegrityError as exc:
+                # Not shown anywhere, but not silently: counted, logged, and raised under strict.
+                self._note_integrity_failure({"category": row["category"], "key": row["key"], "scope": scope}, exc)
+                if self.strict:
+                    raise
+                entity = None
             except PermissionError:
-                entity = None  # an entry that fails its integrity check is not shown anywhere
+                entity = None  # sealed, and this vault has no key to open it
             if entity is None:
                 continue
             reviews = (entity.metadata or {}).get("human_reviews") or []

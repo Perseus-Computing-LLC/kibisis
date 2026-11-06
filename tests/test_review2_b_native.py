@@ -1,7 +1,7 @@
-"""Review 2, area B: Python/Rust verifier agreement, PyO3 edge inputs, fencing tokens, strict= coverage.
+"""Review 2, area B: Python/Rust verifier agreement (R2-B8, R2-B9), PyO3 edge inputs, fencing tokens,
+strict= coverage (R2-B6, R2-B7).
 
-Not collected by default. ``test_control_*`` = secure behaviour (failing = bug);
-``test_attack_*`` = defect demo (passing = bug).
+Regression tests converted from the review's repro file: ``test_attack_*`` assert the fixed behaviour.
 """
 
 import json
@@ -11,7 +11,7 @@ import threading
 import pytest
 
 import kibisis.vault as vault_module
-import kibisis_native as native
+native = pytest.importorskip("kibisis_native")
 from kibisis import SQLiteMemoryVault
 from kibisis._vault_audit import verify_journal_rows
 from kibisis.models import AuditEvent
@@ -48,16 +48,15 @@ def test_control_python_and_rust_agree_on_sound_chain():
     assert verify_journal_rows(_events(rows), head, KEY, format_floor=3, head_required=True) is None
 
 
-def test_attack_python_accepts_a_row_labelled_format_4_that_rust_refuses():
-    """Python's _event_hash treats every fmt >= 3 as format 3, so a row relabelled format 4 verifies;
-    the crate refuses it (UnsupportedFormat). Disagreement between the two verifiers the change note
-    says share one rule set. No forgery (the hash is unchanged), but the format column is not pinned
-    upward. Passing = bug (disagreement)."""
+def test_attack_python_and_rust_both_refuse_a_row_labelled_format_4():
+    """R2-B8: a row relabelled format 4 (the hash unchanged) is refused by the crate (UnsupportedFormat)
+    and by the Python verifier alike: the format column is pinned upward as well as downward."""
     rows, head = _chain(3)
     rows[1]["format"] = 4
     rust = native.verify_chain(rows, head, KEY, True)
     assert rust is not None and "format 4" in rust
-    assert verify_journal_rows(_events(rows), head, KEY, format_floor=3, head_required=True) is None
+    python = verify_journal_rows(_events(rows), head, KEY, format_floor=3, head_required=True)
+    assert python is not None and "format 4" in python
 
 
 def test_control_rust_binding_edge_inputs_raise_python_errors_not_panics():
@@ -130,9 +129,11 @@ def _no_sqlcipher(monkeypatch):
     monkeypatch.setenv("KIBISIS_ALLOW_PLAINTEXT", "1")
 
 
-def test_attack_forget_requests_drops_bad_signature_rows_silently_even_under_strict(_no_sqlcipher, tmp_path):
-    """F14 residual: ``forget_requests`` swallows the EntryIntegrityError from ``get`` (vault.py ~1888)
-    without counting it or honouring strict=True. Passing = bug."""
+def test_attack_forget_requests_counts_bad_signature_rows_and_honours_strict(_no_sqlcipher, tmp_path):
+    """R2-B6: ``forget_requests`` counts an entry that fails its integrity check in integrity_failures
+    and raises under strict=True, like the other read paths. R2-B7: strict=True does not make the OPEN
+    raise through the term index; the bad row is left queued and the first read that touches the index
+    raises for it."""
     p = tmp_path / "v.sqlite"
     v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
     v.remember("decision", "k", "a person note", origin="user", author_id="person")
@@ -143,22 +144,34 @@ def test_attack_forget_requests_drops_bad_signature_rows_silently_even_under_str
     c = sqlite3.connect(str(p))
     c.execute("UPDATE entities SET tenant_sig = 'bad' WHERE key='k'")
     c.commit(); c.close()
-    # Side finding: with term_index on (the default without SQLCipher) strict=True makes the OPEN itself
-    # raise EntryIntegrityError from _ensure_term_index -> _index_queued -> _readable_content.
-    with pytest.raises(vault_module.EntryIntegrityError):
-        SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False, strict=True)
+    v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False, strict=True)  # opens (term index on)
+    try:
+        assert v.integrity_failures["count"] == 1  # counted at open, not raised
+        with pytest.raises(vault_module.EntryIntegrityError):
+            v.search("person note")  # the first read through the index raises for the queued row
+        with pytest.raises(vault_module.EntryIntegrityError):
+            v.forget_requests("default")
+    finally:
+        v.close()
     v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False, strict=True, term_index=False)
     try:
-        assert v.forget_requests("default") == []  # dropped, no exception
-        assert v.integrity_failures["count"] == 0  # and not counted
+        with pytest.raises(vault_module.EntryIntegrityError):
+            v.forget_requests("default")
+        assert v.integrity_failures["count"] >= 1
+    finally:
+        v.close()
+    v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
+    try:
+        before = v.integrity_failures["count"]
+        assert v.forget_requests("default") == []  # left out, not raised
+        assert v.integrity_failures["count"] == before + 1  # but counted
     finally:
         v.close()
 
 
-def test_attack_verify_audit_chain_raises_instead_of_false_on_malformed_metadata_json(_no_sqlcipher, tmp_path):
-    """A file writer replaces metadata_json with non-JSON: verify_audit_chain raises JSONDecodeError
-    instead of returning False with last_chain_error set (callers that catch only False misreport).
-    Passing = bug (low)."""
+def test_attack_verify_audit_chain_returns_false_on_malformed_metadata_json(_no_sqlcipher, tmp_path):
+    """R2-B9: a file writer replaces metadata_json with non-JSON: verify_audit_chain returns False with
+    last_chain_error set instead of raising JSONDecodeError."""
     p = tmp_path / "v.sqlite"
     v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
     v.remember("decision", "k", "x", origin="user")
@@ -168,8 +181,7 @@ def test_attack_verify_audit_chain_raises_instead_of_false_on_malformed_metadata
     c.commit(); c.close()
     v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
     try:
-        with pytest.raises(Exception) as ei:
-            v.verify_audit_chain()
-        assert not isinstance(ei.value, vault_module.VaultIntegrityError)
+        assert v.verify_audit_chain() is False
+        assert "unreadable metadata_json" in (v.last_chain_error or "")
     finally:
         v.close()

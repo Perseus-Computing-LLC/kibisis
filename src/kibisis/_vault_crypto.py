@@ -21,6 +21,7 @@ from .crypto import (
     ENTRY_SIGNATURE_PREFIX,
     TOMBSTONE_BINDING,
     VAULT_META_BOUND_KEYS,
+    VAULT_META_BOUND_KEYS_V1,
     entry_aad,
     keyed_value_digest,
     sign_entry,
@@ -167,14 +168,39 @@ def _rekey_metadata(metadata: Dict[str, Any], digest_key: bytes) -> bool:
 class EntryIntegrityMixin:
     """Seals, signs, opens and checks entries; keys the value digests; upgrades the integrity format."""
 
+    def _refuse_keyed_records_without_salt(self) -> None:
+        """Raise :class:`VaultIntegrityError` when ``vault_meta`` holds what only a keyed vault writes
+        (a key check, a meta MAC, an integrity format of 2 or more) but no ``kdf_salt``: the salt was
+        removed. Without it the records cannot be checked and the file would read as a plaintext vault
+        (read-only) or be given a fresh salt and fail its key check only after writing (writable)."""
+        if not self._has_meta_key("integrity_format") and not self._has_meta_key("key_check") \
+                and not self._has_meta_key("meta_mac"):
+            return  # no vault_meta table, or none of the keyed records: never keyed
+        rows = self._conn.execute(
+            "SELECT key FROM vault_meta WHERE key IN ('key_check', 'meta_mac', 'integrity_format', 'kdf_salt')"
+        ).fetchall()
+        present = {r[0] for r in rows}
+        if "kdf_salt" in present:
+            return
+        keyed = [k for k in ("key_check", "meta_mac") if k in present]
+        if "integrity_format" in present and int(self._meta("integrity_format") or 0) >= 2:
+            keyed.append("integrity_format >= 2")
+        if keyed:
+            raise VaultIntegrityError(
+                f"{self.db_path}: vault_meta carries {', '.join(keyed)} but no kdf_salt; the vault's salt was "
+                "removed. Refusing to open; restore the salt before opening."
+            )
+
     def _vault_salt(self) -> bytes:
-        """One random KDF salt per vault, stored beside the data. A salt is not a secret."""
+        """One random KDF salt per vault, stored beside the data. A salt is not a secret. A vault whose
+        records say it was keyed but whose salt is gone gets no new one (:class:`VaultIntegrityError`)."""
         # Locked before the read so two processes opening a new vault together agree on one salt.
         with self._write_tx() as cursor:
             cursor.execute("CREATE TABLE IF NOT EXISTS vault_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL)")
             row = cursor.execute("SELECT value FROM vault_meta WHERE key = 'kdf_salt'").fetchone()
             if row is not None:
                 return bytes(row[0])
+            self._refuse_keyed_records_without_salt()
             salt = os.urandom(16)
             cursor.execute("INSERT INTO vault_meta (key, value) VALUES ('kdf_salt', ?)", (salt,))
             return salt
@@ -367,12 +393,41 @@ class EntryIntegrityMixin:
     def _key_check_value(self) -> str:
         return hmac.new(self._signing_key, b"kibisis key check v2", hashlib.sha256).hexdigest()
 
+    def _format_2_artefacts(self) -> List[str]:
+        """What in this vault only integrity format 2 or later writes: evidence that the file was keyed
+        before, whatever ``vault_meta.integrity_format`` says now. Empty for a genuine format 1
+        (Kibisis 0.1.0a5 or earlier) vault. The sealed entries are the strongest witness: a format 2+
+        envelope is bound to its entry (``ENTRY_BINDING``) and cannot be re-sealed without the key."""
+        found: List[str] = []
+        for name in ("meta_mac", "journal_format_floor", "journal_anchored"):
+            if self._meta(name) is not None:
+                found.append(f"vault_meta.{name}")
+        if self._conn.execute(
+            "SELECT 1 FROM rejected_value_tombstones WHERE tombstone_mac IS NOT NULL AND tombstone_mac != '' LIMIT 1"
+        ).fetchone():
+            found.append("a signed tombstone row")
+        if self._conn.execute("SELECT 1 FROM audit_head LIMIT 1").fetchone():
+            found.append("a signed journal head")
+        # Rows from before the column existed are labelled 2 by the schema upgrade (formats 1 and 2 share
+        # one layout), so only a format 3 row is evidence.
+        if self._conn.execute("SELECT 1 FROM audit_journal WHERE format >= 3 LIMIT 1").fetchone():
+            found.append("a journal row in format 3")
+        if self._conn.execute(
+            "SELECT 1 FROM entities WHERE is_encrypted = 1 AND encrypted_envelope_json LIKE ? LIMIT 1",
+            (f'%"binding":"{ENTRY_BINDING}"%',),
+        ).fetchone():
+            found.append("an entry sealed with its binding")
+        return found
+
     def _upgrade_integrity(self) -> None:
         """Check the passphrase, then bring an older vault up to INTEGRITY_FORMAT, then check the records.
 
         Order matters. The key check (``vault_meta.key_check``) is compared first, before any migration
-        writes, so a wrong passphrase can never re-key a vault; a keyed vault (integrity format 2 or
-        higher) without a key check is refused (:class:`VaultIntegrityError`). A vault at format 1 is
+        writes, so a wrong passphrase can never re-key a vault; a keyed vault without a key check is
+        refused (:class:`VaultIntegrityError`): one that reports integrity format 2 or higher outright,
+        and one that reports format 1 but carries a ``kdf_salt`` unless it holds nothing that only
+        format 2 and later write (:meth:`_format_2_artefacts`), which is what a genuine 0.1.0a5 vault
+        looks like. A vault at format 1 is
         migrated to 2 (:meth:`_migrate_integrity`; it authenticates through the entries it opens and
         refuses when its journal does not verify), then any vault below 3 is brought to 3
         (:meth:`_upgrade_to_format_3`). A vault already at format 3 must carry a meta MAC that verifies.
@@ -389,6 +444,18 @@ class EntryIntegrityMixin:
                 f"{self.db_path}: the vault is keyed (integrity format {stored_format}) but has no key check; "
                 "refusing to open"
             )
+        elif self._was_keyed:
+            # A salt with no key check and a format 1 claim: a 0.1.0a5 vault looks like this, and so does a
+            # keyed vault whose key check, meta MAC and integrity format were all removed to re-enter the
+            # format 1 migration (which would re-sign whatever the editor left). Only a vault that holds
+            # nothing format 2 or later ever wrote is taken for a5.
+            artefacts = self._format_2_artefacts()
+            if artefacts:
+                raise VaultIntegrityError(
+                    f"{self.db_path}: the vault is keyed (kdf_salt present) but has no key check, and it holds "
+                    f"{', '.join(artefacts)}, which only integrity format 2 and later write; the integrity "
+                    "records were removed. Refusing to migrate; restore the records before opening."
+                )
         if stored_format < 2 and (stored is not None or self._meta("meta_mac") is not None):
             # Format 1 wrote neither record. A vault that carries one while claiming format 1 had its
             # integrity_format edited down; migrating it would re-sign under the editor's story.
@@ -421,15 +488,32 @@ class EntryIntegrityMixin:
         self._set_meta(cursor, "meta_mac", vault_meta_mac(self._signing_key, self._meta_mac_fields()))
 
     def _verify_meta_mac(self) -> None:
-        """Refuse a keyed vault whose meta MAC is missing or does not cover the stored values."""
+        """Refuse a keyed vault whose meta MAC is missing or does not cover the stored values.
+
+        A MAC written before ``verification_quorum`` was one of the bound values (the legacy set,
+        :data:`VAULT_META_BOUND_KEYS_V1`) is accepted once, logged, and replaced by one over the full set
+        when the vault is open writable; a read-only open accepts it as it is. Until that first
+        writable open the stored quorum is not covered.
+        """
         stored = self._meta("meta_mac")
         if stored is None:
             raise VaultIntegrityError(f"{self.db_path}: the vault's meta MAC is missing; refusing to open")
-        if not hmac.compare_digest(str(stored), vault_meta_mac(self._signing_key, self._meta_mac_fields())):
-            raise VaultIntegrityError(
-                f"{self.db_path}: the vault's meta MAC does not cover its integrity records (integrity format, "
-                "salt, key check, journal floor or term index format were changed); refusing to open"
-            )
+        fields = self._meta_mac_fields()
+        if hmac.compare_digest(str(stored), vault_meta_mac(self._signing_key, fields)):
+            return
+        if hmac.compare_digest(str(stored), vault_meta_mac(self._signing_key, fields, VAULT_META_BOUND_KEYS_V1)):
+            if getattr(self, "read_only", False):
+                logger.info("%s: the meta MAC predates the bound verification quorum; re-signed at the next writable open",
+                            self.db_path)
+                return
+            logger.info("%s: re-signing the meta MAC to cover the verification quorum", self.db_path)
+            with self._write_tx() as cursor:
+                self._write_meta_mac(cursor)
+            return
+        raise VaultIntegrityError(
+            f"{self.db_path}: the vault's meta MAC does not cover its integrity records (integrity format, "
+            "salt, key check, journal floor, term index format or verification quorum were changed); refusing to open"
+        )
 
     def _upgrade_to_format_3(self) -> None:
         """Bring a format 2 vault (or a vault just migrated to 2) to format 3, in one transaction.

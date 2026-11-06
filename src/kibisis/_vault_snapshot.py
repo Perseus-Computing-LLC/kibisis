@@ -314,6 +314,22 @@ class SnapshotMixin:
                         self._tombstone_mac(t_scope, t_category, t_key, exact, canonical, ts.get("origin_class") or "principal"),
                     ),
                 )
+                if cursor.rowcount:
+                    # Journaled like a tombstone made here, so _check_tombstones expects the row at the
+                    # next open and a row removed behind the vault's back is noticed.
+                    self._record_audit_event(
+                        cursor=cursor,
+                        action="tombstone",
+                        category=t_category,
+                        key=t_key,
+                        scope=t_scope,
+                        value_sha256=exact,
+                        author_id=ts.get("author_id"),
+                        metadata={
+                            "reason": ts.get("reason", "imported"), "canonical_sha256": canonical,
+                            "path": "import_snapshot", "origin_class": ts.get("origin_class") or "principal",
+                        },
+                    )
             if clear_existing:
                 cursor.execute("SELECT category, key, scope FROM entities")
                 for row in cursor.fetchall():

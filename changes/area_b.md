@@ -11,7 +11,8 @@ Entries for CHANGELOG.md, to be merged by the parent. No version bump.
   format 1 layout and dropping the head no longer verifies. The verifier streams the journal in pages
   (the 1,000,000-row cap is gone) and sets `vault.last_chain_error`. Its rules are those of
   `kibisis::journal::verify_chain` (now also `verify_chain_with(.., head_required)`), which
-  `kibisis_native.verify_chain` exports; `tests/test_review_b_journal.py` feeds the same rows to both.
+  `kibisis_native.verify_chain` exports; `tests/test_review_b_journal.py` feeds the same rows (written
+  with whole-second timestamps, the crate's type) to both.
 - **Signed tombstone table (F4).** Integrity format 3: every `rejected_value_tombstones` row carries
   `tombstone_mac`, an HMAC under the signing key over scope, category, key and both digests, verified at
   open and on every `_find_tombstone` hit (`VaultIntegrityError` on an edited, planted or unsigned row).
@@ -22,8 +23,8 @@ Entries for CHANGELOG.md, to be merged by the parent. No version bump.
   migration. For a plain SQLite file about to be converted to SQLCipher, the check runs against the plain
   file with stdlib `sqlite3` first; a wrong passphrase raises `Failed to authenticate` and leaves the file
   byte for byte as it was. The conversion writes a sibling temp file, opens it with the key, and only then
-  replaces the original. A keyed vault (integrity format >= 2 or `kdf_salt` present) without a key check
-  is refused. `integrity_format`, `kdf_salt`, `key_check`, the journal floor and anchoring and
+  replaces the original. A keyed vault (integrity format >= 2) without a key check is refused (Round 2
+  extends this to any vault with a `kdf_salt`, below). `integrity_format`, `kdf_salt`, `key_check`, the journal floor and anchoring and
   `term_index_format` are bound under one HMAC (`vault_meta.meta_mac`); a keyed vault whose MAC is missing
   or wrong refuses to open (`VaultIntegrityError`). A vault claiming integrity format 1 while carrying a key
   check or meta MAC (records only format 2+ writes) is refused instead of re-migrated. A migration whose
@@ -73,6 +74,54 @@ Entries for CHANGELOG.md, to be merged by the parent. No version bump.
 - Tests: `tests/review_b_*.py` became `tests/test_review_b_*.py` asserting the fixed behaviour; fallback-mode
   tests opt into plaintext; the legacy-row journal test verifies only under a floor of 2; deleting journal
   and head together is now asserted caught.
+
+## Round 2
+
+### Security
+
+- **Format 1 migration no longer reachable on a keyed vault (R2-B1).** A vault with a `kdf_salt` is keyed
+  whatever `integrity_format` says (edited to 1 or deleted). With the key check gone it is refused
+  (`VaultIntegrityError`) unless it is a genuine 0.1.0a5 file: one holding none of what integrity format 2
+  and later write (`_format_2_artefacts`: `meta_mac`, `journal_format_floor`, `journal_anchored`, a signed
+  journal head, a tombstone MAC, a format 3 journal row, an entry sealed with its binding). The journal
+  floor and anchoring are read whenever the vault is keyed, not only at integrity format 3, so a reset
+  file is still held to the floor it recorded. Resetting `vault_meta`, blanking signatures, deleting the
+  tombstone and re-chaining the journal as format 1 no longer launders through a re-migration.
+- **Plain file authenticated before conversion, conversion adopted only after the upgrade (R2-B2).** A plain
+  SQLite file with a salt but no key check (0.1.0a5) is authenticated against the plain file with stdlib
+  `sqlite3` before anything is written: one of its sealed entries must open under the passphrase (or,
+  with none sealed, a format 1 signature must verify). A wrong passphrase raises `Failed to authenticate`
+  and leaves the file byte for byte as it was; the right one still opens it afterwards. The SQLCipher copy
+  (`<path>.tmp_enc`) is now opened, authenticated and upgraded first and replaces the plain file only
+  then (`os.replace`); any failure removes the copy and leaves the plain file.
+- **Imported tombstones are journaled (R2-B3).** `import_snapshot` records a `tombstone` event
+  (`metadata.path = "import_snapshot"`, `origin_class`) for every row it inserts, in the same
+  transaction, so `_check_tombstones` reconciles it and a deleted row refuses the next open.
+- **`verification_quorum` under the meta MAC (R2-B4).** `VAULT_META_BOUND_KEYS` gains `verification_quorum`;
+  the MAC is rewritten whenever the stored quorum changes. A vault whose MAC was written over the legacy
+  key set (`VAULT_META_BOUND_KEYS_V1`) opens once and is re-signed at the first writable open (read-only
+  accepts it as it is); until then the stored quorum is not covered.
+- **Salt removal refused (R2-B5).** A file whose `vault_meta` carries `key_check`, `meta_mac` or an
+  `integrity_format` of 2 or more but no `kdf_salt` is refused by the read-only open (it was read as a
+  plaintext vault with a path-derived signing key) and by the writable open (it was given a fresh salt
+  before the key check failed); no salt is written.
+- **`forget_requests` honours strict and counts (R2-B6).** An entry that fails its integrity check is
+  counted in `integrity_failures` and raises under `strict=True`, as on the other read paths.
+- **`strict=True` and the open (R2-B7).** Building or catching up the entry index at open no longer
+  raises for a failing row: it is logged, counted, kept out of the index and left queued, and the first
+  read through the index raises. `_index_queued(at_open=True)`, `_unindex_entry(keep_queued=True)`.
+- **Verifier agreement (R2-B8, R2-B9).** The Python verifier refuses a journal row whose format is above
+  `JOURNAL_FORMAT`, as the crate does (`UnsupportedFormat`), instead of hashing it as format 3; a row
+  whose `metadata_json` is not JSON makes `verify_audit_chain` return False with `last_chain_error` set
+  instead of raising.
+- SECURITY.md no longer says the two verifiers agree on every row (whole-second, compact-metadata rows),
+  that imported tombstones are reconciled (they are now), that the key check gates every conversion (the
+  a5 path authenticates through an entry), or that `strict` only affects reads.
+
+### Tests
+
+- `tests/review2_b_*.py` became `tests/test_review2_b_*.py` asserting the fixed behaviour; the
+  fixture-based test opens `vault-0.1.0a5-fallback.sqlite` with a wrong passphrase and checks the bytes.
 
 ## Not fixed
 

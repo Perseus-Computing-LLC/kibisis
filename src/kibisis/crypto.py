@@ -234,17 +234,23 @@ def verify_tombstone_mac(
 
 
 #: ``vault_meta`` keys bound together by :func:`vault_meta_mac`, in the order they are encoded.
-VAULT_META_BOUND_KEYS = ("integrity_format", "kdf_salt", "key_check", "journal_format_floor", "journal_anchored",
-                         "term_index_format")
+#: ``verification_quorum`` joined the set after the first format 3 vaults were written; a meta MAC
+#: computed without it (:data:`VAULT_META_BOUND_KEYS_V1`) is accepted once and replaced by one that
+#: covers it the next time the vault is opened writable (see ``_verify_meta_mac``).
+VAULT_META_BOUND_KEYS_V1 = ("integrity_format", "kdf_salt", "key_check", "journal_format_floor", "journal_anchored",
+                            "term_index_format")
+VAULT_META_BOUND_KEYS = VAULT_META_BOUND_KEYS_V1 + ("verification_quorum",)
 
 
-def vault_meta_mac(signing_key: bytes, fields: Dict[str, Any]) -> str:
+def vault_meta_mac(signing_key: bytes, fields: Dict[str, Any], keys: Tuple[str, ...] = VAULT_META_BOUND_KEYS) -> str:
     """HMAC-SHA256 over the ``vault_meta`` values that decide how a vault is checked and opened
     (:data:`VAULT_META_BOUND_KEYS`). Each is encoded as its text form, bytes as hex, a missing key as
     ``null``, so a writer with database access cannot lower the integrity format, swap the salt, drop
-    the key check or the journal floor, or change the term index format without the signing key."""
+    the key check or the journal floor, change the term index format, or lower the verification
+    quorum without the signing key. ``keys`` names the bound set (the legacy set for a MAC written
+    before ``verification_quorum`` was bound)."""
     parts: List[Any] = ["kibisis-vault-meta-mac", 1]
-    for name in VAULT_META_BOUND_KEYS:
+    for name in keys:
         value = fields.get(name)
         if value is None:
             parts.append(None)

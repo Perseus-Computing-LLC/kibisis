@@ -1,7 +1,6 @@
-"""Review 2, area B: key check before migration / SQLCipher conversion (F9, F13, L4 second pass).
+"""Review 2, area B: key check before migration / SQLCipher conversion (R2-B2; F9, F13, L4 second pass).
 
-Not collected by default; run by explicit path. ``test_control_*`` = secure behaviour (failing = bug);
-``test_attack_*`` = defect demo (passing = bug).
+Regression tests converted from the review's repro file: ``test_attack_*`` assert the fixed behaviour.
 """
 
 import shutil
@@ -31,11 +30,11 @@ def _legacy_copy(tmp_path):
     return db
 
 
-def test_attack_legacy_a5_vault_wrong_passphrase_is_converted_to_sqlcipher_before_any_check(tmp_path):
-    """F9 residual: a 0.1.0a5 vault (kdf_salt present, no key_check, no integrity_format) opened with a WRONG
-    passphrase on a host with sqlcipher3 is converted to SQLCipher under the wrong passphrase first;
-    _migrate_integrity then raises 'Failed to authenticate', but the plain file is already gone.
-    The right passphrase can no longer open it. Passing = bug."""
+def test_attack_legacy_a5_vault_wrong_passphrase_leaves_plain_file_untouched(tmp_path):
+    """R2-B2: a 0.1.0a5 vault (kdf_salt present, no key_check, no integrity_format) opened with a WRONG
+    passphrase on a host with sqlcipher3 is authenticated against the plain file (one of its sealed
+    entries must open under the passphrase) before any conversion: the file is byte for byte as it was,
+    no temp copy is left beside it, and the right passphrase still opens it."""
     import sqlcipher3  # noqa: F401
     assert vault_module._sqlcipher_available() is True
     db = _legacy_copy(tmp_path)
@@ -43,10 +42,31 @@ def test_attack_legacy_a5_vault_wrong_passphrase_is_converted_to_sqlcipher_befor
     assert before.startswith(b"SQLite format 3")
     with pytest.raises(ValueError, match="Failed to authenticate"):
         SQLiteMemoryVault(str(db), passphrase=WRONG, auto_gate=False)
-    after = db.read_bytes()
-    assert not after.startswith(b"SQLite format 3"), "file was converted (bricked under the wrong passphrase)"
-    with pytest.raises(ValueError, match="Failed to authenticate"):
+    assert db.read_bytes() == before, "the plain file was changed by a failed open"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["legacy.db"], "a conversion artefact was left behind"
+    v = SQLiteMemoryVault(str(db), passphrase=FIXTURE_PASS, auto_gate=False)
+    try:
+        assert v.encrypted_at_rest is True
+        assert v.verify_audit_chain() is True, v.last_chain_error
+    finally:
+        v.close()
+
+
+def test_conversion_is_not_adopted_when_the_upgrade_fails(tmp_path, monkeypatch):
+    """R2-B2: the SQLCipher copy replaces the plain file only after it opened, authenticated and
+    upgraded; a failure in the upgrade leaves the plain file untouched and removes the copy."""
+    import sqlcipher3  # noqa: F401
+    db = _legacy_copy(tmp_path)
+    before = db.read_bytes()
+
+    def boom(self):
+        raise RuntimeError("upgrade interrupted (test)")
+
+    monkeypatch.setattr(SQLiteMemoryVault, "_upgrade_integrity", boom)
+    with pytest.raises(RuntimeError, match="upgrade interrupted"):
         SQLiteMemoryVault(str(db), passphrase=FIXTURE_PASS, auto_gate=False)
+    assert db.read_bytes() == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["legacy.db"]
 
 
 def test_control_legacy_a5_vault_right_passphrase_upgrades_to_format_3(tmp_path):
