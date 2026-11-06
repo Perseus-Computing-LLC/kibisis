@@ -84,7 +84,8 @@ Entries for CHANGELOG.md, to be merged by the parent. No version bump.
   (`VaultIntegrityError`) unless it is a genuine 0.1.0a5 file: one holding none of what integrity format 2
   and later write (`_format_2_artefacts`: `meta_mac`, `journal_format_floor`, `journal_anchored`, a signed
   journal head, a tombstone MAC, a format 3 journal row, an entry sealed with its binding; round 3: the
-  binding is read from the envelope text whatever `is_encrypted` says). The journal
+  binding is read from the envelope text whatever `is_encrypted` says; round 4: replaced by
+  `_refuse_unless_genuine_a5`, see Round 4). The journal
   floor and anchoring are read whenever the vault is keyed, not only at integrity format 3, so a reset
   file is still held to the floor it recorded. Resetting `vault_meta`, blanking signatures, deleting the
   tombstone and re-chaining the journal as format 1 no longer launders through a re-migration.
@@ -148,6 +149,54 @@ behaviour; the R3-AB4 one is skipped until `fix/round3-entry` merges).
 - A reset that also rewrites the journal headless **and** removes every entry and every `put` row is
   indistinguishable from an empty a5 file; that is the file writer deleting the vault (out of scope).
 - **R3-AB4** is fixed on `fix/round3-entry` (`_verify_meta_mac`, `_persist_verification_quorum`).
+
+## Round 4
+
+Fourth-pass findings in `review_notes/R4.md`; regression tests in `tests/test_review4_r3fixes.py`
+(the `test_attack_*` names are kept; each asserts the fixed behaviour; the controls are unchanged).
+
+### Security
+
+- **R4-1 (high): the format 1 migration class is closed by one discriminator, not one more witness.**
+  R2-B1 → R3-AB2 → R4-1 were one attack: scrub whichever witness the last fix added and re-enter
+  `_migrate_integrity`, which authenticates nothing and signs what it finds. `_format_2_artefacts` and the
+  two checks inside `_migrate_integrity` are replaced by `_refuse_unless_genuine_a5` (`_vault_crypto.py`),
+  run in every writable open with a passphrase on the connection BEFORE `_init_schema` (which used to add
+  the `audit_head` table and the `format` / `tombstone_mac` columns before anything looked). With
+  `kdf_salt` present and no `key_check`, the migration is allowed only when
+  every witness is absent: table `audit_head`; column `audit_journal.format`; column
+  `rejected_value_tombstones.tombstone_mac`; `vault_meta` `key_check` / `meta_mac` / `journal_format_floor`
+  / `journal_anchored` / `verification_quorum`, or `integrity_format` ≥ 2; an entity row with
+  `is_encrypted != 1`; a NULL, empty or malformed envelope; an envelope with the format 2 binding (in its
+  text, or one whose ciphertext opens only under the binding's associated data); a sealed envelope that
+  does not open under the passphrase the way a5 sealed it (no sealed row opening at all is `ValueError`,
+  a wrong passphrase); an
+  empty entity table while the journal holds unpurged `put`/`update` events. Any one witness is a
+  `VaultIntegrityError` naming all of them, nothing written. `_upgrade_integrity` refuses the migration
+  outright when the discriminator did not run. The migration's chain check is kept as necessary, never
+  sufficient (a headless format 1 chain has no keyed element). Table-driven test
+  (`test_attack_every_single_witness_scrub_and_the_full_scrub_are_refused`) enumerates every single-witness
+  scrub and the all-witnesses scrub on a vault that was keyed; the genuine a5 fixture still migrates,
+  re-opens read-only, and its chain verifies (`test_control_a5_fixture_full_lifecycle`). SECURITY.md now
+  states the one reset the discriminator cannot tell from an a5 file ("headless journal + no entry event
+  + no sealed entry" = an empty vault) and what the operator sees.
+- **R4-3 (low)** `_check_tombstones`: a legacy `tombstone_lifted` event whose `metadata.tombstone_scope`
+  differs from the event's scope also pops `(category, key, digest, tombstone_scope)` regardless of the
+  `metadata.tombstone` name test, so a pre-fix lift of a global `'*'` row by a write under the same
+  `category:key` reconciles instead of wedging both open modes.
+
+### Recorded
+
+- **R4-4** `import_snapshot(origin=None)` is principal; docstring and SECURITY.md say a library caller
+  relaying a file from an agent must pass the agent's `origin`.
+
+### Changed behaviour callers may notice
+
+- A keyed format 1 file with any row left plaintext, undecryptable or malformed is now refused as a
+  whole (`VaultIntegrityError`) instead of migrated with `entries_undecryptable > 0`; a5 sealed every
+  entry, so no genuine a5 file changes behaviour.
+- Error texts: "marked plaintext but carry a sealed envelope" → "marked plaintext (is_encrypted != 1)";
+  "the entity table is empty" → "an entity table that is empty while the journal records …".
 
 ## Not fixed
 

@@ -86,17 +86,25 @@ a guarantee beyond what the named code does.
   floor and anchoring, `term_index_format` and `verification_quorum` are bound under one HMAC (`meta_mac`,
   `crypto.vault_meta_mac`). A keyed vault whose MAC is missing or does not verify, or whose `key_check` is
   missing, refuses to open: a vault with a `kdf_salt` is keyed whatever `integrity_format` says, and the
-  format 1 migration (which re-signs the journal and re-keys tombstone digests) runs only for a genuine
-  0.1.0a5 file, one that holds nothing integrity format 2 and later write (no meta MAC, floor or
-  anchoring flag, no signed journal head, no tombstone MAC, no format 3 journal row, no entry whose
-  envelope text carries the binding of its scope, category and key, whatever the row's `is_encrypted`
-  flag says). The migration itself also refuses a row marked plaintext that carries an envelope, a keyed
-  vault whose journal records entries put and never purged while the entity table is empty, and a
-  keyed vault's format 1 chain head that verifies only under the path-derived key (one a file writer
-  computes) rather than the passphrase's. A migration whose previous chain does not verify refuses
-  instead of re-signing it. What the migration cannot tell from a genuine a5 file is a reset that also
-  rewrites the journal headless and empties the vault, which is the file writer deleting the vault (out
-  of scope, SECURITY.md threat model). The key check (or, for a 0.1.0a5 file, one of its sealed entries) is
+  format 1 migration (which re-signs the journal and re-keys tombstone digests) runs only for a file that
+  one discriminator (`_refuse_unless_genuine_a5`, run on the plain file before the schema upgrade adds
+  anything) proves to be a genuine 0.1.0a5 file: no `audit_head` table, no `format` column on the
+  journal, no `tombstone_mac` column, no `key_check`, `meta_mac`, `journal_format_floor`,
+  `journal_anchored` or `verification_quorum` key, no `integrity_format` of 2 or more, every entity row
+  sealed (`is_encrypted = 1`) with an envelope that carries no format 2 binding (in its text or in the
+  associated data its ciphertext opens under) and opens under the passphrase (a5 sealed every entry, and
+  each a5 row is its own proof of the passphrase), and an entity table that is non-empty or a journal
+  with no unpurged `put`/`update` event. Any one failure refuses the open (`VaultIntegrityError` naming
+  every witness found); no sealed row opening at all is a wrong passphrase (`ValueError`). The
+  migration's own chain check stays necessary (a chain that does not verify is never re-signed) but
+  admits nothing by itself: a headless format 1 chain has no keyed element, so the opened rows are what
+  authenticate the file; a keyed vault's format 1 chain head that verifies only under the path-derived
+  key (one a file writer computes) is refused too. What the discriminator cannot tell from a genuine a5
+  file is the reset that satisfies all of it: a headless journal with no entry event and no sealed
+  entry, which is an empty vault. The operator then sees a vault with no entries (`list_entities()` is
+  empty in every scope) and a journal with no entry event, which is the file
+  writer deleting the vault (out of scope, SECURITY.md threat model), not a vault whose rejections
+  were laundered. The key check (or, for a 0.1.0a5 file, one of its sealed entries) is
   compared against the file before any migration or SQLCipher conversion, and a converted copy replaces
   the plain file only after it has opened, authenticated and upgraded. Removing `kdf_salt` while a key
   check, meta MAC or integrity format of 2 or more remains is refused by both the read-only and the
@@ -198,8 +206,10 @@ also stored in plain text.
   adopts the stored value and never writes one; an open that asks for less is refused (`ConfigError`),
   a pinning open that asks for more stores it, a stored quorum below the default is adopted only by a
   process whose own `KIBISIS_VERIFICATION_QUORUM` names it, and while the meta MAC verifies only over
-  the legacy key set the stored quorum is not trusted (a value below the default is dropped before the
-  re-sign). A verified entry carries
+  the legacy key set no stored quorum is trusted, whatever its value (the MAC never covered it, so a
+  file writer can lower a pinned 3 to 2 as easily as to 1): it is ignored, logged at WARNING with the
+  value, and dropped before the re-sign; the next verdict run under the person's
+  `KIBISIS_VERIFICATION_QUORUM` pins it again under the full-set MAC. A verified entry carries
   `quorum_at_verification`. `_review_verdict` / `_trusted_metadata` are not parameters of the public
   `put()`; `put_batch` rejects items that carry them.
 - Recall returns entries inside a `<kibisis-recall>` envelope with text escaped (`fence_recall`,
@@ -236,7 +246,10 @@ trust facts from a file, its own exports included. Each entity's `origin` and `a
 restored, so a person's verified entry round-trips as verified and principal within the vault that made
 it (or any vault under the same passphrase). A tombstone's `origin_class` is taken from the file only when
 the seal also covers the file's tombstones (seals written since this rule name both); otherwise it is
-capped at the importer's class (`origin`, as on `put`; no origin = the caller vouches for a person).
+capped at the importer's class (`origin`, as on `put`; no origin = the caller vouches for a person). That
+default makes `origin=None` principal: a library caller relaying a file it did not make (one an agent
+handed over) must pass the agent's `origin`, or an unsealed file's tombstones are planted at principal
+class (`import_snapshot` has no MCP or CLI caller, so no agent reaches it without a library caller).
 
 What a snapshot can and cannot carry: the manifest is a plain SHA-256 anyone computes, so a snapshot file
 is a trusted input for **content**: it can carry any entity text and metadata, any `candidate`, any

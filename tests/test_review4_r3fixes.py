@@ -2,9 +2,10 @@
 migration discriminator (R3-AB2), the snapshot trust seal (R3-AB3), quorum pinning (R3-AB4/E1/E4),
 MCP hygiene (R3-E2/E3), the legacy fixture.
 
-Not collected by default; run by path. ``test_control_*`` asserts the secure behaviour (failing = bug);
-``test_attack_*`` demonstrates a defect (passing = bug). Vaults are opened WITHOUT SQLCipher with a
-passphrase (allow_plaintext) = SECURITY.md's file-writer model, unless a test says otherwise.
+Converted after the round-4 fixes: ``test_control_*`` asserts the secure behaviour (failing = bug);
+``test_attack_*`` keeps the reviewer's attack and asserts the FIXED behaviour (failing = regression).
+Vaults are opened WITHOUT SQLCipher with a passphrase (allow_plaintext) = SECURITY.md's file-writer
+model, unless a test says otherwise.
 """
 
 from __future__ import annotations
@@ -148,13 +149,12 @@ def test_control_one_write_lifts_the_scoped_and_the_global_row_and_both_reconcil
 
 
 def test_attack_legacy_lift_event_of_a_global_row_under_the_same_key_still_wedges_the_open(tmp_path):
-    """R3-AB1 residual, legacy events only. The compatibility match for pre-fix ``tombstone_lifted``
-    events is taken through ``metadata.tombstone`` ONLY when that differs from the event's own
-    ``category:key``; it ignores ``metadata.tombstone_scope``. A pre-fix lift of a global ('*') row by
-    a write of the SAME ``category:key`` in scope ``default`` journaled the writer's scope, so the row's
-    expectation ``(c, k, V, '*')`` is never popped: the vault opens before the write and wedges after
-    it (writable and read-only). Reachable only in a vault that already holds such an event (a '*' row
-    of a lower class comes from a snapshot import); recorded as a narrow residual."""
+    """R4-3 fixed. A pre-fix ``tombstone_lifted`` event for a global ('*') row lifted by a write of the
+    SAME ``category:key`` in scope ``default`` journaled the writer's scope with
+    ``metadata.tombstone_scope = '*'``; the compatibility match used to run only when
+    ``metadata.tombstone`` differed from the event's own name, so ``(c, k, V, '*')`` was never popped
+    and the vault wedged. Now the named scope is honoured whenever it differs from the event's: both
+    open modes reconcile, the chain verifies and nothing is tombstoned for the value."""
     p = tmp_path / "v.sqlite"
     v = _open(p)
     v.remember("decision", "k1", "something else", origin="user", author_id="alice")
@@ -178,42 +178,227 @@ def test_attack_legacy_lift_event_of_a_global_row_under_the_same_key_still_wedge
     assert ev.metadata["tombstone"] == "decision:k1" and ev.metadata["tombstone_scope"] == "*"
     assert v.list_tombstones(category="decision") == [] and v.verify_audit_chain() is True
     v.close()
-    for read_only in (False, True):
-        with pytest.raises(vault_module.VaultIntegrityError, match="journaled tombstone"):
-            _open(p, read_only=read_only)
+    _reopens_clean(p)
 
 
 # ===================================================================== R3-AB2: the a5 discriminator
 
 
+def _content(p):
+    """Every table's schema and rows: what a refused open must leave as it was (the file header's WAL
+    flag is not content; the connection sets it)."""
+    c = M._conn(p)
+    out = [tuple(r) for r in c.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name")]
+    for (name,) in c.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").fetchall():
+        out.append((name, [tuple(r) for r in c.execute(f"SELECT * FROM {name}").fetchall()]))
+    c.close()
+    return out
+
+
+def _refused_untouched(p, match="not a 0.1.0a5 file"):
+    """The open is refused by the a5 discriminator and the file is byte for byte as the writer left it:
+    no head, no key check, no meta MAC, no migrate event."""
+    before = _content(p)
+    with pytest.raises(vault_module.VaultIntegrityError, match=match) as info:
+        _open(p)
+    assert _content(p) == before
+    c = M._conn(p)
+    assert c.execute("SELECT count(*) FROM audit_head").fetchone()[0] == 0
+    assert c.execute("SELECT count(*) FROM vault_meta WHERE key IN ('key_check','meta_mac')").fetchone()[0] == 0
+    assert c.execute("SELECT count(*) FROM audit_journal WHERE action = 'migrate'").fetchone()[0] == 0
+    c.close()
+    return str(info.value)
+
+
 def test_attack_discriminator_is_defeated_by_blanking_the_envelope(tmp_path):
-    """R3-AB2 residual (same cost profile as R2-B1 / R3-AB2). The witness is now the binding string
-    inside ``encrypted_envelope_json`` and the migration refuses a row with ``is_encrypted = 0`` AND an
-    envelope. A file writer who sets ``is_encrypted = 0`` and BLANKS the envelope (and ``tenant_sig``)
-    leaves no witness and no inconsistency; the rows are still there, so the "journal says entries
-    exist but the table is empty" check does not run; the re-chained headless format-1 journal verifies
-    with no key at all. The open migrates, signs a head, key check and meta MAC, the tombstone is gone
-    and the rejected value is written again. Entries read as unsigned (the R2-B1 cost)."""
+    """R4-1 fixed (the R2-B1 / R3-AB2 / R4-1 class). The R2-B1 reset plus ``is_encrypted = 0``,
+    ``encrypted_envelope_json = NULL``, ``tenant_sig = NULL`` leaves no binding string and no
+    inconsistent row; it used to migrate, sign a head, key check and meta MAC and readmit the rejected
+    value. Now the one discriminator refuses it before ``_init_schema`` (naming the plaintext rows and
+    the later-format schema) and nothing is written: the operator sees a refusal naming what was
+    found, never a laundered vault."""
     p = M._seeded(tmp_path / "v.sqlite")
     c = M._conn(p)
     M._scrub_everything_but_entries(c)
     c.execute("UPDATE entities SET is_encrypted = 0, encrypted_envelope_json = NULL, tenant_sig = NULL")
     c.commit()
     c.close()
-    v = _open(p)  # must raise VaultIntegrityError
+    message = _refused_untouched(p)
+    assert "marked plaintext" in message and "audit_head" in message
+
+
+def _drop_column(c, table, column):
+    c.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+
+
+def _scrub_schema(c):
+    """The file writer rebuilds the schema an a5 file has: no audit_head, no journal format column, no
+    tombstone_mac column (the three tables a later release's schema upgrade adds)."""
+    c.execute("DROP TABLE IF EXISTS audit_head")
+    _drop_column(c, "audit_journal", "format")
+    _drop_column(c, "rejected_value_tombstones", "tombstone_mac")
+
+
+def _legacy_rechain_without_format(c):
+    """``M._legacy_rechain`` writes the ``format`` column; this one re-chains a journal that has none."""
+    from kibisis.vault import _event_hash
+    prev = "0" * 64
+    for r in c.execute("SELECT * FROM audit_journal ORDER BY sequence").fetchall():
+        h = _event_hash(r["sequence"], r["timestamp"], r["action"], r["category"], r["key"], r["scope"],
+                        r["value_sha256"], prev, r["author_id"], None, fmt=1)
+        c.execute("UPDATE audit_journal SET prev_hash = ?, event_hash = ? WHERE sequence = ?", (prev, h, r["sequence"]))
+        prev = h
+
+
+# Each scrub is applied on top of the R2-B1 reset (meta records deleted, signatures blanked, journal
+# re-chained headless in format 1) of a vault that was keyed at format 3. A single-witness scrub
+# removes ONE thing the discriminator looks at; the file still fails on the rest. The all-witnesses
+# scrub removes everything a file writer can remove; the rows' envelopes are then the only witness
+# left, and they cannot be re-sealed without the key.
+SCRUBS = {
+    "nothing_more": [],
+    "is_encrypted_0": ["UPDATE entities SET is_encrypted = 0"],
+    "envelope_null": ["UPDATE entities SET encrypted_envelope_json = NULL"],
+    "envelope_empty": ["UPDATE entities SET encrypted_envelope_json = ''"],
+    "envelope_garbage": ["UPDATE entities SET encrypted_envelope_json = '{\"not\": \"an envelope\"}'"],
+    "binding_scrubbed": ["UPDATE entities SET encrypted_envelope_json = replace(encrypted_envelope_json, 'binding', 'bndng')"],
+    "tenant_sig_null": ["UPDATE entities SET tenant_sig = NULL"],
+    "tenant_sig_empty": ["UPDATE entities SET tenant_sig = ''"],
+    "is_encrypted_0_envelope_null_sig_null": [
+        "UPDATE entities SET is_encrypted = 0, encrypted_envelope_json = NULL, tenant_sig = NULL"],
+    "rows_deleted": ["DELETE FROM entities"],
+    "rows_deleted_journal_deleted": ["DELETE FROM entities", "DELETE FROM audit_journal"],
+    "journal_deleted": ["DELETE FROM audit_journal"],
+    "journal_put_events_deleted": ["DELETE FROM audit_journal WHERE action IN ('put', 'update')"],
+    "audit_head_dropped": ["DROP TABLE audit_head"],
+    "format_column_dropped": ["ALTER TABLE audit_journal DROP COLUMN format"],
+    "tombstone_mac_column_dropped": ["ALTER TABLE rejected_value_tombstones DROP COLUMN tombstone_mac"],
+    "schema_scrubbed": ["@schema"],
+    "schema_scrubbed_rows_plaintext": [
+        "@schema", "UPDATE entities SET is_encrypted = 0, encrypted_envelope_json = NULL, tenant_sig = NULL"],
+    "schema_scrubbed_rows_deleted": ["@schema", "DELETE FROM entities"],
+    "schema_scrubbed_rows_deleted_journal_kept_headless": ["@schema", "DELETE FROM entities", "@rechain"],
+    "schema_scrubbed_rows_kept_bound": ["@schema", "UPDATE entities SET tenant_sig = NULL", "@rechain"],
+    "schema_scrubbed_rows_kept_bound_binding_scrubbed": [
+        "@schema", "UPDATE entities SET encrypted_envelope_json = replace(encrypted_envelope_json, 'binding', 'bndng')",
+        "@rechain"],
+    "everything_but_a_sealed_row": [
+        "@schema", "DELETE FROM audit_journal WHERE action != 'put'", "DELETE FROM entities WHERE key != 'k0'",
+        "DELETE FROM audit_journal WHERE key != 'k0'", "@rechain"],
+}
+
+
+@pytest.mark.parametrize("scrub", sorted(SCRUBS))
+def test_attack_every_single_witness_scrub_and_the_full_scrub_are_refused(tmp_path, scrub):
+    """R4-1: the class, not the variant. Whatever single witness the file writer removes on top of
+    the R2-B1 reset, and whatever combination up to everything a file writer can remove, the open is
+    refused and nothing is written. The one state that passes (``@schema`` + no rows + no entry event,
+    the last case of ``test_control_the_only_reset_that_passes_is_an_empty_vault``) is an empty vault."""
+    p = M._seeded(tmp_path / "v.sqlite")
+    c = M._conn(p)
+    M._scrub_everything_but_entries(c)
+    for step in SCRUBS[scrub]:
+        if step == "@schema":
+            _scrub_schema(c)
+        elif step == "@rechain":
+            _legacy_rechain_without_format(c)
+        else:
+            c.execute(step)
+    c.commit()
+    c.close()
+    before = _content(p)
+    with pytest.raises(vault_module.VaultIntegrityError, match="not a 0.1.0a5 file") as info:
+        _open(p)
+    assert _content(p) == before, scrub
+    message = str(info.value)
+    c = M._conn(p)
+    assert c.execute("SELECT count(*) FROM vault_meta WHERE key IN ('key_check','meta_mac')").fetchone()[0] == 0
+    if c.execute("SELECT 1 FROM sqlite_master WHERE name = 'audit_journal'").fetchone():
+        assert c.execute("SELECT count(*) FROM audit_journal WHERE action = 'migrate'").fetchone()[0] == 0
+    c.close()
+    # The refusal names what was found: at least one of the witnesses the scrub left behind.
+    assert any(w in message for w in ("audit_head", "audit_journal.format", "tombstone_mac", "marked plaintext",
+                                      "missing or malformed", "sealed with its binding", "opens only under its binding",
+                                      "do not open", "entity table that is empty")), message
+
+
+def test_control_the_only_reset_that_passes_is_an_empty_vault(tmp_path):
+    """The reset the discriminator cannot tell from an a5 file: schema scrubbed, every row deleted, and
+    no entry event left (SECURITY.md). What the operator gets is an empty vault with a journal that
+    records no entry, not a vault whose rejections were laundered; the value is not readmitted as a
+    laundered entry because there is nothing left to launder."""
+    p = M._seeded(tmp_path / "v.sqlite")
+    c = M._conn(p)
+    M._scrub_everything_but_entries(c)
+    _scrub_schema(c)
+    c.execute("DELETE FROM entities")
+    c.execute("DELETE FROM audit_journal")
+    c.commit()
+    c.close()
+    v = _open(p)
     try:
-        assert v.integrity_upgrade and v.integrity_upgrade["entries_left_unsigned"] == 3
-        assert v.verify_audit_chain() is True
-        assert v.is_tombstoned("decision", "bad", "deploy on fridays") is False
-        v.remember("decision", "bad", "deploy on fridays", origin="user", author_id="alice")
-        assert v.get("decision", "bad").content == "deploy on fridays"
+        assert v.list_entities() == []
+        assert all(e.action not in ("put", "update") for e in v.list_audit_events(limit=200))
+        assert v._conn.execute("SELECT count(*) FROM entities").fetchone()[0] == 0
     finally:
         v.close()
+
+
+def test_control_wrong_passphrase_on_a_genuine_a5_file_is_a_wrong_passphrase_not_tampering(tmp_path):
+    """Every a5 row is sealed and opens under the passphrase; under the wrong one none opens, and that
+    is reported as ``Failed to authenticate`` (the file untouched), not as a tampered file."""
+    p = tmp_path / "a5.sqlite"
+    shutil.copy(M.FIXTURE_A5, p)
+    before = _content(p)
+    with pytest.raises(ValueError, match="Failed to authenticate"):
+        SQLiteMemoryVault(str(p), passphrase="not the passphrase", auto_gate=False)
+    assert _content(p) == before
+
+
+def test_control_a5_file_with_one_row_that_does_not_open_is_refused(tmp_path):
+    """A genuine a5 file with ONE row whose seal was tampered with (its tag no longer verifies while
+    the other rows open) is refused as tampered, naming the row: the migration never leaves an
+    undecryptable row behind."""
+    p = tmp_path / "a5.sqlite"
+    shutil.copy(M.FIXTURE_A5, p)
     c = M._conn(p)
-    assert c.execute("SELECT count(*) FROM audit_head").fetchone()[0] == 1
-    assert c.execute("SELECT count(*) FROM vault_meta WHERE key IN ('key_check','meta_mac')").fetchone()[0] == 2
-    assert c.execute("SELECT count(*) FROM audit_journal WHERE action = 'migrate'").fetchone()[0] == 1
+    env = json.loads(c.execute("SELECT encrypted_envelope_json FROM entities WHERE key = 'door_code'").fetchone()[0])
+    env["tag_b64"] = env["tag_b64"][::-1]  # the ciphertext no longer authenticates
+    c.execute("UPDATE entities SET encrypted_envelope_json = ? WHERE key = 'door_code'", (json.dumps(env),))
+    c.commit()
     c.close()
+    before = _content(p)
+    with pytest.raises(vault_module.VaultIntegrityError, match="do not open under the passphrase.*ops:door_code"):
+        SQLiteMemoryVault(str(p), passphrase=M.FIXTURE_A5_PASS, auto_gate=False)
+    assert _content(p) == before
+
+
+@pytest.mark.parametrize("witness", [
+    "CREATE TABLE audit_head (id INTEGER PRIMARY KEY CHECK (id = 1), sequence INTEGER NOT NULL, event_hash TEXT NOT NULL, mac TEXT NOT NULL)",
+    "ALTER TABLE audit_journal ADD COLUMN format INTEGER NOT NULL DEFAULT 2",
+    "ALTER TABLE rejected_value_tombstones ADD COLUMN tombstone_mac TEXT DEFAULT NULL",
+    "INSERT INTO vault_meta (key, value) VALUES ('meta_mac', 'x')",
+    "INSERT INTO vault_meta (key, value) VALUES ('journal_format_floor', '3')",
+    "INSERT INTO vault_meta (key, value) VALUES ('journal_anchored', '1')",
+    "INSERT INTO vault_meta (key, value) VALUES ('verification_quorum', '1')",
+    "INSERT INTO vault_meta (key, value) VALUES ('integrity_format', '2')",
+    "UPDATE entities SET is_encrypted = 0 WHERE key = 'unsigned_legacy'",
+    "UPDATE entities SET encrypted_envelope_json = NULL WHERE key = 'unsigned_legacy'",
+    "DELETE FROM entities",
+])
+def test_control_a5_fixture_with_one_planted_witness_is_refused(tmp_path, witness):
+    """Each witness on its own, planted into the genuine a5 fixture, is enough to refuse the migration
+    (a5 never wrote any of them), and nothing is written."""
+    p = tmp_path / "a5.sqlite"
+    shutil.copy(M.FIXTURE_A5, p)
+    c = M._conn(p)
+    c.execute(witness)
+    c.commit()
+    c.close()
+    before = _content(p)
+    with pytest.raises(vault_module.VaultIntegrityError):
+        SQLiteMemoryVault(str(p), passphrase=M.FIXTURE_A5_PASS, auto_gate=False)
+    assert _content(p) == before
 
 
 def test_control_tenant_sig_blank_alone_is_still_refused(tmp_path):
@@ -223,10 +408,10 @@ def test_control_tenant_sig_blank_alone_is_still_refused(tmp_path):
     c.execute("UPDATE entities SET tenant_sig = ''")
     c.commit()
     c.close()
-    before = p.read_bytes()
+    before = _content(p)
     with pytest.raises(vault_module.VaultIntegrityError, match="sealed with its binding"):
         _open(p)
-    assert p.read_bytes() == before
+    assert _content(p) == before
 
 
 def test_control_journal_deleted_with_entries_kept_is_refused(tmp_path):
@@ -345,12 +530,13 @@ def test_control_default_import_origin_is_principal_so_the_cap_only_bites_when_n
 # ===================================================================== R3-AB4 / E1 / E4: the quorum
 
 
-def test_attack_legacy_meta_mac_keeps_a_lowered_quorum_that_is_still_at_the_default(tmp_path):
-    """R3-AB4 residual. Under a V1 (pre-quorum) meta MAC the stored quorum is "not trusted" only below
-    the DEFAULT: a person pinned 3 (a pre-R2-B4 file carries the V1 MAC as it is; no backup copy is
-    needed), a file writer lowers it to 2, and the next writable open adopts 2, re-signs the full-set
-    MAC over it, and every later open adopts 2 in silence. 'Can only raise the bar' holds against the
-    default, not against what the person pinned."""
+def test_attack_legacy_meta_mac_keeps_a_lowered_quorum_that_is_still_at_the_default(tmp_path, caplog):
+    """R4-2 fixed. Under a V1 (pre-quorum) meta MAC no stored quorum is trusted, whatever its value: a
+    person pinned 3, a file writer lowers it to 2 (the default), and the next writable open ignores
+    the value (logging it at WARNING), drops it before re-signing the full-set MAC, so the MAC never
+    covers a value nobody signed; two accounts do not mint ``verified``; a pinning verdict under the
+    person's quorum restores 3 under the full-set MAC."""
+    import logging
     p = tmp_path / "v.sqlite"
     v = _open(p, verification_quorum=3, pin_quorum=True, trust_caller_identity=True)
     v.remember("decision", "d", "ship it", origin="user", author_id="alice", epistemic_state="verified", attester="alice")
@@ -363,21 +549,29 @@ def test_attack_legacy_meta_mac_keeps_a_lowered_quorum_that_is_still_at_the_defa
     c.execute("UPDATE vault_meta SET value = '2' WHERE key = 'verification_quorum'")  # the file writer's edit
     c.commit()
     c.close()
-    v = _open(p, trust_caller_identity=True)  # the operator's process, naming no quorum
+    with caplog.at_level(logging.WARNING, logger="kibisis"):
+        v = _open(p, trust_caller_identity=True)  # the operator's process, naming no quorum
+    assert any("stored verification quorum 2 is not covered by the meta MAC" in r.getMessage()
+               and r.levelno == logging.WARNING for r in caplog.records), [r.getMessage() for r in caplog.records]
     try:
-        assert v.verification_quorum == 2 and v.verification_quorum_stored == 2  # must stay 3 or refuse
+        assert v.verification_quorum == 2 and v.verification_quorum_stored is None  # the default, nothing stored
         v.review_entity("decision", "d", "verified", reviewer_id="bob", attester="bob")
-        assert v.get("decision", "d").epistemic_state.value == "verified"  # two accounts, not three
+        assert v.get("decision", "d").epistemic_state.value == "verified"  # the default quorum, 2 accounts
     finally:
         v.close()
     c = M._conn(p)
     fields = M._bound(c)
     c.close()
-    assert fields["verification_quorum"] == "2"
+    assert fields.get("verification_quorum") is None  # dropped, not re-signed
     assert fields["meta_mac"] == vault_meta_mac(signing_key, {k: fields.get(k) for k in VAULT_META_BOUND_KEYS})
+    v = _open(p, verification_quorum=3, pin_quorum=True, trust_caller_identity=True)  # the person re-pins
+    try:
+        assert v.verification_quorum == 3 and v.verification_quorum_stored == 3
+    finally:
+        v.close()
     v = _open(p)
     try:
-        assert v.verification_quorum == 2  # permanent, signed, silent
+        assert v.verification_quorum == 3  # under the full-set MAC
     finally:
         v.close()
 

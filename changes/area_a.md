@@ -224,7 +224,8 @@ are kept; each now asserts the fixed behaviour).
   so a pre-R2-B4 `meta_mac` plus `verification_quorum = 1` became a signed downgrade. Under a legacy
   MAC the stored quorum is now not trusted: a value below the default is ignored (the process runs
   with its own / the default), deleted before the re-sign, and logged at WARNING; a value at or above
-  the default can only raise the bar and is kept and covered. `_verify_meta_mac` logs the legacy MAC at
+  the default was kept and covered in round 3 (round 4, R4-2: no value is kept any more; see below).
+  `_verify_meta_mac` logs the legacy MAC at
   WARNING in both read-only and writable opens.
 - **R3-E4** (low) `open_vault(env=...)` reads `KIBISIS_VERIFICATION_QUORUM` from its mapping
   (`parse_verification_quorum`) and passes `verification_quorum=` explicitly, like the path, key and
@@ -250,3 +251,23 @@ are kept; each now asserts the fixed behaviour).
   `pin_quorum=True` from a path it trusts as a person's act.
 - A vault pinned at 1 refuses every open that does not name 1 itself (`ConfigError`); run with
   `KIBISIS_VERIFICATION_QUORUM=1`, or raise it with a verdict under `KIBISIS_VERIFICATION_QUORUM=2`.
+
+## Round 4
+
+### Fixed
+
+- **R4-2** (low–medium) Under a legacy (V1) meta MAC, round 3 kept a stored quorum at or above the
+  default ("can only raise the bar" was measured against the default, not against what the person
+  pinned), so a file writer could lower a pinned 3 to 2 and the re-sign made it permanent. No stored
+  quorum is trusted under a legacy MAC now, whatever its value: `_stored_quorum` returns None and logs
+  the value at WARNING ("not covered by the meta MAC … ignored and dropped"), `_drop_untrusted_stored_quorum`
+  deletes it before the full-set re-sign, and the next TTY-gated verdict run under the person's
+  `KIBISIS_VERIFICATION_QUORUM` re-pins it. Nothing that was not under a MAC is ever re-signed.
+  `tests/test_review4_r3fixes.py::test_attack_legacy_meta_mac_keeps_a_lowered_quorum_that_is_still_at_the_default`
+  asserts the fixed behaviour (process runs with the default, `verification_quorum_stored` None, two
+  accounts do not mint `verified`, the full-set MAC covers no quorum, a pinning verdict restores 3).
+
+### Changed behaviour callers may notice
+
+- A pre-R2-B4 file whose person pinned a quorum above the default loses the pin at its first open under
+  this release (logged at WARNING with the value) until the next review verdict re-pins it.

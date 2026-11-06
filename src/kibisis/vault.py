@@ -464,6 +464,21 @@ class SQLiteMemoryVault(
             if converted_temp is not None:
                 self._discard_converted(converted_temp)
             raise
+        self._a5_checked = False  # True once _refuse_unless_genuine_a5 ran on the file as it was before _init_schema
+        if passphrase:
+            # The a5 discriminator must see the file before _init_schema adds the tables and columns a later
+            # release's schema has (audit_head, audit_journal.format, tombstone_mac): a keyed file reset to
+            # look like 0.1.0a5 is refused here, and a genuine a5 file hands over its derived keys.
+            try:
+                prechecked = self._refuse_unless_genuine_a5(passphrase)
+            except BaseException:
+                self._conn.close()
+                if converted_temp is not None:
+                    self._discard_converted(converted_temp)  # the plain file was never touched
+                raise
+            self._a5_checked = True
+            if prechecked is not None:
+                self._prechecked_keys = prechecked
         self._init_schema()
         if not passphrase:
             try:
@@ -572,7 +587,11 @@ class SQLiteMemoryVault(
         but no key check that claims format 1 (Kibisis 0.1.0a5 or earlier wrote no key check) is
         authenticated the way its migration will be: one of its sealed entries must open under the
         passphrase, or, when none is sealed, one of its format 1 signatures must verify; otherwise
-        ``ValueError`` is raised and the file is untouched. Returns the salt and the derived keys so the
+        ``ValueError`` is raised and the file is untouched. This is the passphrase gate before the
+        conversion only; whether such a file is a genuine 0.1.0a5 file at all (every row sealed and
+        opening, no later-format table, column or meta key) is decided by its sibling
+        :meth:`_refuse_unless_genuine_a5`, which runs on the connection before ``_init_schema`` in every
+        writable open with a passphrase. Returns the salt and the derived keys so the
         open that follows need not derive them again, or None when the file has no vault_meta yet (a
         vault never opened with a passphrase).
         """
@@ -1109,8 +1128,10 @@ class SQLiteMemoryVault(
         """The quorum ``vault_meta`` holds, or None when there is none (or it is not a positive integer).
 
         While the meta MAC verifies only over the legacy key set (:attr:`_meta_mac_legacy`) the stored
-        value was never signed, so one below :data:`DEFAULT_VERIFICATION_QUORUM` is not evidence of
-        anything and is reported as None (R3-AB4); a higher one can only raise the bar and is kept.
+        value was never signed, so it is not evidence of anything, whatever it is: a file writer can
+        lower a quorum a person pinned above the default to the default itself (R4-2), not only below
+        it (R3-AB4). It is reported as None, logged at WARNING with the value, and dropped before the
+        MAC is re-signed (``_drop_untrusted_stored_quorum``); the next review verdict re-pins it.
         """
         try:
             stored_raw = self._meta("verification_quorum")
@@ -1124,19 +1145,20 @@ class SQLiteMemoryVault(
             return None
         if stored < 1:
             return None
-        if self._meta_mac_legacy and stored < DEFAULT_VERIFICATION_QUORUM:
+        if self._meta_mac_legacy:
             logger.warning(
-                "%s: the stored verification quorum %d is below the default %d and the meta MAC that would cover "
-                "it predates the bound quorum; the stored value is ignored",
-                self.db_path, stored, DEFAULT_VERIFICATION_QUORUM,
+                "%s: the stored verification quorum %d is not covered by the meta MAC (it predates the bound quorum), "
+                "so it is not trusted: the value is ignored and dropped at the next writable open; a review verdict "
+                "run under KIBISIS_VERIFICATION_QUORUM=%d pins it again",
+                self.db_path, stored, stored,
             )
             return None
         return stored
 
     def _drop_untrusted_stored_quorum(self, cursor: Any) -> None:
-        """Before a legacy (pre-quorum) meta MAC is re-signed: remove a stored quorum the MAC never covered
-        and that a process would otherwise refuse (below the default), so the re-signed MAC does not turn
-        a file writer's value into a signed one. Called by ``_verify_meta_mac`` under ``_meta_mac_legacy``."""
+        """Before a legacy (pre-quorum) meta MAC is re-signed: remove a stored quorum the MAC never covered,
+        whatever its value, so the re-signed MAC never turns a value nobody signed into a signed one.
+        Called by ``_verify_meta_mac`` under ``_meta_mac_legacy``."""
         if self._stored_quorum() is None and self._meta("verification_quorum") is not None:
             cursor.execute("DELETE FROM vault_meta WHERE key = 'verification_quorum'")
 

@@ -393,34 +393,159 @@ class EntryIntegrityMixin:
     def _key_check_value(self) -> str:
         return hmac.new(self._signing_key, b"kibisis key check v2", hashlib.sha256).hexdigest()
 
-    def _format_2_artefacts(self) -> List[str]:
-        """What in this vault only integrity format 2 or later writes: evidence that the file was keyed
-        before, whatever ``vault_meta.integrity_format`` says now. Empty for a genuine format 1
-        (Kibisis 0.1.0a5 or earlier) vault. The sealed entries are the strongest witness: a format 2+
-        envelope is bound to its entry (``ENTRY_BINDING``) and cannot be re-sealed without the key."""
+    #: What a Kibisis 0.1.0a5 file never has (checked against ``tests/fixtures/vault-0.1.0a5-fallback.sqlite``,
+    #: whose ``vault_meta`` holds ``kdf_salt`` alone): tables, columns and ``vault_meta`` keys that only
+    #: integrity format 2 and later, or the schema upgrade of a later release, write.
+    _A5_FOREIGN_TABLES: Tuple[str, ...] = ("audit_head",)
+    _A5_FOREIGN_COLUMNS: Tuple[Tuple[str, str], ...] = (("audit_journal", "format"), ("rejected_value_tombstones", "tombstone_mac"))
+    _A5_FOREIGN_META: Tuple[str, ...] = ("key_check", "meta_mac", "journal_format_floor", "journal_anchored", "verification_quorum")
+
+    def _refuse_unless_genuine_a5(self, passphrase: str) -> Optional[Tuple[bytes, Tuple[bytes, bytes, bytes]]]:
+        """The one discriminator between a genuine Kibisis 0.1.0a5 file and a keyed (integrity format 2+)
+        file reset to look like one, run on the plain file BEFORE ``_init_schema`` adds what a later
+        release's schema has. It applies to a file whose ``vault_meta`` carries ``kdf_salt`` but no
+        ``key_check`` and claims integrity format below 2: that is what a5 wrote, and also what a file
+        writer (r/w on the plain SQLite file, no passphrase) leaves after deleting the key check, meta
+        MAC and integrity format, blanking the signatures and re-chaining the journal headless in
+        format 1 (R2-B1, R3-AB2, R4-1), hoping to re-enter the format 1 migration, which authenticates
+        nothing but the entries it opens and then signs whatever it finds. Only a file that is provably
+        an a5 file is let into that migration; any failure is a :class:`VaultIntegrityError` that names
+        every witness found, and nothing is written. Returns ``(salt, derived keys)`` when the file
+        passed (so the open need not derive them again), or None when the file is not a candidate (no
+        ``vault_meta``, no salt, or a key check present: the ordinary checks in ``_upgrade_integrity``
+        decide those).
+
+        Witnesses, each enough on its own, and why:
+
+        * table ``audit_head`` exists: the signed journal head arrived after a5 (the migration would
+          otherwise sign a headless chain; a headless format 1 chain has no keyed element at all);
+        * column ``audit_journal.format``: the journal format label arrived with integrity format 2+;
+        * column ``rejected_value_tombstones.tombstone_mac``: tombstone MACs are integrity format 3;
+        * ``vault_meta`` ``key_check``, ``meta_mac``, ``journal_format_floor``, ``journal_anchored`` or
+          ``verification_quorum`` (:data:`_A5_FOREIGN_META`), or ``integrity_format`` of 2 or more:
+          a5's ``vault_meta`` holds the salt alone;
+        * an entity row with ``is_encrypted != 1``: a5 sealed every entry of a vault with a passphrase
+          (the fixture: 6 of 6), so a plaintext row in a keyed format 1 file was edited (the R3-AB2
+          flip, or R4-1's flip plus a blanked envelope);
+        * an entity row whose envelope is NULL, empty or does not parse: no sealed content to
+          authenticate the row with (R4-1);
+        * an envelope carrying the format 2 binding (``ENTRY_BINDING``): a5 never wrote it, and it is
+          inside the ciphertext's authenticated data, so it cannot be removed without the key; an
+          envelope whose binding string was scrubbed from the text still opens only under that
+          associated data (``entry_aad``), and is counted the same way;
+        * a sealed envelope that does not open under the passphrase-derived key the way a5 sealed it
+          (no binding): every a5 row is its own proof of the passphrase. When no sealed row opens at
+          all the passphrase is wrong (or every envelope was replaced): ``ValueError`` ("Failed to
+          authenticate ..."), the same refusal as for any wrong passphrase;
+        * the entity table is empty while the journal records ``put``/``update`` events that were never
+          purged or tombstoned: the entries were deleted (the R3-AB2 ``DELETE FROM entities`` variant).
+
+        What is left to a file writer is the reset that satisfies all of these: a headless journal
+        with no entry event and no sealed entry, which is an empty vault (SECURITY.md). The
+        ``tenant_sig`` column is not a witness: the fixture holds an a5 row without one.
+        """
+        from .crypto import AESGCMCryptoEnvelopeProvider, derive_vault_keys
+
+        conn = self._conn
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
+        if "vault_meta" not in tables:
+            return None
+        meta = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM vault_meta").fetchall()}
+        if meta.get("kdf_salt") is None or meta.get("key_check") is not None:
+            return None
+        salt = bytes(meta["kdf_salt"])
         found: List[str] = []
-        for name in ("meta_mac", "journal_format_floor", "journal_anchored"):
-            if self._meta(name) is not None:
+        try:
+            stored_format = int(meta.get("integrity_format") or 0)
+        except (TypeError, ValueError):
+            stored_format = 0
+        if stored_format >= 2:
+            found.append(f"vault_meta.integrity_format = {stored_format}")
+        for table in self._A5_FOREIGN_TABLES:
+            if table in tables:
+                found.append(f"a table {table}")
+        for table, column in self._A5_FOREIGN_COLUMNS:
+            if table in tables and column in {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}:
+                found.append(f"a column {table}.{column}")
+        for name in self._A5_FOREIGN_META:
+            if meta.get(name) is not None:
                 found.append(f"vault_meta.{name}")
-        if self._conn.execute(
-            "SELECT 1 FROM rejected_value_tombstones WHERE tombstone_mac IS NOT NULL AND tombstone_mac != '' LIMIT 1"
-        ).fetchone():
-            found.append("a signed tombstone row")
-        if self._conn.execute("SELECT 1 FROM audit_head LIMIT 1").fetchone():
-            found.append("a signed journal head")
-        # Rows from before the column existed are labelled 2 by the schema upgrade (formats 1 and 2 share
-        # one layout), so only a format 3 row is evidence.
-        if self._conn.execute("SELECT 1 FROM audit_journal WHERE format >= 3 LIMIT 1").fetchone():
-            found.append("a journal row in format 3")
-        # The witness is the binding string inside the envelope, whatever ``is_encrypted`` says: that column
-        # is a plain integer a file writer flips, while the binding was sealed with the key (R3-AB2). An a5
-        # vault never wrote the string at all.
-        if self._conn.execute(
-            "SELECT 1 FROM entities WHERE encrypted_envelope_json LIKE ? LIMIT 1",
-            (f'%"binding":"{ENTRY_BINDING}"%',),
-        ).fetchone():
-            found.append("an entry sealed with its binding")
-        return found
+        rows = (
+            conn.execute(
+                "SELECT category, key, scope, is_encrypted, encrypted_envelope_json FROM entities ORDER BY id"
+            ).fetchall()
+            if "entities" in tables
+            else []
+        )
+        plaintext = bound = unparsable = 0
+        openable: List[Tuple[Any, EncryptedEnvelope]] = []
+        for r in rows:
+            if r["is_encrypted"] != 1:
+                plaintext += 1
+            try:
+                envelope = EncryptedEnvelope.model_validate_json(r["encrypted_envelope_json"] or "")
+            except Exception:
+                unparsable += int(r["is_encrypted"] == 1)  # a plaintext row is counted once, above
+                continue
+            if envelope.binding == ENTRY_BINDING:
+                bound += 1
+            else:
+                openable.append((r, envelope))
+        if plaintext:
+            found.append(f"{plaintext} of {len(rows)} entries marked plaintext (is_encrypted != 1)")
+        if unparsable:
+            found.append(f"{unparsable} of {len(rows)} entries whose sealed envelope is missing or malformed")
+        if bound:
+            found.append(f"{bound} of {len(rows)} entries sealed with its binding (an integrity format 2 seal)")
+        provider = AESGCMCryptoEnvelopeProvider(salt=salt)
+        opened = 0
+        closed: List[str] = []
+        rebound = 0
+        for r, envelope in openable:
+            try:
+                provider.decrypt(envelope, passphrase, aad=None)
+                opened += 1
+                continue
+            except Exception:
+                pass
+            try:
+                # The binding string was scrubbed from the envelope text but the ciphertext still carries the
+                # format 2 associated data: the seal itself is the witness.
+                provider.decrypt(envelope, passphrase, aad=entry_aad(r["scope"], r["category"], r["key"]))
+                rebound += 1
+            except Exception:
+                closed.append(f"{r['category']}:{r['key']} [scope={r['scope']}]")
+        if rebound:
+            found.append(f"{rebound} of {len(rows)} entries whose seal opens only under its binding (an integrity format 2 seal)")
+        if closed and not opened and not found:
+            # Nothing else is wrong with the file and no sealed row opens: the passphrase is wrong (or every
+            # envelope was replaced, which the right passphrase cannot tell apart); refused as a wrong passphrase.
+            raise ValueError("Failed to authenticate or decrypt vault database with provided passphrase")
+        if closed:
+            found.append(
+                f"{len(closed)} of {len(rows)} sealed entries that do not open under the passphrase, first {closed[0]}"
+            )
+        if not rows and "audit_journal" in tables:
+            live: set = set()
+            for ev in conn.execute("SELECT action, category, key, scope FROM audit_journal ORDER BY sequence ASC").fetchall():
+                ident = (ev["category"], ev["key"], ev["scope"])
+                if ev["action"] in ("put", "update"):
+                    live.add(ident)
+                elif ev["action"] in ("purge", "tombstone"):
+                    live.discard(ident)
+            if live:
+                category, key, scope = sorted(live)[0]
+                found.append(
+                    f"an entity table that is empty while the journal records {len(live)} entries that were never "
+                    f"purged, first '{category}:{key}' [scope={scope}]"
+                )
+        if found:
+            raise VaultIntegrityError(
+                f"{self.db_path}: the vault is keyed (kdf_salt present) but has no key check, and it is not a "
+                f"0.1.0a5 file: it holds {'; '.join(found)}. Only a genuine 0.1.0a5 file is migrated; the "
+                "integrity records were removed. Refusing to migrate; restore the records before opening."
+            )
+        return salt, derive_vault_keys(passphrase, salt)
 
     def _upgrade_integrity(self) -> None:
         """Check the passphrase, then bring an older vault up to INTEGRITY_FORMAT, then check the records.
@@ -428,9 +553,9 @@ class EntryIntegrityMixin:
         Order matters. The key check (``vault_meta.key_check``) is compared first, before any migration
         writes, so a wrong passphrase can never re-key a vault; a keyed vault without a key check is
         refused (:class:`VaultIntegrityError`): one that reports integrity format 2 or higher outright,
-        and one that reports format 1 but carries a ``kdf_salt`` unless it holds nothing that only
-        format 2 and later write (:meth:`_format_2_artefacts`), which is what a genuine 0.1.0a5 vault
-        looks like. A vault at format 1 is
+        and one that reports format 1 but carries a ``kdf_salt`` unless the one a5 discriminator
+        (:meth:`_refuse_unless_genuine_a5`, run on the plain file before ``_init_schema``) proved it
+        is a genuine 0.1.0a5 file. A vault at format 1 is
         migrated to 2 (:meth:`_migrate_integrity`; it authenticates through the entries it opens and
         refuses when its journal does not verify), then any vault below 3 is brought to 3
         (:meth:`_upgrade_to_format_3`). A vault already at format 3 must carry a meta MAC that verifies.
@@ -450,14 +575,13 @@ class EntryIntegrityMixin:
         elif self._was_keyed:
             # A salt with no key check and a format 1 claim: a 0.1.0a5 vault looks like this, and so does a
             # keyed vault whose key check, meta MAC and integrity format were all removed to re-enter the
-            # format 1 migration (which would re-sign whatever the editor left). Only a vault that holds
-            # nothing format 2 or later ever wrote is taken for a5.
-            artefacts = self._format_2_artefacts()
-            if artefacts:
+            # format 1 migration (which would re-sign whatever the editor left). The one discriminator,
+            # ``_refuse_unless_genuine_a5``, ran on the plain file before ``_init_schema`` and refused
+            # anything that is not provably an a5 file; it must have run for the migration to be allowed.
+            if not getattr(self, "_a5_checked", False):
                 raise VaultIntegrityError(
-                    f"{self.db_path}: the vault is keyed (kdf_salt present) but has no key check, and it holds "
-                    f"{', '.join(artefacts)}, which only integrity format 2 and later write; the integrity "
-                    "records were removed. Refusing to migrate; restore the records before opening."
+                    f"{self.db_path}: the vault is keyed (kdf_salt present) but has no key check, and it was not "
+                    "checked as a 0.1.0a5 file before the schema upgrade; refusing to migrate."
                 )
         if stored_format < 2 and (stored is not None or self._meta("meta_mac") is not None):
             # Format 1 wrote neither record. A vault that carries one while claiming format 1 had its
@@ -497,10 +621,11 @@ class EntryIntegrityMixin:
         :data:`VAULT_META_BOUND_KEYS_V1`) is accepted once, logged at WARNING, and replaced by one over
         the full set when the vault is open writable; a read-only open accepts it as it is. Such a MAC
         never covered the stored quorum, and any pre-upgrade copy of it stays valid over the legacy set,
-        so the stored quorum is not trusted while it holds (R3-AB4): a value below the default is
-        ignored (``_stored_quorum``) and dropped before the re-sign (``_drop_untrusted_stored_quorum``),
-        so the new MAC never signs a file writer's lower quorum; a value at or above the default can only
-        raise the bar and is kept.
+        so no stored quorum is trusted while it holds, whatever its value (R3-AB4, R4-2): it is ignored
+        (``_stored_quorum``, which logs the value) and dropped before the re-sign
+        (``_drop_untrusted_stored_quorum``), so the new MAC never signs a value nobody signed. The
+        person loses nothing: the next review verdict run under their ``KIBISIS_VERIFICATION_QUORUM``
+        pins it again, under the full-set MAC.
         """
         stored = self._meta("meta_mac")
         if stored is None:
@@ -518,8 +643,8 @@ class EntryIntegrityMixin:
                 )
                 return
             logger.warning(
-                "%s: the meta MAC predates the bound verification quorum; a stored quorum below the default is "
-                "dropped and the MAC is re-signed over the full set",
+                "%s: the meta MAC predates the bound verification quorum; a stored quorum is not covered by it and "
+                "is dropped, and the MAC is re-signed over the full set",
                 self.db_path,
             )
             with self._write_tx() as cursor:
@@ -618,7 +743,9 @@ class EntryIntegrityMixin:
         A ``tombstone_lifted`` event names the row it removed. Events written by earlier releases from a
         lower-class lift (``_lift_lower_class_tombstones``) named the writer's entry instead and put the
         row's ``category:key`` and scope in ``metadata.tombstone`` / ``tombstone_scope``; those are
-        matched through the metadata so such vaults still open (R3-AB1)."""
+        matched through the metadata so such vaults still open (R3-AB1): by the named ``category:key``
+        when it differs from the event's own, and by the named scope whenever it differs from the
+        event's (a global ``'*'`` row lifted by a write under the same ``category:key``, R4-3)."""
         from ._vault_review import ORIGIN_CLASSES, _class_rank
 
         rows = self._conn.execute(
@@ -646,10 +773,15 @@ class EntryIntegrityMixin:
                 continue
             expected.pop(ident, None)
             named = meta.get("tombstone")
+            named_scope = meta.get("tombstone_scope")
+            row_scope = named_scope if isinstance(named_scope, str) and named_scope else ev["scope"]
             if isinstance(named, str) and ":" in named and named != f"{ev['category']}:{ev['key']}":
-                row_scope = meta.get("tombstone_scope") or ev["scope"]
                 for cut in (i for i, ch in enumerate(named) if ch == ":"):
                     expected.pop((named[:cut], named[cut + 1:], ev["value_sha256"], row_scope), None)
+            if row_scope != ev["scope"]:
+                # R4-3: a legacy lift of a row in another scope (a global '*' row) under the event's own
+                # category:key names only the scope; pop that row whatever the name test said.
+                expected.pop((ev["category"], ev["key"], ev["value_sha256"], row_scope), None)
         missing = [ident for ident in expected if ident not in present]
         if missing:
             category, key, _, scope = missing[0]
@@ -715,33 +847,11 @@ class EntryIntegrityMixin:
             # Otherwise decide every entry before changing anything, and stop under a wrong passphrase: an
             # upgrade under the wrong key would re-key the tombstones and the journal beyond repair.
             was_keyed = self._was_keyed or any(r["is_encrypted"] == 1 for r in rows)
-            # R3-AB2: what a genuine 0.1.0a5 file cannot look like. A row that says it is plaintext but
-            # carries an envelope had its ``is_encrypted`` flag edited (a5 wrote the two together); and a
-            # keyed vault whose journal says entries were put and never purged, while the table is empty,
-            # had its entries deleted. Either is a reset of a later-format vault, not a legacy file.
-            inconsistent = [r for r in rows if r["is_encrypted"] != 1 and r["encrypted_envelope_json"]]
-            if inconsistent:
-                r = inconsistent[0]
-                raise VaultIntegrityError(
-                    f"{self.db_path}: {len(inconsistent)} entries are marked plaintext but carry a sealed envelope, "
-                    f"first '{r['category']}:{r['key']}' [scope={r['scope']}]; the entity table was edited. Refusing "
-                    "to migrate; restore the rows before opening."
-                )
-            if self._was_keyed and not rows:
-                live: set = set()
-                for ev in events:
-                    ident = (ev["category"], ev["key"], ev["scope"])
-                    if ev["action"] in ("put", "update"):
-                        live.add(ident)
-                    elif ev["action"] in ("purge", "tombstone"):
-                        live.discard(ident)
-                if live:
-                    category, key, scope = sorted(live)[0]
-                    raise VaultIntegrityError(
-                        f"{self.db_path}: the vault is keyed (kdf_salt present) and its journal records {len(live)} "
-                        f"entries that were never purged, first '{category}:{key}' [scope={scope}], but the entity "
-                        "table is empty; the entries were deleted outside kibisis. Refusing to migrate."
-                    )
+            # With a salt present the file passed ``_refuse_unless_genuine_a5`` before ``_init_schema``: every
+            # row is sealed the way a5 sealed it and opens under the passphrase, and an empty table has no
+            # unpurged entry event behind it. The chain check below is necessary (a journal that does not
+            # verify is never re-signed) but it admits nothing on its own: a headless format 1 chain has no
+            # keyed element, so the opened rows are what authenticate the file (R2-B1, R3-AB2, R4-1).
             if not was_keyed:
                 counts["entries_adopted_from_keyless_vault"] = 0
             reseal: List[Tuple[Any, str]] = []

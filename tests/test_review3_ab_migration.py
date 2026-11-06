@@ -104,9 +104,9 @@ def test_attack_r2b1_discriminator_is_defeated_by_flipping_is_encrypted_to_0(tmp
 
 
 def test_control_r3ab2_plaintext_row_with_an_envelope_is_refused_by_the_migration(tmp_path):
-    """The migration itself refuses a row marked plaintext that carries an envelope, whatever the
-    discriminator saw (here the binding is scrubbed from the envelope text too, so only the row
-    inconsistency is left to notice)."""
+    """A row marked plaintext that carries an envelope is refused (here the binding is scrubbed from
+    the envelope text too, so the plaintext mark and the envelope that does not open are what the
+    discriminator names)."""
     p = _seeded(tmp_path / "v.sqlite")
     c = _conn(p)
     _scrub_everything_but_entries(c)
@@ -114,7 +114,7 @@ def test_control_r3ab2_plaintext_row_with_an_envelope_is_refused_by_the_migratio
               "replace(encrypted_envelope_json, 'binding', 'bndng')")
     c.commit()
     c.close()
-    with pytest.raises(vault_module.VaultIntegrityError, match="marked plaintext but carry a sealed envelope"):
+    with pytest.raises(vault_module.VaultIntegrityError, match="marked plaintext"):
         SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
 
 
@@ -128,7 +128,7 @@ def test_attack_r2b1_discriminator_is_defeated_by_deleting_every_entry(tmp_path)
     c.execute("DELETE FROM entities")
     c.commit()
     c.close()
-    with pytest.raises(vault_module.VaultIntegrityError, match="entity table is empty"):
+    with pytest.raises(vault_module.VaultIntegrityError, match="entity table that is empty"):
         SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
     c = _conn(p)
     assert c.execute("SELECT count(*) FROM audit_head").fetchone()[0] == 0
@@ -139,9 +139,9 @@ def test_attack_r2b1_discriminator_is_defeated_by_deleting_every_entry(tmp_path)
 def test_control_r3ab2_keyed_format1_chain_is_not_accepted_under_the_path_key(tmp_path, monkeypatch):
     """A vault with a salt had its format-1 head signed under the passphrase's legacy key; a head that
     verifies only under the path-derived key (one a file writer computes) is refused by the migration
-    itself. The head is a format-2 artefact the discriminator already refuses, so the discriminator is
+    itself. The head is a witness the a5 discriminator already refuses, so the discriminator is
     stubbed out here to exercise the migration's own check (defence in depth)."""
-    monkeypatch.setattr(vault_module.SQLiteMemoryVault, "_format_2_artefacts", lambda self: [])
+    monkeypatch.setattr(vault_module.SQLiteMemoryVault, "_refuse_unless_genuine_a5", lambda self, passphrase: None)
     import hashlib
 
     from kibisis._vault_audit import _head_mac
@@ -218,7 +218,8 @@ def test_attack_r2b4_legacy_v1_meta_mac_re_signs_an_attacker_quorum(tmp_path, ca
         v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)  # names no quorum
     assert any("predates the bound verification quorum" in r.getMessage() and r.levelno == logging.WARNING
                for r in caplog.records), [r.getMessage() for r in caplog.records]
-    assert any("below the default" in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
+    assert any("not covered by the meta MAC" in r.getMessage() and " 1 " in r.getMessage()
+               and r.levelno == logging.WARNING for r in caplog.records)  # the dropped value is named
     try:
         assert v.verification_quorum == 2 and v.verification_quorum_stored is None  # the forged 1 was ignored
         v.remember("decision", "e", "single attestation does not mint verified", origin="user", author_id="bob",

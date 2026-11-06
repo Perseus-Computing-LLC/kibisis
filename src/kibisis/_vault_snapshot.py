@@ -255,7 +255,10 @@ class SnapshotMixin:
         A tombstone's ``origin_class`` is likewise taken from the file only when the seal opens and
         covers the tombstones; otherwise it is capped at the importer's class (``origin``, as on
         :meth:`put`; ``None`` means the caller vouches for a person), so a file cannot plant a
-        rejection of a higher class than whoever imports it.
+        rejection of a higher class than whoever imports it. ``origin=None`` is therefore principal:
+        a library caller relaying a file it did not make (one handed over by an agent, or by anyone
+        but a person at the terminal) must pass that party's ``origin`` (``"model"``, ``"tool"``), or
+        the file's unsealed tombstones are planted at principal class (R4-4).
 
         The restore is one transaction: it applies whole or, on an error, not at all. Restoring over a
         live vault without ``clear_existing`` leaves a live entry a person reviewed, or one of a
