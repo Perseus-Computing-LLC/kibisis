@@ -85,6 +85,7 @@ def _no_passphrase_from_environment(monkeypatch):
 def no_sqlcipher(monkeypatch):
     """Run as when the sqlcipher3 driver fails to load: the vault file is plain SQLite."""
     monkeypatch.setattr(vault_module, "sqlcipher3", sqlite3)
+    monkeypatch.setenv("KIBISIS_ALLOW_PLAINTEXT", "1")  # fallback mode is opt-in: the file is plain on disk
     monkeypatch.setattr(vault_module, "_sqlcipher_available", lambda: False)
 
 
@@ -283,6 +284,7 @@ def _strip_term_index(path):
     vault._conn.execute("DROP TABLE IF EXISTS entities_terms_docs")
     vault._conn.execute("DROP TABLE IF EXISTS entities_search_dirty")
     vault._conn.execute("DELETE FROM vault_meta WHERE key = 'term_index_format'")
+    vault._write_meta_mac(vault._conn)  # as a vault written before the index existed: no format under the meta MAC
     vault._conn.commit()
     vault.close()
 

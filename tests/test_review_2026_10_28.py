@@ -37,8 +37,8 @@ def test_tombstone_cannot_land_between_check_and_insert(tmp_path):
         resume = threading.Event()
         original = SQLiteMemoryVault._find_tombstone
 
-        def paused_find(cursor, scope, val_hash, can_hash):
-            result = original(cursor, scope, val_hash, can_hash)
+        def paused_find(self, cursor, scope, val_hash, can_hash):
+            result = original(self, cursor, scope, val_hash, can_hash)
             checked.set()
             resume.wait(10)
             return result
@@ -57,7 +57,7 @@ def test_tombstone_cannot_land_between_check_and_insert(tmp_path):
             except Exception as exc:  # noqa: BLE001
                 errors["b"] = exc
 
-        SQLiteMemoryVault._find_tombstone = staticmethod(paused_find)
+        SQLiteMemoryVault._find_tombstone = paused_find
         try:
             t_a = threading.Thread(target=writer)
             t_a.start()
@@ -70,7 +70,7 @@ def test_tombstone_cannot_land_between_check_and_insert(tmp_path):
             t_a.join(30)
             t_b.join(30)
         finally:
-            SQLiteMemoryVault._find_tombstone = staticmethod(original)
+            SQLiteMemoryVault._find_tombstone = original
 
         assert not t_a.is_alive() and not t_b.is_alive()
         assert "b" not in errors, errors
@@ -349,8 +349,10 @@ def test_removing_or_forging_the_head_fails_verification(tmp_path):
 
 
 def test_legacy_format_rows_still_verify_and_new_rows_anchor(tmp_path):
-    """A journal written by an older version has format 2 rows and no head; it verifies on its links,
-    and the first new append anchors it."""
+    """A journal written by an older version has format 2 rows. In a vault upgraded from that version the
+    journal format floor is 2, so those rows still verify on their links, and new rows append in format
+    3. A vault that never held legacy rows has its floor at 3 and refuses rows rewritten in format 2;
+    and once a keyed journal has held a row it needs its signed head, even with every row removed."""
     from kibisis.vault import _event_hash
 
     v = _journal_vault(tmp_path)
@@ -368,7 +370,15 @@ def test_legacy_format_rows_still_verify_and_new_rows_anchor(tmp_path):
             )
             prev = h
         v._conn.execute("DELETE FROM audit_head")
-    assert v.verify_audit_chain()
+    # This vault's floor is 3 (it never held legacy rows): the rewritten rows are refused.
+    assert not v.verify_audit_chain()
+    assert "below this vault's floor 3" in v.last_chain_error
+    # As the upgrade of a vault that did hold them would have left it: floor 2, head signed for the last row.
+    with v._conn:
+        v._set_meta(v._conn, "journal_format_floor", 2)
+        v._write_meta_mac(v._conn)
+        v._write_audit_head(v._conn, rows[-1]["sequence"], prev)
+    assert v.verify_audit_chain(), v.last_chain_error
     assert all(e.format == 2 for e in v.list_audit_events(limit=100))
     v.put("c", "new", "appended by the current version")
     events = v.list_audit_events(limit=100)
@@ -376,8 +386,14 @@ def test_legacy_format_rows_still_verify_and_new_rows_anchor(tmp_path):
     assert v.verify_audit_chain()
     head = v._conn.execute("SELECT sequence, event_hash FROM audit_head").fetchone()
     assert (head["sequence"], head["event_hash"]) == (events[-1].sequence, events[-1].event_hash)
-    # Tail truncation of the mixed journal is now detected too.
+    # Tail truncation of the mixed journal is detected too.
     with v._conn:
         v._conn.execute("DELETE FROM audit_journal WHERE sequence = (SELECT MAX(sequence) FROM audit_journal)")
     assert not v.verify_audit_chain()
+    # So is removing the whole journal together with its head: the vault remembers that it held rows.
+    with v._conn:
+        v._conn.execute("DELETE FROM audit_journal")
+        v._conn.execute("DELETE FROM audit_head")
+    assert not v.verify_audit_chain()
+    assert "no signed head" in v.last_chain_error
     v.close()

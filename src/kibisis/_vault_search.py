@@ -748,6 +748,7 @@ class SearchRecallMixin:
                     "DELETE FROM entities_terms WHERE id = old.id; DELETE FROM entities_terms_docs WHERE id = old.id; ",
                 )
                 self._set_meta(cursor, "term_index_format", TERM_INDEX_FORMAT)
+                self._write_meta_mac(cursor)  # the format is one of the values the meta MAC covers
         self._term_index = True
         self._drain_search_queue()
 

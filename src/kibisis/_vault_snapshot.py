@@ -66,7 +66,10 @@ class SnapshotMixin:
         for r in raw_entities:
             try:
                 content = self._open_entry(r)
-            except EntryIntegrityError:
+            except EntryIntegrityError as exc:
+                self._note_integrity_failure(r, exc)  # logged, counted; raised under strict=True
+                if self.strict:
+                    raise
                 unreadable += 1  # failed its integrity check; never exported
                 continue
             entities_data.append({
@@ -215,9 +218,9 @@ class SnapshotMixin:
                     """
                     INSERT OR IGNORE INTO rejected_value_tombstones (
                         category, key, value_sha256, canonical_sha256, reason, author_id, created_at, scope,
-                        sealed_digests
+                        sealed_digests, tombstone_mac
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         t_category,
@@ -229,6 +232,7 @@ class SnapshotMixin:
                         ts.get("created_at", time.time()),
                         t_scope,
                         sealed,
+                        self._tombstone_mac(t_scope, t_category, t_key, exact, canonical),
                     ),
                 )
             if clear_existing:

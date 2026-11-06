@@ -128,7 +128,12 @@ def resolve_scope(env: Optional[Mapping[str, str]] = None, cwd: Optional[str] = 
 
 
 def plaintext_allowed(env: Optional[Mapping[str, str]] = None) -> bool:
-    """True only when ``KIBISIS_ALLOW_PLAINTEXT`` is set to 1, true or yes."""
+    """True only when ``KIBISIS_ALLOW_PLAINTEXT`` is set to 1, true or yes.
+
+    The flag allows two things, both plain on disk on purpose: a vault without a passphrase, and a
+    vault with a passphrase on a host without the ``sqlcipher3`` driver (entry content sealed, the rest
+    of the file plain). :func:`open_vault` relays it to the vault for both cases.
+    """
     env = os.environ if env is None else env
     return env.get(ENV_ALLOW_PLAINTEXT, "").strip().lower() in ("1", "true", "yes")
 
@@ -146,4 +151,4 @@ def open_vault(db_path: Optional[str] = None, env: Optional[Mapping[str, str]] =
         )
     if path != ":memory:":
         os.makedirs(os.path.dirname(os.path.abspath(path)), mode=0o700, exist_ok=True)
-    return SQLiteMemoryVault(path, passphrase=passphrase, allow_plaintext=allow_plaintext and not passphrase)
+    return SQLiteMemoryVault(path, passphrase=passphrase, allow_plaintext=allow_plaintext)

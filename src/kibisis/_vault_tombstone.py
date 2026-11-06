@@ -51,24 +51,28 @@ class TombstoneMixin:
                 )
             return purged
 
-    @staticmethod
-    def _find_tombstone(cursor: Any, scope: str, val_hash: str, can_hash: str) -> Optional[Any]:
+    def _find_tombstone(self, cursor: Any, scope: str, val_hash: str, can_hash: str) -> Optional[Any]:
         """Return the first tombstone in ``scope`` (or a ``'*'`` tombstone) that rejects this value.
 
         Category and key play no part: a tombstone stops a value, not a key, so a rejected value
         cannot come back under a new key or category. Scopes stay separate, so one tenant's
-        rejection neither blocks nor reveals another tenant's writes.
+        rejection neither blocks nor reveals another tenant's writes. A hit must carry a valid
+        ``tombstone_mac`` (:meth:`_verify_tombstone_row`); an edited row raises ``VaultIntegrityError``.
         """
         cursor.execute(
             """
-            SELECT category, key, reason, author_id FROM rejected_value_tombstones
+            SELECT category, key, reason, author_id, scope, value_sha256, canonical_sha256, tombstone_mac
+            FROM rejected_value_tombstones
             WHERE (scope = ? OR scope = '*')
               AND (value_sha256 = ? OR (canonical_sha256 != '' AND canonical_sha256 = ?))
             LIMIT 1
             """,
             (scope, val_hash, can_hash),
         )
-        return cursor.fetchone()
+        row = cursor.fetchone()
+        if row is not None:
+            self._verify_tombstone_row(row)
+        return row
 
     def _value_copies(self, cursor: Any, scope: str, val_hash: str, can_hash: str) -> List[Dict[str, Any]]:
         """Every stored row in ``scope`` (every scope for ``'*'``) that holds the value, live or archived.
@@ -224,13 +228,14 @@ class TombstoneMixin:
                 """
                 INSERT OR REPLACE INTO rejected_value_tombstones (
                     category, key, value_sha256, canonical_sha256, reason, author_id, created_at, scope,
-                    sealed_digests
+                    sealed_digests, tombstone_mac
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     category, key, val_hash, can_hash, reason, author_id, now, scope,
                     self._seal_digests(scope, category, key, plain_exact, plain_canonical),
+                    self._tombstone_mac(scope, category, key, val_hash, can_hash),
                 ),
             )
             # Physical purge of the entity (the FTS index follows through triggers)

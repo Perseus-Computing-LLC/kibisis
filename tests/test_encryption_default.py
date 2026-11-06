@@ -166,17 +166,22 @@ class TestEncryptionByDefault(unittest.TestCase):
         self.assertEqual(v.migrate_plaintext(), {"migrated": 0, "remaining_plaintext": 0})
 
     def test_passphrase_vault_reopens_when_sqlcipher3_is_missing(self):
-        """Without sqlcipher3 the file stays plain SQLite. Opening it again must work, and the first open
-        with sqlcipher3 converts it."""
+        """Without sqlcipher3 the file stays plain SQLite, which the caller must opt into (allow_plaintext=True
+        or KIBISIS_ALLOW_PLAINTEXT=1). Opening it again must work, and the first open with sqlcipher3 converts it."""
         from unittest import mock
 
         import kibisis.vault as vault_module
 
         with mock.patch.object(vault_module, "sqlcipher3", sqlite3):
-            v = SQLiteMemoryVault(self.db, passphrase=PASS)
+            with self.assertRaises(EncryptionRequiredError) as refused:
+                SQLiteMemoryVault(self.db, passphrase=PASS)
+            self.assertIn("plain text", str(refused.exception))
+            v = SQLiteMemoryVault(self.db, passphrase=PASS, allow_plaintext=True)
+            self.assertFalse(v.encrypted_at_rest)
             v.put("c", "k", f"sealed {CANARY}")
             v.close()
-            again = SQLiteMemoryVault(self.db, passphrase=PASS)
+            with mock.patch.dict(os.environ, {"KIBISIS_ALLOW_PLAINTEXT": "1"}):
+                again = SQLiteMemoryVault(self.db, passphrase=PASS)
             self.assertEqual(again.get("c", "k").content, f"sealed {CANARY}")
             again.close()
         with open(self.db, "rb") as fh:
