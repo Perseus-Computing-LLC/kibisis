@@ -223,38 +223,83 @@ class EntryIntegrityMixin:
             self._conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)).fetchone()
         )
 
-    def _keyless_rows(self) -> Tuple[int, int]:
-        """(entity rows, tombstone rows) of a file that holds no ``kdf_salt``."""
+    #: ``vault_meta`` keys a keyed open writes on its own at the first open; anything else in the table
+    #: of a salt-less file is content the file carried (a pinned quorum, a journal floor, an index format).
+    _INIT_META_KEYS: Tuple[str, ...] = ("kdf_salt", "integrity_format", "key_check", "meta_mac")
+
+    def _keyless_content(self) -> Tuple[int, int, int, List[str]]:
+        """(entity rows, tombstone rows, journal events, non-init ``vault_meta`` keys) of a file that
+        holds no ``kdf_salt``: everything a keyless file can carry that a fresh vault does not."""
         entries = self._conn.execute("SELECT count(*) FROM entities").fetchone()[0] if self._table_exists("entities") else 0
         tombstones = (
             self._conn.execute("SELECT count(*) FROM rejected_value_tombstones").fetchone()[0]
             if self._table_exists("rejected_value_tombstones") else 0
         )
-        return int(entries), int(tombstones)
+        events = self._conn.execute("SELECT count(*) FROM audit_journal").fetchone()[0] if self._table_exists("audit_journal") else 0
+        meta_keys: List[str] = []
+        if self._table_exists("vault_meta"):
+            placeholders = ", ".join("?" for _ in self._INIT_META_KEYS)
+            meta_keys = sorted(
+                str(r[0]) for r in self._conn.execute(
+                    f"SELECT key FROM vault_meta WHERE key NOT IN ({placeholders})", self._INIT_META_KEYS
+                ).fetchall()
+            )
+        return int(entries), int(tombstones), int(events), meta_keys
+
+    def _keyless_rows(self) -> Tuple[int, int]:
+        """(entity rows, tombstone rows) of a file that holds no ``kdf_salt``."""
+        entries, tombstones, _events, _meta = self._keyless_content()
+        return entries, tombstones
 
     def _refuse_unadopted_keyless_rows(self) -> None:
-        """The salt-absent door (R5-1). A file with no ``kdf_salt`` reads as a vault that never had a
-        passphrase, and the first keyed open adopts its plaintext rows into the keyed vault. A keyed
+        """The salt-absent door (R5-1, R6-1). A file with no ``kdf_salt`` reads as a vault that never
+        had a passphrase, and the first keyed open adopts what it holds into the keyed vault. A keyed
         vault whose ``vault_meta`` was deleted whole (salt included) and whose rows were flattened to
-        plaintext by a file writer looks exactly the same, so the adoption is never silent: a file with
-        rows is refused unless the open passed ``adopt_keyless=True``, and then every adopted row
-        becomes a ``candidate`` (:meth:`_migrate_integrity`). A tombstone row in such a file is refused
-        outright: it would be MAC-signed on nobody's word; lift it in the keyless vault first. A file
-        with no rows and no tombstones is a fresh vault and needs no opt-in. Runs before
-        ``_init_schema`` so the refused file is not written to."""
+        plaintext by a file writer looks exactly the same, so the adoption is never silent. The gate
+        is on ANY content, not on rows alone: entity rows, tombstone rows, journal events, or a
+        ``vault_meta`` record a first keyed open does not write itself (a pinned quorum, a journal
+        floor). Only a file with none of these is a fresh vault that needs no opt-in.
+
+        - Rows (with or without a journal) are refused unless the open passed ``adopt_keyless=True``;
+          with it every adopted row is stored as a model-origin ``candidate``
+          (:meth:`_demote_adopted_row`) and the journal is chained under the signed head, counted in
+          the ``migrate`` event.
+        - A tombstone row is refused outright, with or without the opt-in: it would be MAC-signed on
+          nobody's word; lift it in the keyless vault first.
+        - A journal with no rows is refused outright, with or without the opt-in: there is nothing to
+          adopt, and chaining the events under the signed head would sign a history nobody vouched for
+          (the keyless mirror of the salted empty reset, R5-2). Start a new vault, or open this one
+          without a passphrase.
+        - ``vault_meta`` records alone (no rows, no journal) are refused without the opt-in; with it
+          the open proceeds and the ``migrate`` event names the records (``empty_keyless_file``).
+
+        Runs before ``_init_schema`` so the refused file is not written to."""
         if self._has_meta_key("kdf_salt"):
             return
-        entries, tombstones = self._keyless_rows()
+        entries, tombstones, events, meta_keys = self._keyless_content()
+        opted_in = bool(getattr(self, "_adopt_keyless", False))
         if tombstones:
             raise VaultIntegrityError(
                 f"{self.db_path}: this file has no salt but holds {tombstones} tombstone rows; a tombstone adopted "
                 "from a keyless file would be signed on nobody's word. Lift the tombstones in the keyless vault "
                 "(open it without a passphrase) before giving it one."
             )
-        if entries and not getattr(self, "_adopt_keyless", False):
+        if events and not entries:
+            raise VaultIntegrityError(
+                f"{self.db_path}: this file has no salt, no entries and a journal of {events} events; a keyless file "
+                "with a journal and no entries is not adoptable: the events would be chained under a signed head on "
+                "nobody's word. Start a new vault, or open this one without a passphrase."
+            )
+        if entries and not opted_in:
             raise VaultIntegrityError(
                 f"{self.db_path}: this file has {entries} plaintext entries and no salt; a keyed vault whose records "
                 "were removed looks the same; pass adopt_keyless=True to adopt them as candidates"
+            )
+        if meta_keys and not opted_in:
+            raise VaultIntegrityError(
+                f"{self.db_path}: this file has no salt and no entries but holds vault_meta records "
+                f"({', '.join(meta_keys)}); a keyed vault whose records were removed looks the same; pass "
+                "adopt_keyless=True to adopt it"
             )
 
     def _vault_salt(self) -> bytes:
@@ -333,35 +378,87 @@ class EntryIntegrityMixin:
 
     #: Metadata an entry carries only because a person or the vault's own admission path established it;
     #: cleared when a row is adopted from a keyless file (R5-1), as a model-origin write never carries them.
+    #: Kept for callers that enumerate it; :meth:`_demote_adopted_row` now drops the whole reserved set
+    #: ``_put`` refuses from a payload (:data:`~kibisis.vault.RESERVED_METADATA_KEYS`), which covers these.
     _TRUST_METADATA_KEYS: Tuple[str, ...] = (
         "human_reviews", "attestations", "verification_pending", "act_class_capped_from",
         "trust_inherited_from", "last_verified_at",
     )
 
+    #: Supersession facts the vault derives on its own write path (K-R2) and never takes from a payload:
+    #: the metadata mirrors of the ``supersedes``/``superseded_by`` columns and a revival note.
+    _SUPERSESSION_METADATA_KEYS: Tuple[str, ...] = (
+        "supersedes", "superseded_by", "revived_from", "supersession_approved_by", "quorum_at_verification",
+        "trust_capped_from",
+    )
+
     def _demote_adopted_row(self, cursor: Any, entity_id: int) -> None:
-        """Make an entry adopted from a keyless file a ``candidate`` with its trust facts reset
-        (:data:`_TRUST_METADATA_KEYS` dropped, ``adopted_from_keyless_file`` stamped). The origin and
-        origin class stay as stored; what is reset is anything that would count as a person's word."""
-        row = cursor.execute("SELECT metadata_json, epistemic_state FROM entities WHERE id = ?", (entity_id,)).fetchone()
+        """Store an entry adopted from a keyless file exactly as a model-origin ``put`` would store it
+        (R5-1, R6-2). Nothing in a keyless file vouches for anything, so the row is re-derived the way
+        ``_put`` derives an agent write: ``epistemic_state = candidate``, ``origin_class = agent``,
+        ``act_class = inform``, the ``origin`` column ``model``; every key ``_put`` refuses from a
+        payload (:data:`~kibisis.vault.RESERVED_METADATA_KEYS` and the ``lineage_*`` prefix) is
+        dropped; every principal-only key (:data:`~kibisis.vault.PRINCIPAL_METADATA_KEYS`:
+        ``author_id``, ``supersession``, ``proposed_supersedes``, ``slot``, ``last_verified_at``) is
+        moved under ``agent_metadata`` as ``_put`` does for a non-principal write; the supersession
+        facts the vault derives itself (:data:`_SUPERSESSION_METADATA_KEYS`, and the ``supersedes`` and
+        ``superseded_by`` columns) are cleared. The stored state and origin are recorded in
+        ``adopted_from_keyless_file`` as a label of what the file said, nothing more. A forged
+        principal-class row therefore neither blocks an agent's later write (K-R1) nor outranks it, and
+        a person's later verdict yields what a verdict on an agent's candidate yields."""
+        from .vault import PRINCIPAL_METADATA_KEYS, _reserved_metadata_keys  # vault imports this module
+
+        row = cursor.execute(
+            "SELECT metadata_json, epistemic_state, origin, supersedes, superseded_by FROM entities WHERE id = ?",
+            (entity_id,),
+        ).fetchone()
         try:
             meta = json.loads(row["metadata_json"] or "{}")
         except (TypeError, ValueError):
             meta = {}
         if not isinstance(meta, dict):
             meta = {}
-        for name in self._TRUST_METADATA_KEYS:
+        stamp: Dict[str, Any] = {"at": time.time(), "stored_state": row["epistemic_state"], "stored_origin": row["origin"]}
+        dropped = _reserved_metadata_keys(meta)  # the same set _put drops from a caller's payload
+        for name in dropped:
             meta.pop(name, None)
-        meta["adopted_from_keyless_file"] = {"at": time.time(), "stored_state": row["epistemic_state"]}
+        for name in self._SUPERSESSION_METADATA_KEYS:
+            if name in meta:
+                meta.pop(name)
+                dropped.append(name)
+        if row["supersedes"] or row["superseded_by"]:
+            stamp["supersession_cleared"] = {"supersedes": row["supersedes"], "superseded_by": row["superseded_by"]}
+        moved = sorted(k for k in meta if k in PRINCIPAL_METADATA_KEYS)
+        if moved:
+            agent_meta = meta.get("agent_metadata")
+            agent_meta = dict(agent_meta) if isinstance(agent_meta, dict) else {}
+            for k in moved:
+                agent_meta[k] = meta.pop(k)
+            meta["agent_metadata"] = agent_meta
+        if dropped:
+            stamp["dropped_metadata_keys"] = sorted(dropped)
+        if moved:
+            stamp["moved_under_agent_metadata"] = moved
+        meta["origin_class"] = "agent"
+        meta["act_class"] = "inform"
+        meta["adopted_from_keyless_file"] = stamp
         cursor.execute(
-            "UPDATE entities SET epistemic_state = ?, metadata_json = ? WHERE id = ?",
+            "UPDATE entities SET epistemic_state = ?, metadata_json = ?, origin = 'model', supersedes = NULL, "
+            "superseded_by = NULL WHERE id = ?",
             (EpistemicState.CANDIDATE.value, json.dumps(meta, sort_keys=True), entity_id),
         )
 
     def keyless_adoption(self) -> Optional[Dict[str, Any]]:
         """What the latest ``migrate`` event says about rows adopted from a keyless file (R5-1):
-        ``{"entries": n, "at": timestamp, "sequence": s}`` when it adopted any, else None. Shown by
-        ``health`` and ``review list`` for as long as the event is the latest migration, since every
-        adopted row is a candidate on nobody's word until a person reviews it."""
+        ``{"entries": n, "events": e, "at": timestamp, "sequence": s}`` when it adopted any, else
+        None (``events`` is how many of the file's journal events were chained under the signed head
+        on the file's word, R6-1). Shown by ``health`` and ``review list`` for as long as the event is
+        the latest migration, since every adopted row is a candidate on nobody's word until a person
+        reviews it. A read-only open with the opt-in (which demotes the rows in memory and writes
+        nothing, R6-3) reports its in-memory adoption with ``sequence`` None."""
+        view = getattr(self, "_keyless_adoption_view", None)
+        if view:
+            return dict(view)
         try:
             row = self._conn.execute(
                 "SELECT sequence, timestamp, metadata_json FROM audit_journal WHERE action = 'migrate' "
@@ -378,7 +475,9 @@ class EntryIntegrityMixin:
         adopted = meta.get("entries_adopted_from_keyless_vault") if isinstance(meta, dict) else None
         if not isinstance(adopted, int) or isinstance(adopted, bool) or adopted <= 0:
             return None
-        return {"entries": adopted, "at": float(row["timestamp"]), "sequence": int(row["sequence"])}
+        events = meta.get("journal_events_adopted_from_keyless_vault")
+        events = events if isinstance(events, int) and not isinstance(events, bool) and events >= 0 else 0
+        return {"entries": adopted, "events": events, "at": float(row["timestamp"]), "sequence": int(row["sequence"])}
 
     def _open_entry(self, r: Any) -> str:
         """Content of a stored row, after its integrity checks.
@@ -954,9 +1053,13 @@ class EntryIntegrityMixin:
         writer removed: nothing in the file tells them apart, R5-1) reaches this only with
         ``adopt_keyless=True`` (:meth:`_refuse_unadopted_keyless_rows`). Its rows are adopted
         regardless of signature, since the keyless signing key is computable from the path, and each
-        becomes a ``candidate`` with its attestations, reviews and trust-derived metadata reset, as a
-        model-origin write would be stored: ``entries_adopted_from_keyless_vault`` counts them and a
-        person's verdict is what makes any of them ``verified`` again.
+        is stored as a model-origin ``put`` stores an agent's write (:meth:`_demote_adopted_row`: a
+        ``candidate``, ``origin_class`` ``agent``, ``act_class`` ``inform``, reserved and principal-only
+        metadata dropped or moved under ``agent_metadata``, supersession links cleared, R6-2):
+        ``entries_adopted_from_keyless_vault`` counts them, ``journal_events_adopted_from_keyless_vault``
+        counts the file's journal events chained under the signed head on its word (R6-1), and a
+        person's verdict is what makes any of them ``verified`` again. A keyless file with a journal
+        and no rows is refused here as well as at the gate.
         """
         counts: Dict[str, Any] = {
             "entries_resealed": 0,
@@ -984,10 +1087,27 @@ class EntryIntegrityMixin:
                 "author_id, metadata_json, format FROM audit_journal ORDER BY sequence ASC"
             ).fetchall()
             if not (rows or tombstones or events):
+                adopted_meta: List[str] = []
+                if not self._was_keyed:
+                    adopted_meta = self._keyless_content()[3]
                 self._set_meta(cursor, "integrity_format", 2)
                 self._set_meta(cursor, "key_check", self._key_check_value())
-                if not self._was_keyed:
+                if not self._was_keyed and not adopted_meta:
                     return None  # a fresh vault: nothing was here before this open
+                if not self._was_keyed:
+                    # A keyless file with no rows and no journal but vault_meta records a first keyed open
+                    # never writes (a pinned quorum, say): admitted only with the opt-in
+                    # (_refuse_unadopted_keyless_rows); say so in the journal (R6-1).
+                    self._record_audit_event(
+                        cursor=cursor, action="migrate", category="", key="", scope="*", value_sha256="",
+                        metadata={"integrity_format": 2, "previous_head": "0" * 64, "previous_chain_valid": True,
+                                  "empty_keyless_file": True, "vault_meta_keys_adopted": adopted_meta,
+                                  "entries_adopted_from_keyless_vault": 0,
+                                  "journal_events_adopted_from_keyless_vault": 0, **counts},
+                    )
+                    return {"empty_keyless_file": True, "vault_meta_keys_adopted": adopted_meta,
+                            "entries_adopted_from_keyless_vault": 0, "journal_events_adopted_from_keyless_vault": 0,
+                            **counts}
                 # A salted file with nothing in it: the one reset the a5 discriminator admits (or a vault
                 # that was emptied). Say so in the journal, so it never reads as a vault created fresh.
                 self._record_audit_event(
@@ -1016,6 +1136,14 @@ class EntryIntegrityMixin:
                     "adopted from a keyless file would be signed on nobody's word. Lift the tombstones in the "
                     "keyless vault (open it without a passphrase) before giving it one."
                 )
+            if not was_keyed and events and not rows:
+                # The same rule _refuse_unadopted_keyless_rows applies before _init_schema (R6-1), kept here
+                # so no caller order can chain a keyless journal with nothing to adopt under the signed head.
+                raise VaultIntegrityError(
+                    f"{self.db_path}: this file has no salt, no entries and a journal of {len(events)} events; a "
+                    "keyless file with a journal and no entries is not adoptable: the events would be chained under "
+                    "a signed head on nobody's word. Start a new vault, or open this one without a passphrase."
+                )
             # With a salt present the file passed ``_refuse_unless_genuine_a5`` before ``_init_schema``: every
             # row is sealed the way a5 sealed it and opens under the passphrase, and an empty table has no
             # unpurged entry event behind it. The chain check below is necessary (a journal that does not
@@ -1023,6 +1151,9 @@ class EntryIntegrityMixin:
             # keyed element, so the opened rows are what authenticate the file (R2-B1, R3-AB2, R4-1).
             if not was_keyed:
                 counts["entries_adopted_from_keyless_vault"] = 0
+                # The file's journal is chained under the signed head below only because rows were adopted
+                # with the opt-in; the count says how many events were taken on the file's word (R6-1).
+                counts["journal_events_adopted_from_keyless_vault"] = len(events)
             reseal: List[Tuple[Any, str]] = []
             opened = verified = 0
             for r in rows:

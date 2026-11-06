@@ -61,7 +61,10 @@ from datetime import datetime, timezone
 from typing import Any, List, Optional
 
 from ._operator import NotInteractive, account_identity, require_terminal
-from .config import ENV_VERIFICATION_QUORUM, ConfigError, default_db_path, open_vault, parse_verification_quorum, resolve_scope
+from .config import (
+    ENV_VERIFICATION_QUORUM, ConfigError, cli_refusal_text, default_db_path, open_vault, parse_verification_quorum,
+    resolve_scope,
+)
 from .models import EpistemicState
 from .protocols import EncryptionRequiredError
 
@@ -102,10 +105,32 @@ def _add_adopt_keyless(cmd: argparse.ArgumentParser) -> None:
         "--adopt-keyless",
         action="store_true",
         help=(
-            "adopt the entries of a vault file that has no salt (written without a passphrase) into this "
-            "keyed vault, as candidates; a keyed vault whose records were removed looks the same, so this "
-            "is refused without the flag"
+            "at the open, before this verdict runs: adopt the entries of a vault file that has no salt (written "
+            "without a passphrase) into this keyed vault, each stored as a model-origin candidate; a keyed vault "
+            "whose records were removed looks the same, so the open is refused without the flag. The adoption "
+            "is written even when the verdict itself is then refused"
         ),
+    )
+
+
+def _adoption_line(vault: Any) -> Optional[str]:
+    """What the latest migration adopted from a keyless file (R5-1), or None: those entries are
+    candidates on nobody's word until a person reviews them."""
+    report = getattr(vault, "keyless_adoption", None)
+    adopted = report() if callable(report) else None
+    if not adopted:
+        return None
+    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(adopted["at"]))
+    n = adopted["entries"]
+    where = (
+        f"journal sequence {adopted['sequence']}" if adopted.get("sequence") is not None
+        else "in memory only: this read-only open wrote nothing"
+    )
+    events = adopted.get("events") or 0
+    chained = f", with {events} of the file's journal events chained on its word" if events else ""
+    return (
+        f"{n} {'entry' if n == 1 else 'entries'} adopted from a keyless file on {when} ({where}){chained}: "
+        "candidates until reviewed; nothing in the file vouched for them"
     )
 
 
@@ -196,21 +221,6 @@ def _quorum_line(vault: Any) -> str:
     return f"quorum {quorum} — {who} (pinned in the vault){tail}"
 
 
-def _adoption_line(vault: Any) -> Optional[str]:
-    """What the latest migration adopted from a keyless file (R5-1), or None: those entries are
-    candidates on nobody's word until a person reviews them."""
-    report = getattr(vault, "keyless_adoption", None)
-    adopted = report() if callable(report) else None
-    if not adopted:
-        return None
-    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(adopted["at"]))
-    n = adopted["entries"]
-    return (
-        f"{n} {'entry' if n == 1 else 'entries'} adopted from a keyless file on {when} (journal sequence "
-        f"{adopted['sequence']}): candidates until reviewed; nothing in the file vouched for them"
-    )
-
-
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parser().parse_args(argv)
     if args.command != "list":
@@ -235,10 +245,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             vault = open_vault(db_path, pin_quorum=True, adopt_keyless=bool(getattr(args, "adopt_keyless", False)))
     except (ConfigError, EncryptionRequiredError) as exc:
-        print(f"kibisis-review: {exc}", file=sys.stderr)
+        print(f"kibisis-review: {cli_refusal_text(exc)}", file=sys.stderr)
         return 2
     except (ValueError, PermissionError) as exc:  # wrong passphrase, not a vault, needs a writable open first
-        print(f"kibisis-review: {exc}", file=sys.stderr)
+        print(f"kibisis-review: {cli_refusal_text(exc)}", file=sys.stderr)
         return 2
     print(f"vault {db_path}  scope {scope!r}", file=sys.stderr)
     print(_quorum_line(vault), file=sys.stderr)

@@ -212,46 +212,78 @@ def _forge_metadata(p, **per_key):
     c.close()
 
 
-def test_attack_r6_2_adopted_candidates_keep_forged_origin_class_act_class_and_block_agent_writes(tmp_path):
-    """With the opt-in, every adopted row is a candidate, but ``_demote_adopted_row`` keeps the
-    reserved K-R1 keys the vault never takes from a payload: ``origin_class=principal`` and
-    ``act_class=act`` survive. A forged principal-class candidate then refuses the agent's write on
-    that key (OriginClassError) exactly like a tombstone would, and a forged ``superseded_by`` column
-    refuses it (SupersededEntryError) — the tombstone-like outcome adoption refuses for tombstone rows."""
+def test_fixed_r6_2_adopted_candidates_are_stored_as_a_model_origin_put_and_never_block_agent_writes(tmp_path):
+    """With the opt-in, every adopted row is re-derived as ``_put`` derives a model-origin write (R6-2):
+    ``origin_class=agent``, ``act_class=inform``, the reserved keys dropped, ``author_id`` moved under
+    ``agent_metadata``, the forged ``superseded_by`` column cleared. A forged principal-class row
+    therefore neither refuses the agent's later write on the key (K-R1) nor outranks it, and a forged
+    ``superseded_by`` never refuses it (K-R2). The adoption stamp records what the file said."""
     p = R5._laundered_keyless_file(tmp_path)
     c = M._conn(p)
     c.execute("UPDATE entities SET origin = 'model'")
     c.execute("UPDATE entities SET superseded_by = 'decision:other' WHERE key = 'k2'")
     c.commit()
     c.close()
-    _forge_metadata(p, k0={"origin_class": "principal", "act_class": "act", "author_id": "alice"},
+    _forge_metadata(p, k0={"origin_class": "principal", "act_class": "act", "author_id": "alice",
+                           "attestations": [{"by": "alice"}], "trust_capped_from": "verified",
+                           "proposed_supersedes": "decision:k1", "supersession": {"approved_by": "alice"}},
                     k1={"origin_class": "principal", "act_class": "act", "human_reviews": [{"reviewer_id": "x", "verdict": "verified"}]})
     v = _open(p, adopt_keyless=True)
     try:
         assert v.integrity_upgrade["entries_adopted_from_keyless_vault"] == 3
         for key in ("k0", "k1", "k2"):
-            e = v.get("decision", key, scope="default", include_candidates=True) if "include_candidates" in v.get.__code__.co_varnames else v.get("decision", key, scope="default")
+            e = v.get("decision", key, scope="default")
             assert e is not None and e.epistemic_state.value == "candidate"
-            assert "human_reviews" not in (e.metadata or {})
+            meta = e.metadata or {}
+            assert "human_reviews" not in meta
+            assert meta.get("origin_class") == "agent"
+            assert meta.get("act_class") == "inform"
+            assert e.origin == "model"
+            assert meta["adopted_from_keyless_file"]["stored_state"] == "verified"
+            for reserved in ("author_id", "superseded_by", "supersedes", "proposed_supersedes", "attestations",
+                             "trust_capped_from", "supersession"):
+                assert reserved not in meta, reserved
         k0 = v.get("decision", "k0", scope="default")
-        # DEFECT: the reserved keys a model-origin write could never carry are kept on the adopted candidate
-        assert k0.metadata.get("origin_class") == "principal"
-        assert k0.metadata.get("act_class") == "act"
-        assert k0.metadata.get("author_id") == "alice"
-        # ... and the agent is now locked out of the key by K-R1 (a block without any tombstone)
-        with pytest.raises(OriginClassError):
-            v.remember("decision", "k0", "the agent's own fact", origin="model", author_id="mcp-agent")
-        # ... and by K-R2 on the forged superseded_by column
-        with pytest.raises(SupersededEntryError):
-            v.remember("decision", "k2", "the agent's own fact", origin="model", author_id="mcp-agent")
+        assert k0.metadata["agent_metadata"]["author_id"] == "alice"  # moved, as _put moves it for an agent
+        stamp = k0.metadata["adopted_from_keyless_file"]
+        assert "origin_class" in stamp["dropped_metadata_keys"] and "attestations" in stamp["dropped_metadata_keys"]
+        k2 = v.get("decision", "k2", scope="default")
+        assert k2.metadata["adopted_from_keyless_file"]["supersession_cleared"]["superseded_by"] == "decision:other"
+        # The agent's own later write lands on both keys: no K-R1 block, no K-R2 block
+        e = v.remember("decision", "k0", "the agent's own fact", origin="model", author_id="mcp-agent")
+        assert e.content == "the agent's own fact"
+        e = v.remember("decision", "k2", "the agent's own fact", origin="model", author_id="mcp-agent")
+        assert e.content == "the agent's own fact"
     finally:
         v.close()
 
 
-def test_attack_r6_2b_a_persons_approve_of_the_adopted_candidate_yields_a_verified_principal_act_entry(tmp_path):
-    """Review the adopted row as a person would (one verdict, quorum 1): the forged origin_class and
-    act_class ride through the verdict into a verified, principal-class, ``act`` entry — the reviewer
-    saw content, not the reserved keys."""
+def test_fixed_r6_2_demotion_uses_the_reserved_key_set_put_uses(tmp_path):
+    """The demotion drops exactly what ``_put`` refuses from a payload: the module's reserved-key set
+    (plus the ``lineage_*`` prefix), not a second list that could drift from it."""
+    from kibisis.vault import RESERVED_METADATA_KEYS, _reserved_metadata_keys
+
+    p = R5._laundered_keyless_file(tmp_path)
+    forged = {k: "x" for k in RESERVED_METADATA_KEYS}
+    forged["lineage_parent"] = "x"
+    forged["note"] = "kept"
+    _forge_metadata(p, k0=forged)
+    v = _open(p, adopt_keyless=True)
+    try:
+        meta = v.get("decision", "k0", scope="default").metadata
+        assert meta["note"] == "kept"
+        assert meta["origin_class"] == "agent" and meta["act_class"] == "inform"
+        leftover = set(_reserved_metadata_keys(meta))
+        assert leftover <= {"origin_class", "act_class", "adopted_from_keyless_file"}, leftover
+        assert "lineage_parent" not in meta
+    finally:
+        v.close()
+
+
+def test_fixed_r6_2b_a_persons_approve_of_the_adopted_candidate_yields_what_an_agent_candidate_yields(tmp_path):
+    """Review the adopted row as a person would (one verdict, quorum 1): the verified entry is what a
+    verdict on an agent's own candidate produces, ``origin_class=agent`` and ``act_class=inform``;
+    the forged ``principal``/``act`` never rides through the verdict."""
     p = R5._laundered_keyless_file(tmp_path)
     c = M._conn(p)
     c.execute("UPDATE entities SET origin = 'model'")
@@ -262,8 +294,8 @@ def test_attack_r6_2b_a_persons_approve_of_the_adopted_candidate_yields_a_verifi
     try:
         e = v.review_entity("decision", "k0", "verified", scope="default", reviewer_id="operator", reviewer_origin="user")
         assert e.epistemic_state.value == "verified"
-        assert e.metadata.get("origin_class") == "principal"   # DEFECT: never established by anyone
-        assert e.metadata.get("act_class") == "act"            # DEFECT: an action-driving entry on nobody's word
+        assert e.metadata.get("origin_class") == "agent"
+        assert e.metadata.get("act_class") == "inform"
     finally:
         v.close()
 
@@ -291,27 +323,52 @@ def test_control_read_only_open_with_opt_in_writes_nothing(tmp_path):
     before = _snap(p)
     v = _open(p, read_only=True, adopt_keyless=True)
     try:
-        rows = v.list_entities()
+        rows = v.list_entities(epistemic_state="candidate")
+        assert v.list_entities() == []  # nothing served as verified
     finally:
         v.close()
     assert _snap(p) == before
     assert rows
 
 
-def test_attack_r6_3_read_only_open_with_opt_in_serves_the_forged_rows_undemoted_as_verified(tmp_path):
-    """The docstring says: with adopt_keyless 'every adopted entry becomes a candidate ... read-only
-    or writable'. Read-only cannot demote: the forged rows come back exactly as the writer wrote them,
-    state ``verified``, content ``FORGED``."""
+def test_fixed_r6_3_read_only_open_with_opt_in_serves_the_rows_demoted_as_the_writable_adoption_would(tmp_path):
+    """A read-only open cannot write the demotion, so it applies it to a private in-memory copy (R6-3):
+    every row comes back a model-origin candidate, the forged ``verified`` state is never served, the
+    file is byte for byte unchanged, and ``keyless_adoption()`` says the rows were adopted (no journal
+    sequence: nothing was written). The writable adoption of the same file stores the same rows."""
     p = R5._laundered_keyless_file(tmp_path)
+    _forge_metadata(p, k0={"origin_class": "principal", "act_class": "act", "author_id": "alice"})
+    before = _snap(p)
     v = _open(p, read_only=True, adopt_keyless=True)
     try:
-        rows = v.list_entities()
-        assert rows, "nothing served"
-        assert all(r.epistemic_state.value == "verified" for r in rows)
-        assert all(r.content.startswith("FORGED") for r in rows)
-        assert v.keyless_adoption() is None  # nothing says they were adopted
+        assert v.list_entities() == []
+        rows = v.list_entities(epistemic_state="candidate")
+        assert rows and all(r.epistemic_state.value == "candidate" for r in rows)
+        served = {r.key: (r.origin, r.metadata.get("origin_class"), r.metadata.get("act_class"),
+                          r.metadata.get("author_id"), (r.metadata.get("agent_metadata") or {}).get("author_id"))
+                  for r in rows}
+        adopted = v.keyless_adoption()
+        assert adopted and adopted["entries"] == 3 and adopted["sequence"] is None
     finally:
         v.close()
+    assert _snap(p) == before
+    w = _open(p, adopt_keyless=True)
+    try:
+        stored = {r.key: (r.origin, r.metadata.get("origin_class"), r.metadata.get("act_class"),
+                          r.metadata.get("author_id"), (r.metadata.get("agent_metadata") or {}).get("author_id"))
+                  for r in w.list_entities(epistemic_state="candidate")}
+    finally:
+        w.close()
+    assert served == stored
+    assert served["k0"] == ("model", "agent", "inform", None, "alice")
+
+
+def test_control_read_only_open_without_opt_in_still_refuses_the_laundered_file(tmp_path):
+    p = R5._laundered_keyless_file(tmp_path)
+    before = _snap(p)
+    with pytest.raises(VaultIntegrityError, match="adopt_keyless"):
+        _open(p, read_only=True)
+    assert _snap(p) == before
 
 
 # --- 1c. Shapes of the keyless file ----------------------------------------------------------------
@@ -346,81 +403,134 @@ def _plant_events(p, author="alice"):
     c.close()
 
 
-def test_attack_r6_1_keyless_file_with_no_rows_and_a_planted_journal_is_signed_without_the_opt_in(tmp_path):
-    """Zero rows + journal events in a salt-less file: ``_refuse_unadopted_keyless_rows`` looks at
-    rows and tombstones only, so the MCP/AML open path (no opt-in) chains the writer's journal into
-    the signed head; ``keyless_adoption()`` is None (0 adopted), so nothing surfaces it. The mirror of
-    R5-2 on the second door."""
+@pytest.mark.parametrize("optin", [False, True])
+def test_fixed_r6_1_keyless_file_with_no_rows_and_a_planted_journal_is_refused_untouched(tmp_path, optin):
+    """Zero rows + journal events in a salt-less file (R6-1): the gate is on any content, so the
+    MCP/AML open path (no opt-in) refuses it before writing, and the opt-in does not change that: a
+    keyless file with a journal and no entries is not adoptable (there is nothing to adopt, and the
+    events would be chained under the signed head on nobody's word, the mirror of R5-2)."""
     p = _keyless_empty(tmp_path)
     _plant_events(p)
-    before = _journal(p)
-    v = open_vault(str(p), env={"KIBISIS_PASSPHRASE": PASS, "KIBISIS_ALLOW_PLAINTEXT": "1"})  # the MCP server's open
+    before = _snap(p)
+    for ro in (False, True):
+        with pytest.raises(VaultIntegrityError, match="journal and no entries is not adoptable") as exc:
+            if optin:
+                _open(p, read_only=ro, adopt_keyless=True)
+            else:
+                open_vault(str(p), env={"KIBISIS_PASSPHRASE": PASS, "KIBISIS_ALLOW_PLAINTEXT": "1"}, read_only=ro)
+        assert "4 events" in str(exc.value)
+        assert _snap(p) == before, (optin, ro)
+    # and the keyless file is still readable as the plaintext vault it is
+    v = SQLiteMemoryVault(str(p), passphrase=None, allow_plaintext=True, auto_gate=False, read_only=True)
     try:
-        assert v.verify_audit_chain() is True
-        assert v.integrity_upgrade is not None and v.integrity_upgrade.get("entries_adopted_from_keyless_vault") == 0
-        assert v.keyless_adoption() is None
-        after = _journal(p)
-        planted = [e for e in after if e["author_id"] == "alice"]
-        assert len(planted) == len(before) == 4
-        assert {e["action"] for e in planted} == {"put", "state_transition", "human_review", "attestations_reset"}
-        assert after[-1]["action"] == "migrate"
-        # the planted events now sit under the real-key chain and audit_head
-        head = M._conn(p).execute("SELECT * FROM audit_head").fetchall()
-        assert head
-    finally:
-        v.close()
-    # and a read-only open afterwards vouches for it
-    v = _open(p, read_only=True)
-    try:
-        assert v.verify_audit_chain() is True
+        assert len(_journal(p)) == 4
     finally:
         v.close()
 
 
-def test_attack_r6_minor_a_foreign_sqlite_file_is_initialised_as_a_vault_by_a_keyed_writable_open(tmp_path):
+def test_fixed_r6_1_keyless_file_with_rows_and_a_journal_counts_the_events_it_chains(tmp_path):
+    """With rows and the opt-in the file's journal is chained under the signed head, and the migrate
+    event says how many events were taken on the file's word; ``keyless_adoption()`` reports them."""
+    p = R5._laundered_keyless_file(tmp_path)
+    _plant_events(p)
+    v = _open(p, adopt_keyless=True)
+    try:
+        assert v.integrity_upgrade["entries_adopted_from_keyless_vault"] == 3
+        assert v.integrity_upgrade["journal_events_adopted_from_keyless_vault"] == 4
+        adopted = v.keyless_adoption()
+        assert adopted["entries"] == 3 and adopted["events"] == 4
+        assert v.verify_audit_chain() is True
+        last = _journal(p)[-1]
+        assert last["action"] == "migrate"
+        assert json.loads(last["metadata_json"])["journal_events_adopted_from_keyless_vault"] == 4
+    finally:
+        v.close()
+
+
+def test_fixed_r6_1_keyless_file_with_only_vault_meta_records_needs_the_opt_in(tmp_path):
+    """No rows, no journal, but a ``vault_meta`` record a first keyed open never writes (a pinned
+    quorum): refused without the opt-in, bytes unchanged; with it the open proceeds and the migrate
+    event names the records. A file with no such record is still a fresh vault, no opt-in needed."""
+    p = _keyless_empty(tmp_path)
+    c = M._conn(p)
+    c.execute("DELETE FROM audit_journal")
+    c.execute("DELETE FROM vault_meta")
+    c.execute("INSERT INTO vault_meta (key, value) VALUES ('verification_quorum', '3')")
+    c.commit()
+    c.close()
+    before = _snap(p)
+    for ro in (False, True):
+        with pytest.raises(VaultIntegrityError, match="vault_meta records \\(verification_quorum\\)"):
+            _open(p, read_only=ro)
+        assert _snap(p) == before
+    v = _open(p, adopt_keyless=True)
+    try:
+        assert v.integrity_upgrade["empty_keyless_file"] is True
+        assert v.integrity_upgrade["vault_meta_keys_adopted"] == ["verification_quorum"]
+        assert v.keyless_adoption() is None  # no entries were adopted
+        assert _journal(p)[-1]["action"] == "migrate"
+        assert json.loads(_journal(p)[-1]["metadata_json"])["vault_meta_keys_adopted"] == ["verification_quorum"]
+    finally:
+        v.close()
+    # the fresh-vault shape: tables, no rows, no journal, only what a first open writes
+    q = _keyless_empty(tmp_path, "fresh.sqlite")
+    c = M._conn(q)
+    c.execute("DELETE FROM audit_journal")
+    c.execute("DELETE FROM vault_meta")
+    c.commit()
+    c.close()
+    v = _open(q)
+    try:
+        assert v.integrity_upgrade is None
+        assert v.list_entities() == []
+    finally:
+        v.close()
+
+
+def test_fixed_r6_minor_a_foreign_sqlite_file_is_refused_by_a_keyed_writable_open(tmp_path):
     """A file that is not a kibisis DB at all (one 'notes' table): read-only refuses ('not a kibisis
-    vault'); the writable keyed open adds the vault schema into it and runs. No adoption, but not a
-    clean error either (the same as 'create a new vault here')."""
+    vault'), and so does the writable keyed open now, with the file left byte for byte as it was. An
+    empty file (no tables) is still a fresh vault."""
     p = tmp_path / "notes.sqlite"
     c = sqlite3.connect(str(p))
     c.execute("CREATE TABLE notes (x TEXT)")
     c.execute("INSERT INTO notes VALUES ('hello')")
     c.commit()
     c.close()
-    with pytest.raises(ValueError, match="not a kibisis vault"):
-        _open(p, read_only=True)
-    v = _open(p)
+    before = _snap(p)
+    for ro in (True, False):
+        with pytest.raises(ValueError, match="not a kibisis vault"):
+            _open(p, read_only=ro)
+        with pytest.raises(ValueError, match="not a kibisis vault"):
+            _open(p, read_only=ro, adopt_keyless=True)
+        assert _snap(p) == before
+    c = sqlite3.connect(str(p))
+    assert c.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall() == [("notes",)]
+    c.close()
+    empty = tmp_path / "empty.sqlite"
+    empty.write_bytes(b"")
+    v = _open(empty)
     try:
         assert v.list_entities() == []
-        assert v.keyless_adoption() is None
     finally:
         v.close()
-    c = sqlite3.connect(str(p))
-    assert c.execute("SELECT x FROM notes").fetchone() == ("hello",)
-    assert c.execute("SELECT count(*) FROM vault_meta WHERE key = 'kdf_salt'").fetchone()[0] == 1
-    c.close()
 
 
-def test_attack_r6_1b_a_keyless_file_without_an_entities_table_is_rebuilt_writable_and_its_journal_signed(tmp_path):
-    """Read-only says 'not a kibisis vault (no entities table)'; the writable keyed open (no opt-in)
-    creates the table, treats the file as fresh and chains the planted journal under the signed head."""
+def test_fixed_r6_1b_a_keyless_file_without_an_entities_table_is_refused_writable_too(tmp_path):
+    """Read-only says 'not a kibisis vault (no entities table)'; the writable keyed open (with or
+    without the opt-in) now says the same, and the planted journal is never chained under a signed head."""
     p = R5._laundered_keyless_file(tmp_path)
     _plant_events(p)
     c = M._conn(p)
     c.execute("DROP TABLE entities")
     c.commit()
     c.close()
-    with pytest.raises(ValueError, match="not a kibisis vault"):
-        _open(p, read_only=True)
-    before = p.read_bytes()
-    v = _open(p)  # no opt-in
-    try:
-        assert v.verify_audit_chain() is True
-        assert [e["author_id"] for e in _journal(p)][:4] == ["alice"] * 4
-        assert v.keyless_adoption() is None
-    finally:
-        v.close()
-    assert p.read_bytes() != before
+    before = _snap(p)
+    for ro in (True, False):
+        for optin in (False, True):
+            with pytest.raises(ValueError, match="not a kibisis vault"):
+                _open(p, read_only=ro, adopt_keyless=optin)
+            assert _snap(p) == before, (ro, optin)
 
 
 @pytest.mark.parametrize("shape", [
@@ -561,12 +671,16 @@ def test_control_quorum_dropped_from_cannot_be_edited_or_deleted_under_a_full_se
         _open(p, pin_quorum=True)  # a verdict run without the env cannot pin the default
 
 
-def test_attack_r6_4_a_planted_quorum_dropped_from_under_a_legacy_mac_is_signed_and_blocks_unnamed_verdicts(tmp_path):
-    """Under a legacy (pre-quorum) MAC nothing binds ``quorum_dropped_from``. A file writer with a
-    pre-quorum copy of the MAC plants ``quorum_dropped_from = 99`` (or a ``verification_quorum = 99``
-    that becomes the floor): the legacy re-sign writes the full-set MAC over it, and from then on every
-    pinning open that names no quorum is refused. The person must name a quorum to clear it (so this is
-    a nuisance, not a lowering), but a value nobody signed became signed."""
+@pytest.mark.parametrize("planted", ["quorum_dropped_from", "both"])
+def test_fixed_r6_4_a_planted_quorum_dropped_from_under_a_legacy_mac_is_dropped_and_logged(tmp_path, planted, caplog):
+    """Under a legacy (pre-quorum) MAC nothing binds ``quorum_dropped_from`` or ``verification_quorum``
+    (R6-4): both are untrusted, both are deleted (named in a WARNING) and the MAC is re-signed without
+    them. A planted ``quorum_dropped_from`` never becomes a floor and never blocks a pinning open that
+    names no quorum. The one floor the re-sign records is the R5-4 one: the dropped
+    ``verification_quorum`` alone (capped at that value, never the planted record), and its refusal
+    says the value was dropped, not that the vault was pinned at it."""
+    import logging
+
     p = tmp_path / "v.sqlite"
     v = _open(p)  # never pinned: the file has no verification_quorum, a full-set MAC
     v.remember("c", "k", "an agent fact", origin="model", author_id="mcp-agent")
@@ -575,19 +689,73 @@ def test_attack_r6_4_a_planted_quorum_dropped_from_under_a_legacy_mac_is_signed_
     c = M._conn(p)
     c.execute("UPDATE vault_meta SET value = ? WHERE key = 'meta_mac'", (legacy,))
     c.execute("INSERT INTO vault_meta (key, value) VALUES ('quorum_dropped_from', '99')")
+    if planted == "both":
+        c.execute("INSERT INTO vault_meta (key, value) VALUES ('verification_quorum', '98')")
     c.commit()
     c.close()
-    v = _open(p)  # a server's open: legacy MAC accepted, re-signed over the planted record
+    with caplog.at_level(logging.WARNING, logger="kibisis.vault"):
+        v = _open(p)  # a server's open: legacy MAC accepted, the planted records dropped, re-signed without them
+    floor = 98 if planted == "both" else None
     try:
-        assert v.quorum_dropped_from == 99
+        assert v.quorum_dropped_from == floor  # never the planted 99
         assert not v._meta_mac_legacy
+        assert v.verification_quorum_stored is None
     finally:
         v.close()
-    v = _open(p, read_only=True)  # now under the full-set MAC: edits would fail, the planted value is signed
-    assert v.quorum_dropped_from == 99
+    warned = [r.getMessage() for r in caplog.records if "not covered by the legacy meta MAC" in r.getMessage()]
+    assert any("quorum_dropped_from" in w and "99" in w for w in warned), warned
+    if planted == "both":
+        assert any("verification_quorum" in w and "98" in w for w in warned), warned
+    c = M._conn(p)
+    assert c.execute("SELECT count(*) FROM vault_meta WHERE key = 'verification_quorum'").fetchone()[0] == 0
+    stored_floor = c.execute("SELECT value FROM vault_meta WHERE key = 'quorum_dropped_from'").fetchone()
+    assert (stored_floor[0] if stored_floor else None) == (str(floor) if floor else None)
+    c.close()
+    v = _open(p, read_only=True)
+    assert v.quorum_dropped_from == floor
     v.close()
-    with pytest.raises(ConfigError, match="pinned at 99"):
-        _open(p, pin_quorum=True)  # the person's verdict without the env is refused
+    if floor is None:
+        v = _open(p, pin_quorum=True)  # the person's verdict without the env is not refused
+        try:
+            assert v.verification_quorum_stored == v.verification_quorum
+        finally:
+            v.close()
+    else:
+        with pytest.raises(ConfigError, match="a stored verification quorum of 98 was dropped") as info:
+            _open(p, pin_quorum=True)
+        assert "99" not in str(info.value)
+        v = _open(p, verification_quorum=2, pin_quorum=True)  # any named quorum clears the floor
+        try:
+            assert v.quorum_dropped_from is None and v.verification_quorum_stored == 2
+        finally:
+            v.close()
+
+
+def test_control_r5_4_a_pinned_quorum_dropped_under_a_legacy_mac_is_still_a_floor(tmp_path):
+    """The R5-4 floor survives R6-4: a quorum a person pinned (under the full-set MAC) that a legacy
+    re-sign then has to drop is kept as ``quorum_dropped_from`` under the new full-set MAC, and a
+    pinning open that names no quorum is refused until the person names it."""
+    p = tmp_path / "v.sqlite"
+    v = _open(p, verification_quorum=3, pin_quorum=True)
+    v.remember("c", "k", "an agent fact", origin="model", author_id="mcp-agent")
+    legacy = R5._v1_mac(v)
+    v.close()
+    c = M._conn(p)
+    c.execute("UPDATE vault_meta SET value = ? WHERE key = 'meta_mac'", (legacy,))
+    c.commit()
+    c.close()
+    v = _open(p)
+    try:
+        assert v.quorum_dropped_from == 3 and v.verification_quorum_stored is None
+    finally:
+        v.close()
+    with pytest.raises(ConfigError, match="dropped at an earlier open"):
+        _open(p, pin_quorum=True)
+    v = _open(p, verification_quorum=3, pin_quorum=True)
+    try:
+        assert v.verification_quorum_stored == 3 and v.quorum_dropped_from is None
+    finally:
+        v.close()
 
 
 # --- 3. Regression sweep -----------------------------------------------------------------------------

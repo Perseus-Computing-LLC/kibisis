@@ -115,19 +115,36 @@ a guarantee beyond what the named code does.
   The second door is the file with no salt at all: `vault_meta` deleted whole, every row flattened to
   plaintext with whatever content and state the writer chose, tombstones dropped. That file is
   indistinguishable from a vault that was written without a passphrase, and the discriminator above
-  does not see it. It is guarded on its own terms (round 5, R5-1): a keyed open (read-only or writable)
-  of a salt-less file that holds entries is refused (`VaultIntegrityError`: "this file has N plaintext
-  entries and no salt; a keyed vault whose records were removed looks the same; pass adopt_keyless=True
-  to adopt them as candidates") unless the caller opted in; only the operator commands behind the
-  terminal check (`kibisis-review <verdict>|lift --adopt-keyless`, the admit command's
-  `--adopt-keyless`) can, never the MCP or AML servers or the OKF commands. With the opt-in every
-  adopted row becomes a `candidate`, its `human_reviews`, `attestations` and trust-derived metadata
-  reset, as a model-origin write would be stored; a tombstone row in such a file refuses the open
-  outright (it would be MAC-signed on nobody's word; lift it in the keyless vault first). The `migrate`
-  event records `entries_adopted_from_keyless_vault`, and `health` (MCP `kibisis_health`), `review
-  list` and `keyless_adoption()` show "N entries adopted from a keyless file on <date>" for as long as
-  that is the latest migration. What the writer gets from this door is therefore a vault of candidates
-  that a person must review one by one, and a notice that says where they came from.
+  does not see it. It is guarded on its own terms (round 5, R5-1; round 6, R6-1..R6-3): a keyed open
+  (read-only or writable) of a salt-less file that holds any content (entry rows, tombstone rows,
+  journal events, or a `vault_meta` record a first keyed open does not write itself) is refused
+  (`VaultIntegrityError`: "this file has N plaintext entries and no salt; a keyed vault whose records
+  were removed looks the same; pass adopt_keyless=True to adopt them as candidates"; the CLIs word it
+  as `--adopt-keyless`) unless the caller opted in; only the operator commands behind the terminal
+  check (`kibisis-review <verdict>|lift --adopt-keyless`, the admit command's `--adopt-keyless`) can,
+  never the MCP or AML servers or the OKF commands. Only a salt-less file with none of these (tables
+  and nothing else) is a fresh vault. A SQLite file that holds tables but no `entities` table is not
+  a vault at all and is refused by every keyed open, writable included ("not a kibisis vault"), with
+  nothing written. With the opt-in every adopted row is stored exactly as a model-origin `put` stores
+  an agent's write: a `candidate` with `origin_class: agent`, `act_class: inform`, origin `model`,
+  every reserved metadata key (`human_reviews`, `attestations`, `origin_class`, `act_class`,
+  `superseded_by`, `supersedes`, `trust_capped_from`, ...) dropped, every principal-only key
+  (`author_id`, `supersession`, `proposed_supersedes`, ...) moved under `agent_metadata`, and its
+  supersession links cleared (`_demote_adopted_row`); what the file said is kept as a label in
+  `adopted_from_keyless_file`. A forged principal-class row therefore neither blocks an agent's later
+  write on the key nor outranks it, and a person's verdict on it yields what a verdict on an agent's
+  candidate yields. A writable open writes that into the file; a read-only open with the opt-in
+  applies the same demotion to a private in-memory copy and writes nothing, so the writer's rows are
+  never served as verified by either. A tombstone row in such a file refuses the open outright (it
+  would be MAC-signed on nobody's word; lift it in the keyless vault first), and so does a journal
+  with no entries ("a keyless file with a journal and no entries is not adoptable"): the events would
+  be chained under the signed head on nobody's word. When rows are adopted, the file's journal is
+  chained under the signed head and the `migrate` event records both
+  `entries_adopted_from_keyless_vault` and `journal_events_adopted_from_keyless_vault`; `health` (MCP
+  `kibisis_health`), `review list` and `keyless_adoption()` show "N entries adopted from a keyless
+  file on <date>" for as long as that is the latest migration. What the writer gets from this door is
+  therefore a vault of agent-class candidates that a person must review one by one, and a notice that
+  says where they came from.
 - *Stalling reads with an absurd KDF cost.* A provider bound to a vault derives keys from the vault's own
   salt at the fixed iteration count only; the salt and count written in an envelope are not used, and a
   foreign salt is refused before any derivation (`AESGCMCryptoEnvelopeProvider.decrypt`, crypto.py). The cap
@@ -163,10 +180,13 @@ also stored in plain text.
   caught (pinned by `tests/test_threat_model_claims.py`). A writer who also removes `kdf_salt`, `key_check`,
   `integrity_format` and the MAC (and flattens every sealed row, since a sealed row without a salt is
   refused) turns the file into one that looks like it never had a passphrase, with whatever rows the
-  writer left in it. An empty such file is told apart from a new vault only by a copy of the head kept
-  outside the file. One with rows is refused by every keyed open until an operator passes
-  `adopt_keyless` at a terminal, and then holds only candidates with a standing notice of the adoption
-  (above, "the second door"); the writer's rows are never served as verified.
+  writer left in it. One with rows is refused by every keyed open until an operator passes
+  `adopt_keyless` at a terminal, and then holds only agent-class candidates with a standing notice of
+  the adoption (above, "the second door"); the writer's rows are never served as verified, by a
+  writable or a read-only open. One with no rows but a journal, a tombstone, or a `vault_meta` record a
+  first open never writes is refused too (a journal with no rows with or without the opt-in). A file
+  the writer emptied of everything but the tables is told apart from a new vault only by a copy of the
+  head kept outside the file.
 - *Reading everything that is not sealed content:* categories, keys, scopes, metadata, states, origins, the
   journal's categories, keys and author ids, and the `entities_fts` index of category, key and scope terms
   (created in `_init_schema`, vault.py). The content column of a sealed row is empty (`_seal`, _vault_crypto.py), so entry text and

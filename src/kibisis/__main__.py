@@ -17,7 +17,7 @@ import os
 import sys
 from typing import Optional, Tuple
 
-from .config import ConfigError, default_db_path, open_vault, resolve_scope, validate_scope
+from .config import ConfigError, cli_refusal_text, default_db_path, open_vault, resolve_scope, validate_scope
 from ._operator import NotInteractive, account_identity, require_terminal
 from .protocols import EncryptionRequiredError
 from .vault import ORIGINS, AdmissionRefused, SQLiteMemoryVault
@@ -60,7 +60,10 @@ def _admit(args: argparse.Namespace) -> int:
         # entries of a vault file that has no salt (--adopt-keyless, R5-1).
         vault = open_vault(args.db, pin_quorum=True, adopt_keyless=bool(args.adopt_keyless))
     except (ConfigError, EncryptionRequiredError) as exc:
-        print(f"refused: {exc}", file=sys.stderr)
+        print(f"refused: {cli_refusal_text(exc)}", file=sys.stderr)
+        return 2
+    except (ValueError, PermissionError) as exc:  # wrong passphrase, not a vault, a keyless file without the flag
+        print(f"refused: {cli_refusal_text(exc)}", file=sys.stderr)
         return 2
     print(f"vault {vault.db_path}  scope {scope!r}", file=sys.stderr)
     if vault.verification_quorum == 1:
@@ -260,9 +263,10 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument(
         "--adopt-keyless", action="store_true",
         help=(
-            "adopt the entries of a vault file that has no salt (written without a passphrase) into this keyed "
-            "vault, as candidates; a keyed vault whose records were removed looks the same, so this is refused "
-            "without the flag"
+            "at the open, before this admission runs: adopt the entries of a vault file that has no salt (written "
+            "without a passphrase) into this keyed vault, each stored as a model-origin candidate; a keyed vault "
+            "whose records were removed looks the same, so the open is refused without the flag. The adoption is "
+            "written even when the admission itself is then refused"
         ),
     )
     a.set_defaults(func=_admit)

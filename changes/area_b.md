@@ -144,6 +144,57 @@ behaviour; the R3-AB4 one is skipped until `fix/round3-entry` merges).
   tried; the path key stays for a vault that never had a passphrase). The genuine a5 fixture still
   migrates, read-only and writable, idempotently.
 
+### Round 6
+
+Review `review_notes/R6.md`. Repro suite `tests/review6_keyless.py` → `tests/test_review6_keyless.py`
+(collected; the seven `test_attack_*` are now `test_fixed_r6_*` asserting the fix; 42 tests).
+
+### Fixed
+
+- **R6-1 / R6-1b (low)** the salt-absent gate is on any content, not on rows alone.
+  `_refuse_unadopted_keyless_rows` (via `_keyless_content()`) counts entity rows, tombstone rows,
+  `audit_journal` events and `vault_meta` keys a first keyed open does not write itself
+  (`_INIT_META_KEYS`: `kdf_salt`, `integrity_format`, `key_check`, `meta_mac`). A keyless file with a
+  journal and no entries is refused with or without the opt-in ("a keyless file with a journal and no
+  entries is not adoptable"), bytes unchanged, both modes; `_migrate_integrity` repeats the rule so no
+  caller order chains such a journal under the signed head. A keyless file with only `vault_meta`
+  records (a planted `verification_quorum`, say) is refused without the opt-in; with it the `migrate`
+  event records `empty_keyless_file: true` and `vault_meta_keys_adopted`. When rows are adopted the
+  file's journal is chained under the signed head and the `migrate` event (and `keyless_adoption()`,
+  key `events`) records `journal_events_adopted_from_keyless_vault`. A SQLite file that holds tables
+  but no `entities` table (another program's database, or a vault whose table was dropped beside a
+  planted journal) is refused by the writable keyed open too (`_refuse_foreign_database` in `_connect`,
+  before `PRAGMA journal_mode` touches the header; `ValueError` "not a kibisis vault"); an empty file
+  (no tables) is still a fresh vault.
+- **R6-2 / R6-2b (low)** `_demote_adopted_row` re-derives an adopted row as `_put` stores a
+  model-origin write: `epistemic_state = candidate`, `origin_class = agent`, `act_class = inform`,
+  `origin = model`, every key `_put` refuses from a payload dropped through the same
+  `vault._reserved_metadata_keys` (the module's `RESERVED_METADATA_KEYS` plus the `lineage_*` prefix),
+  every `PRINCIPAL_METADATA_KEYS` key (`author_id`, `supersession`, `proposed_supersedes`, `slot`,
+  `last_verified_at`) moved under `agent_metadata` as `_put` moves it for an agent, the
+  `supersedes`/`superseded_by` columns and their metadata mirrors (`_SUPERSESSION_METADATA_KEYS`)
+  cleared. The stamp `adopted_from_keyless_file` records `stored_state`, `stored_origin`,
+  `dropped_metadata_keys`, `moved_under_agent_metadata` and `supersession_cleared`. A forged
+  principal-class row no longer refuses an agent's later write (K-R1) nor a forged `superseded_by`
+  (K-R2), and a person's verdict on it yields an agent-class `inform` entry, never `principal`/`act`.
+- **R6-3 (low)** a read-only open with `adopt_keyless=True` on a keyless file serves the rows demoted
+  exactly as the writable adoption stores them: `_adopt_keyless_in_memory` copies the file into a
+  private in-memory connection (`Connection.backup`) and runs `_demote_adopted_row` on every row; the
+  file is byte for byte unchanged and `keyless_adoption()` reports the in-memory adoption with
+  `sequence: None`. The forged `verified` state is never served.
+- **Docs** SECURITY.md ("the second door" and the salt-removal bullet), the constructor docstring, the
+  `_refuse_unadopted_keyless_rows` and `_demote_adopted_row` docstrings and `config.open_vault` now
+  say what the code does: any content gates the open; the demotion is the model-origin `put` shape;
+  read-only demotes in memory; a journal with no rows is not adoptable.
+
+### Changed behaviour callers may notice
+
+- `keyless_adoption()` carries `events` (journal events chained on the file's word) and, for a
+  read-only in-memory adoption, `sequence: None`. `kibisis_health.keyless_adoption` adds
+  `journal_events`.
+- Adopted rows come back with `origin == "model"`, `origin_class == "agent"` and their `author_id`
+  under `agent_metadata`, as an agent's own write would.
+
 ### Round 5
 
 Review `review_notes/R5.md` (091c218). Repro suite `tests/review5_discriminator.py` →

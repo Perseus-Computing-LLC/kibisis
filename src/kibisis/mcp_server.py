@@ -631,6 +631,7 @@ class KibisisMCPServer:
             when = time.strftime("%Y-%m-%d", time.gmtime(adopted["at"]))
             adoption: Any = {
                 "entries": adopted["entries"],
+                "journal_events": adopted.get("events", 0),
                 "at": adopted["at"],
                 "note": (
                     f"{adopted['entries']} entries adopted from a keyless file on {when}: candidates on nobody's "

@@ -170,3 +170,14 @@ Second-pass findings R2-C-1..R2-C-5 (`review_notes/R2_C.md`), plus the "suspecte
   AML servers and the OKF commands never pass it (pinned by
   `test_fixed_r5_1_servers_and_okf_commands_never_pass_the_opt_in`). `review list` prints the
   adoption notice; `kibisis_health` reports `keyless_adoption` (`entries`, `at`, `note`) or null.
+
+## Round 6
+
+- **Minor** `config.cli_refusal_text` rewords a vault refusal for a person at a CLI: the library's
+  "pass adopt_keyless=True" becomes "pass --adopt-keyless" in `kibisis-review` and the admit command
+  (which now also catches `ValueError`/`PermissionError` from the open and exits 2 instead of
+  tracing). The `--adopt-keyless` help text on both says the adoption happens at the open, before the
+  verdict/admission, each row stored as a model-origin candidate, and is written even when the verdict
+  itself is then refused. `review list` / verdicts print the adoption line with "in memory only: this
+  read-only open wrote nothing" for a read-only in-memory adoption (R6-3) and the count of journal
+  events chained on the file's word (R6-1).

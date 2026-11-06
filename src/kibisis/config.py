@@ -162,6 +162,18 @@ def plaintext_allowed(env: Optional[Mapping[str, str]] = None) -> bool:
     return env.get(ENV_ALLOW_PLAINTEXT, "").strip().lower() in ("1", "true", "yes")
 
 
+#: The keyless-adoption opt-in as the library names it in a refusal, and as the CLIs spell it.
+ADOPT_KEYLESS_KEYWORD = "pass adopt_keyless=True"
+ADOPT_KEYLESS_FLAG = "pass --adopt-keyless"
+
+
+def cli_refusal_text(exc: BaseException) -> str:
+    """A vault refusal worded for a person at a CLI: the library says ``pass adopt_keyless=True``
+    (its keyword); the commands that carry the opt-in call it ``--adopt-keyless``, and that is what
+    the person reads. Adoption happens at the open, before any verdict runs."""
+    return str(exc).replace(ADOPT_KEYLESS_KEYWORD, ADOPT_KEYLESS_FLAG)
+
+
 def open_vault(
     db_path: Optional[str] = None,
     env: Optional[Mapping[str, str]] = None,
@@ -183,10 +195,12 @@ def open_vault(
     check; the servers, ``review list``, the OKF commands and embedders adopt the stored quorum and
     never pin one.
 
-    ``adopt_keyless=True`` is the opt-in for giving a passphrase to a plain file that holds entries and
+    ``adopt_keyless=True`` is the opt-in for giving a passphrase to a plain file that holds content and
     no salt (R5-1): without it such an open is refused, since a keyed vault whose records a file
-    writer removed looks the same; with it the entries are adopted as candidates. Only the operator
-    CLIs behind the terminal check pass it (``--adopt-keyless``); the servers and the OKF commands never do.
+    writer removed looks the same; with it the entries are adopted as model-origin candidates. Only the
+    operator CLIs behind the terminal check pass it (``--adopt-keyless``); the servers and the OKF
+    commands never do. The library's refusal names the keyword; a CLI prints it through
+    :func:`cli_refusal_text` so the person reads the flag they have.
 
     ``read_only=True`` opens an existing vault without changing a byte of the vault file (no SQLCipher
     conversion, integrity upgrade or index build; every write is refused) and does not create a missing

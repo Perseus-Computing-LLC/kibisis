@@ -284,3 +284,14 @@ are kept; each now asserts the fixed behaviour).
   pinning open names its quorum or pins at least that value. `SQLiteMemoryVault.quorum_dropped_from`
   exposes it; `review._quorum_line` appends "a pinned N was dropped under a legacy meta MAC …".
   Editing or deleting the record fails both MAC checks.
+
+## Round 6
+
+- **R6-4 (low)** under a legacy (pre-quorum) meta MAC both `verification_quorum` and
+  `quorum_dropped_from` are unbound (`VAULT_META_BOUND_KEYS_V1`), so `_drop_untrusted_stored_quorum`
+  deletes BOTH before the re-sign, each named in a WARNING ("vault_meta.<key> = <value> is not covered by
+  the legacy meta MAC"). A planted `quorum_dropped_from` is never read as a floor and never fed into
+  one; the only floor the re-sign records is the R5-4 one, the dropped `verification_quorum` alone,
+  capped at that value. The pinning-open refusal now says "a stored verification quorum of N was dropped
+  at an earlier open because the meta MAC did not cover it (the file read as pinned at N; nothing signed
+  vouched for that)" rather than "had its verification quorum pinned at N".

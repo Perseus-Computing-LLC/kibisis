@@ -261,14 +261,20 @@ class SQLiteMemoryVault(
     ) -> None:
         """Open a vault. Entry content is encrypted by default.
 
-        ``adopt_keyless=True`` is the one way to give a passphrase to a plain file that holds entries
+        ``adopt_keyless=True`` is the one way to give a passphrase to a plain file that holds content
         and no salt (a vault written without a passphrase). A keyed vault whose ``vault_meta`` and
         seals a file writer removed looks exactly like one, so without the opt-in such an open is
         refused (:class:`VaultIntegrityError`, read-only or writable), and with it every adopted entry
-        becomes a ``candidate`` with its attestations reset; :meth:`keyless_adoption` reports the
-        count until a later migration. Only the operator CLIs behind the terminal check pass it
-        (``kibisis-review ... --adopt-keyless``, ``kibisis admit --adopt-keyless``); the servers and
-        the OKF commands never do. A plain file with no entries needs no opt-in.
+        is stored as a model-origin write would be stored: a ``candidate``, ``origin_class`` ``agent``,
+        ``act_class`` ``inform``, with every reserved and principal-only metadata key dropped or moved
+        under ``agent_metadata`` and its supersession links cleared (``_demote_adopted_row``). A
+        writable open writes that into the file and a ``migrate`` event; a read-only open applies the
+        same demotion to a private in-memory copy and writes nothing. :meth:`keyless_adoption` reports
+        the count until a later migration. A keyless file holding a tombstone row, or a journal with no
+        entries, is refused with or without the opt-in. Only the operator CLIs behind the terminal
+        check pass it (``kibisis-review ... --adopt-keyless``, ``kibisis admit --adopt-keyless``); the
+        servers and the OKF commands never do. A plain file with nothing in it (no rows, no tombstones,
+        no journal events, no ``vault_meta`` records) needs no opt-in: it is a fresh vault.
 
         ``read_only=True`` opens an existing on-disk vault as it is and never writes to it: the SQLite
         connection is ``mode=ro``, so the plain-SQLite-to-SQLCipher migration, the integrity upgrade and
@@ -362,6 +368,8 @@ class SQLiteMemoryVault(
         self._quorum_requested = verification_quorum is not None or bool((env_quorum or "").strip())
         self._pin_quorum = bool(pin_quorum)
         self._adopt_keyless = bool(adopt_keyless)
+        #: Set by a read-only open with the opt-in on a keyless file: the in-memory adoption it served (R6-3).
+        self._keyless_adoption_view: Optional[Dict[str, Any]] = None
         #: The quorum the vault file remembers, or None until a verdict pinned one (then the default applies).
         self.verification_quorum_stored: Optional[int] = None
         #: A quorum a person had pinned that was dropped because a legacy meta MAC never covered it (R5-4);
@@ -472,6 +480,10 @@ class SQLiteMemoryVault(
         self._tokenizer_lock = threading.Lock()
         self._sqlcipher_active = False
         self._cache_mb = int(cache_mb) if cache_mb is not None else None
+        # A SQLite file that holds tables but none of ours is somebody else's database, not a vault to
+        # initialise into (R6-1b, R6 Minor): refused by _connect like the read-only open refuses it, before
+        # the journal mode is touched or _init_schema adds anything. An empty file (no tables) is a fresh vault.
+        self._refuse_foreign = on_disk and os.path.exists(self.db_path) and os.path.getsize(self.db_path) > 0
         try:
             self._connect(converted_temp or self.db_path, passphrase, memory_security)
         except BaseException:
@@ -566,6 +578,14 @@ class SQLiteMemoryVault(
                 self._conn.close()
                 raise ValueError("Failed to authenticate or decrypt vault database with provided passphrase") from e
             self._conn.execute("PRAGMA secure_delete = ON;")
+        if getattr(self, "_refuse_foreign", False):
+            # Before _configure_db switches the journal mode (a write to the file header): a SQLite file that
+            # holds tables but none of ours is refused as it is (R6-1b, R6 Minor).
+            try:
+                self._refuse_foreign_database()
+            except BaseException:
+                self._conn.close()
+                raise
         self._configure_db()
         if self._cache_mb is not None:
             self._conn.execute(f"PRAGMA cache_size = -{self._cache_mb * 1024}")
@@ -769,12 +789,40 @@ class SQLiteMemoryVault(
                 self._signing_key = self._legacy_signing_key
                 if plain_file and _sqlcipher_available():
                     logger.warning("kibisis: %s is a plaintext vault; read-only open leaves it as it is", self.db_path)
+                if getattr(self, "_adopt_keyless", False):
+                    # R6-3: the opt-in means "serve these rows as the writable adoption would store them",
+                    # and a read-only open cannot write that. So the rows are demoted in a private
+                    # in-memory copy of the file (the same _demote_adopted_row the writable open runs);
+                    # the file is not touched and the forged state is never served as verified.
+                    self._adopt_keyless_in_memory()
             # Adopt (or refuse) the stored quorum exactly as a writable open would; a read-only open never
             # stores one. After the meta MAC check, since the stored quorum is one of the values it covers.
             self._persist_verification_quorum()
         except BaseException:
             self._conn.close()
             raise
+
+    def _adopt_keyless_in_memory(self) -> None:
+        """Replace the read-only connection to a keyless file with an in-memory copy in which every row
+        has been demoted as the writable adoption would demote it (:meth:`_demote_adopted_row`, R6-3).
+        The file is left byte for byte as it is; :meth:`keyless_adoption` reports the in-memory adoption
+        with no journal sequence, since nothing was written."""
+        memory = sqlcipher3.connect(":memory:", check_same_thread=False)
+        memory.row_factory = sqlcipher3.Row
+        try:
+            self._conn.backup(memory)
+        except BaseException:
+            memory.close()
+            raise
+        self._conn.close()
+        self._conn = memory
+        ids = [int(r[0]) for r in self._conn.execute("SELECT id FROM entities").fetchall()]
+        cursor = self._conn.cursor()
+        for entity_id in ids:
+            self._demote_adopted_row(cursor, entity_id)
+        self._conn.commit()
+        if ids:
+            self._keyless_adoption_view = {"entries": len(ids), "events": 0, "at": time.time(), "sequence": None}
     # --- end read-only open ------------------------------------------------------------------------
 
     def _validate_fencing(
@@ -1139,6 +1187,16 @@ class SQLiteMemoryVault(
         except sqlcipher3.OperationalError:
             return False  # no vault_meta table: the vault was never opened with a passphrase
 
+    def _refuse_foreign_database(self) -> None:
+        """Refuse a SQLite file that holds tables but no ``entities`` table: another program's database,
+        or a vault file whose ``entities`` table was dropped (R6-1b). The writable open used to add the
+        vault schema into such a file and run, and for a salt-less file with a planted journal that chained
+        the journal under the signed head; now it is refused the way the read-only open refuses it. A file
+        with no tables at all is a fresh vault."""
+        tables = {r[0] for r in self._conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
+        if tables and "entities" not in tables:
+            raise ValueError(f"{self.db_path} is not a kibisis vault (no entities table)")
+
     def _meta(self, key: str) -> Any:
         row = self._conn.execute("SELECT value FROM vault_meta WHERE key = ?", (key,)).fetchone()
         return None if row is None else row[0]
@@ -1193,26 +1251,47 @@ class SQLiteMemoryVault(
         return value if value >= 1 else None
 
     def _drop_untrusted_stored_quorum(self, cursor: Any) -> None:
-        """Before a legacy (pre-quorum) meta MAC is re-signed: remove a stored quorum the MAC never covered,
+        """Before a legacy (pre-quorum) meta MAC is re-signed: remove every record the MAC never covered,
         whatever its value, so the re-signed MAC never turns a value nobody signed into a signed one.
-        A dropped value above the default is kept as ``quorum_dropped_from`` (under the full-set MAC,
-        R5-4): not as a quorum (nobody signed it) but as a floor for the next pinning open that names
-        no quorum, so a person's pinned 3 cannot be turned into the default by their own later verdict
-        run without ``KIBISIS_VERIFICATION_QUORUM``. Called by ``_verify_meta_mac`` under
+        Under the legacy key set neither ``verification_quorum`` nor ``quorum_dropped_from`` was bound
+        (:data:`~kibisis.crypto.VAULT_META_BOUND_KEYS_V1`), so BOTH are untrusted and both are deleted
+        (R5-4, R6-4): a stored ``quorum_dropped_from`` is never read as a floor here, since a file writer
+        with a pre-quorum copy of the MAC could have planted it. A dropped ``verification_quorum`` above
+        the default is then kept as ``quorum_dropped_from`` (under the full-set MAC): not as a quorum
+        (nobody signed it) but as a floor for the next pinning open that names no quorum, so a person's
+        pinned 3 cannot be turned into the default by their own later verdict run without
+        ``KIBISIS_VERIFICATION_QUORUM``. The floor can only raise the bar that open must clear, never
+        lower it, and any named quorum clears it. Called by ``_verify_meta_mac`` under
         ``_meta_mac_legacy``."""
+        planted_floor = self._meta("quorum_dropped_from")
+        if planted_floor is not None:
+            logger.warning(
+                "%s: vault_meta.quorum_dropped_from = %r is not covered by the legacy meta MAC, so it is not a floor "
+                "anybody recorded: dropped before the MAC is re-signed",
+                self.db_path, planted_floor,
+            )
+            cursor.execute("DELETE FROM vault_meta WHERE key = 'quorum_dropped_from'")
+            self.quorum_dropped_from = None
         if self._stored_quorum() is None and self._meta("verification_quorum") is not None:
             raw = self._meta("verification_quorum")
             try:
                 dropped = int(bytes(raw).decode("ascii") if isinstance(raw, (bytes, memoryview)) else raw)
             except (TypeError, ValueError):
                 dropped = 0
+            logger.warning(
+                "%s: vault_meta.verification_quorum = %r is not covered by the legacy meta MAC: dropped before the "
+                "MAC is re-signed%s",
+                self.db_path, raw,
+                f"; kept as a floor (quorum_dropped_from = {dropped}) for a pinning open that names no quorum"
+                if dropped > DEFAULT_VERIFICATION_QUORUM else "",
+            )
             cursor.execute("DELETE FROM vault_meta WHERE key = 'verification_quorum'")
             # Only a value above the default is worth a floor: a pinning open never pins below the default,
-            # so a dropped 1 or 2 (the forged lowering R2-B4 is about) is simply gone.
-            floor = max(dropped, self._dropped_quorum() or 0)
-            if floor > DEFAULT_VERIFICATION_QUORUM:
-                self._set_meta(cursor, "quorum_dropped_from", str(floor))
-                self.quorum_dropped_from = floor
+            # so a dropped 1 or 2 (the forged lowering R2-B4 is about) is simply gone. The floor is the
+            # dropped quorum alone: the planted record above never feeds it.
+            if dropped > DEFAULT_VERIFICATION_QUORUM:
+                self._set_meta(cursor, "quorum_dropped_from", str(dropped))
+                self.quorum_dropped_from = dropped
 
     def _persist_verification_quorum(self) -> None:
         """Adopt the stored quorum, compare it with the process's, and store it only from a pinning open.
@@ -1259,10 +1338,10 @@ class SQLiteMemoryVault(
         pins = stored is None or self.verification_quorum > stored
         if pins and dropped is not None and not self._quorum_requested and self.verification_quorum < dropped:
             raise ConfigError(
-                f"{self.db_path} had its verification quorum pinned at {dropped}; that value was dropped at an "
-                "earlier open because the meta MAC did not cover it, and this open names no quorum, so it would "
-                f"pin the default {self.verification_quorum} in its place. Run under KIBISIS_VERIFICATION_QUORUM="
-                f"{dropped} to pin it again (or name the quorum you mean)."
+                f"{self.db_path}: a stored verification quorum of {dropped} was dropped at an earlier open because the "
+                f"meta MAC did not cover it (the file read as pinned at {dropped}; nothing signed vouched for that), "
+                f"and this open names no quorum, so it would pin the default {self.verification_quorum} in its "
+                f"place. Run under KIBISIS_VERIFICATION_QUORUM={dropped} to pin it again (or name the quorum you mean)."
             )
         clear = dropped is not None and (
             self._quorum_requested or max(self.verification_quorum, stored or 0) >= dropped
