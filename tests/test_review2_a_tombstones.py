@@ -1,8 +1,8 @@
 """Second-pass review (R2, area A) — tombstones: origin classes, lift, canonical fold, key/metadata digests.
 
-Not collected by default (no ``test_`` prefix on the file); run by explicit path. Convention:
-``test_control_*`` asserts the SECURE behaviour (failing = bug); ``test_attack_*`` demonstrates a
-defect (PASSING = bug). Each docstring names the finding in review_notes/R2_A.md.
+Regression tests for review_notes/R2_A.md. ``test_control_*`` assert behaviour the first-round fixes
+established; ``test_attack_*`` were the R2 repros and now assert the FIXED behaviour (each docstring
+names the finding and what the fix guarantees).
 """
 
 import pytest
@@ -96,12 +96,10 @@ def test_control_mcp_forget_is_agent_class_and_a_person_lifts_by_writing(vault, 
 
 @pytest.mark.parametrize("downgrade_origin, lifter_origin", [("tool", "model"), ("model", "user")])
 def test_attack_retombstone_downgrades_principal_tombstone_class(vault, downgrade_origin, lifter_origin):
-    """R2-A1 (passing = bug). ``_tombstone_locked`` writes ``INSERT OR REPLACE`` on
-    UNIQUE(category, key, value_sha256, scope). A non-principal ``tombstone(content=V)`` of the same
-    category/key/value replaces the person's principal-class row with a row of its own class (fresh
-    MAC, so integrity checks pass). ``tool`` -> external-class, which a *model* write then lifts;
-    ``model`` -> agent-class, which the person's own next write silently lifts. The documented
-    guarantee "a principal-class tombstone blocks everyone until a person runs lift" is gone."""
+    """R2-A1 fixed. A non-principal ``tombstone(content=V)`` of a value that already has a person's
+    principal-class row leaves the row (class and MAC) as it is and journals ``tombstone_reaffirmed``;
+    a later write by any class below principal is still refused, and the refusal names the principal
+    class. The guarantee "a principal-class tombstone blocks everyone until a person lifts it" holds."""
     vault.put("c", "k", VALUE, origin="user")
     vault.tombstone("c", "k", origin="user", author_id="alice")  # the person's rejection
     assert _classes(vault) == ["principal"]
@@ -110,28 +108,50 @@ def test_attack_retombstone_downgrades_principal_tombstone_class(vault, downgrad
 
     # the agent (relayed by a library embedder) names the same category/key and the same value
     vault.tombstone("c", "k", content=VALUE, origin=downgrade_origin, author_id="mcp-agent")
-    assert _classes(vault) != ["principal"], "the principal row was not replaced"
+    assert _classes(vault) == ["principal"], "the principal row must not be replaced"
+    acts = [e.action for e in vault.list_audit_events(limit=50)]
+    assert "tombstone_reaffirmed" in acts
+    reaffirmed = [e for e in vault.list_audit_events(limit=50) if e.action == "tombstone_reaffirmed"][0]
+    assert reaffirmed.metadata["origin_class"] == "principal"
+    assert reaffirmed.metadata["requester_class"] != "principal"
 
-    ent = vault.put("c", "k2", VALUE, origin=lifter_origin)  # lifted: the value is back
-    assert ent.content == VALUE
-    assert vault.list_tombstones() == []
-    lifted = [e for e in vault.list_audit_events(limit=50) if e.action == "tombstone_lifted"]
-    assert lifted and lifted[0].metadata.get("tombstone_class") != "principal"
+    with pytest.raises(TombstonedValueError, match="tombstone class: principal"):
+        vault.put("c", "k2", VALUE, origin=lifter_origin)
+    assert _classes(vault) == ["principal"]
+    assert "tombstone_lifted" not in [e.action for e in vault.list_audit_events(limit=50)]
 
 
 def test_attack_retombstone_downgrade_also_works_after_person_reject_via_review(vault, server):
-    """R2-A1 variant (passing = bug): the person rejected an agent candidate in the review path
+    """R2-A1 fixed (review path): the person rejected an agent candidate in the review path
     (``review_entity(verdict='revoked')`` -> principal tombstone); the agent re-tombstones the same
-    value through the library with origin='tool' and then writes it back through MCP."""
+    value through the library with origin='tool' and the row stays principal, so the agent's MCP
+    write of the value is still refused."""
     assert not _call(server, "kibisis_remember", {"category": "c", "key": "k", "content": VALUE})[0]
     vault.review_entity("c", "k", "revoked", reviewer_id="alice")
     assert _classes(vault) == ["principal"]
     assert _call(server, "kibisis_remember", {"category": "c", "key": "k", "content": VALUE})[0]
     vault.tombstone("c", "k", content=VALUE, origin="tool", author_id="mcp-agent")
-    assert _classes(vault) == ["external"]
+    assert _classes(vault) == ["principal"]
     err, text = _call(server, "kibisis_remember", {"category": "c", "key": "k", "content": VALUE})
-    assert not err, text
-    assert vault.get("c", "k").content == VALUE
+    assert err and "tombstone class: principal" in text, text
+    assert vault.get("c", "k") is None
+
+
+def test_control_higher_class_retombstone_raises_the_row_class_and_resigns_it(vault):
+    """The row's class is the highest class that ever asked: an agent's tombstone that a person later
+    confirms (``tombstone(content=V, origin='user')``) becomes principal with a fresh MAC, journaled
+    as a ``tombstone`` event; the vault reopens clean (every row verifies against its MAC)."""
+    vault.put("c", "k", VALUE, origin="model")
+    vault.tombstone("c", "k", origin="model", author_id="mcp-agent")
+    assert _classes(vault) == ["agent"]
+    vault.tombstone("c", "k", content=VALUE, origin="user", author_id="alice")
+    assert _classes(vault) == ["principal"]
+    events = [e for e in vault.list_audit_events(limit=50) if e.action == "tombstone"]
+    assert any(e.metadata["origin_class"] == "principal" and e.metadata["stored_class"] == "agent" for e in events)
+    assert len(vault.list_tombstones()) == 1
+    with pytest.raises(TombstonedValueError, match="tombstone class: principal"):
+        vault.put("c", "k2", VALUE, origin="user")
+    vault._check_tombstones()  # every row's MAC verifies and every journaled tombstone has its row
 
 
 def test_control_mcp_alone_cannot_replace_a_principal_tombstone_row(vault, server):
@@ -150,54 +170,65 @@ def test_control_mcp_alone_cannot_replace_a_principal_tombstone_row(vault, serve
 # ----------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("word", ["agent", "mcp"])
+@pytest.mark.parametrize("word", ["agent", "mcp", "inform"])
 def test_attack_tombstone_of_a_bookkeeping_word_blocks_every_agent_write_until_a_person_lifts(vault, server, word):
-    """R2-A2 (passing = bug). ``_entry_digests`` digests every string leaf of the final ``meta``,
-    which includes the vault's own fields (``origin_class='agent'``, ``act_class='inform'``, the MCP
-    server's ``origin='mcp'``). One MCP remember+forget of such a word tombstones it (agent class);
-    from then on every ``kibisis_remember`` in the scope is refused. A person's write does not lift
-    it (their rows carry 'principal', not 'agent'), so only ``kibisis-review lift`` recovers."""
+    """R2-A2 fixed. ``_entry_digests`` matches the content, the key and the caller's own metadata
+    (``agent_metadata``, keys and values) only, never the vault's bookkeeping strings
+    (``origin_class='agent'``, ``act_class='inform'``, the MCP server's ``origin='mcp'``). An MCP
+    remember+forget of such a word tombstones the word; later writes of other content in the scope
+    are accepted, and the word itself is still refused as content, key or agent metadata."""
     assert not _call(server, "kibisis_remember", {"category": "c", "key": "k", "content": word})[0]
     assert not _call(server, "kibisis_forget", {"category": "c", "key": "k", "reason": "x"})[0]
-    err, text = _call(server, "kibisis_remember", {"category": "c", "key": "k2", "content": "an unrelated fact"})
-    assert err and "key or metadata" in text, text
-    vault.put("c", "p", "a person's fact", origin="user")  # does not lift it
     assert _classes(vault) == ["agent"]
-    err, _ = _call(server, "kibisis_remember", {"category": "c", "key": "k2", "content": "an unrelated fact"})
-    assert err
-    assert vault.lift_tombstone("c", "k") == 1
-    assert not _call(server, "kibisis_remember", {"category": "c", "key": "k2", "content": "an unrelated fact"})[0]
+    err, text = _call(server, "kibisis_remember", {"category": "c", "key": "k2", "content": "an unrelated fact"})
+    assert not err, text
+    assert vault.get("c", "k2").content == "an unrelated fact"
+    assert _call(server, "kibisis_remember", {"category": "c", "key": "k3", "content": word})[0]
+    assert _call(server, "kibisis_remember", {"category": "c", "key": word, "content": "x"})[0]
+    err, text = _call(server, "kibisis_remember", {"category": "c", "key": "k4", "content": "x", "metadata": {"n": word}})
+    assert err and "key or metadata" in text, text
+    assert _classes(vault) == ["agent"]
 
 
 def test_attack_person_reject_of_a_bookkeeping_word_blocks_the_agent_permanently(vault, server):
-    """R2-A2 variant (passing = bug): the person rejects an agent candidate whose content is 'mcp'
+    """R2-A2 fixed (principal variant): the person rejects an agent candidate whose content is 'mcp'
     (the MCP server stamps metadata.origin='mcp' on every remember). The principal-class tombstone
-    then refuses every later MCP write in the scope."""
+    refuses the word, not every later MCP write in the scope."""
     assert not _call(server, "kibisis_remember", {"category": "c", "key": "k", "content": "MCP"})[0]
     vault.review_entity("c", "k", "revoked", reviewer_id="alice")
+    assert _classes(vault) == ["principal"]
     err, text = _call(server, "kibisis_remember", {"category": "c", "key": "k2", "content": "an unrelated fact"})
+    assert not err, text
+    err, text = _call(server, "kibisis_remember", {"category": "c", "key": "k3", "content": "mcp"})
     assert err and "tombstone class: principal" in text, text
 
 
 # ----------------------------------------------------------------------------------------------
-# R2-A3: F12 residual — dict KEYS in metadata are not digested
+# R2-A3: F12 residual — dict KEYS in metadata are digested too
 # ----------------------------------------------------------------------------------------------
 
 
 def test_attack_tombstoned_value_stored_as_a_metadata_dict_key_survives(vault, server):
-    """R2-A3 (passing = bug). ``string_leaves`` walks dict values only. A person-rejected value is
-    accepted as a key of ``agent_metadata``, is readable through ``get()`` / ``list_entities()`` and
-    is not purged by ``_value_copies``. (Control: the same value as a dict *value* is refused.)"""
+    """R2-A3 fixed. ``string_leaves`` yields dict keys as well as values, at any depth: a
+    person-rejected value is refused as a key of ``agent_metadata``, nested or not, and a copy that
+    was stored before the rejection is purged with the rest. (Control: as a dict value too.)"""
     assert not _call(server, "kibisis_remember", {"category": "c", "key": "k", "content": VALUE})[0]
     vault.review_entity("c", "k", "revoked", reviewer_id="alice")
     err, text = _call(server, "kibisis_remember", {"category": "c", "key": "k3", "content": "x", "metadata": {"n": VALUE}})
     assert err, "control: value as a dict value must be refused"
     err, text = _call(server, "kibisis_remember", {"category": "c", "key": "k2", "content": "x", "metadata": {VALUE: 1}})
-    assert not err, text
-    assert VALUE in vault.get("c", "k2").metadata["agent_metadata"]
-    # and a later principal tombstone of the value does not purge this copy
-    vault.put("c", "k4", VALUE + " (copy)", origin="user")
-    assert VALUE in vault.get("c", "k2").metadata["agent_metadata"]
+    assert err and "key or metadata" in text, text
+    err, text = _call(server, "kibisis_remember", {"category": "c", "key": "k2", "content": "x", "metadata": {"a": {VALUE: 1}}})
+    assert err and "key or metadata" in text, text
+    assert vault.get("c", "k2") is None
+    # a copy filed as a key before the value was rejected is purged by the rejection
+    assert not _call(server, "kibisis_remember", {"category": "c", "key": "k5", "content": "copy holder", "metadata": {"x": 1}})[0]
+    vault.put("c", "k6", "another holder", origin="user", metadata={"agent_metadata": {"n": {"x": "v"}}})
+    assert not _call(server, "kibisis_remember", {"category": "c", "key": "k7", "content": "y", "metadata": {"copy": 1}})[0]
+    vault.put("c", "k8", "x", origin="user")
+    vault.tombstone("c", "k8", origin="user", author_id="alice")  # rejects the value "x"
+    assert vault.get("c", "k5") is None and vault.get("c", "k6") is None
+    assert vault.get("c", "k7") is not None
 
 
 # ----------------------------------------------------------------------------------------------
@@ -207,21 +238,32 @@ def test_attack_tombstoned_value_stored_as_a_metadata_dict_key_survives(vault, s
 
 @pytest.mark.parametrize(
     "a, b",
-    [("कल", "काल"), ("कल", "कील"), ("नमस्ते", "नमसत"), ("கல", "கால")],  # Devanagari kal/kaal/keel, namaste; Tamil kal/kaal
+    [("कल", "काल"), ("कल", "कील"), ("கல", "கால")],  # Devanagari kal/kaal/keel; Tamil kal/kaal (Mc vowel signs)
 )
 def test_attack_canonical_fold_collapses_distinct_words_in_abugida_scripts(a, b):
-    """R2-A4 (passing = bug). Dropping ``Mc`` (spacing vowel signs) after NFKC makes different
-    Devanagari/Tamil words identical, so a tombstone of one refuses the others (false refusals), and
-    ``is_tombstoned`` reports them as rejected."""
+    """R2-A4 fixed. Spacing combining marks (``Mc``, the side vowel signs) are kept by the fold, so
+    different Devanagari/Tamil words keep different digests and a tombstone of one does not refuse
+    the others."""
     assert a != b
-    assert canonicalize_text(a) == canonicalize_text(b)
+    assert canonicalize_text(a) != canonicalize_text(b)
+
+
+def test_control_fold_still_drops_nonspacing_marks_by_design():
+    """R2-A4 scope: nonspacing marks (``Mn``: the virama, above/below vowel signs, the evasion marks
+    an attacker adds to a Latin word) are still dropped, so a word that differs only in such a sign
+    folds alike. The exact digest still tells them apart; only the canonical match is wider."""
+    assert canonicalize_text("नमस्ते") == canonicalize_text("नमसत")
+    assert canonicalize_text("a\u0334b") == canonicalize_text("ab")  # a mark NFKC cannot compose is dropped
 
 
 def test_attack_tombstone_of_one_hindi_word_refuses_a_different_hindi_word(vault):
+    """R2-A4 fixed: a rejection of 'कल' (tomorrow) does not refuse 'काल' (time)."""
     vault.put("c", "k", "कल", origin="user")
     vault.tombstone("c", "k", origin="user")
+    assert vault.put("c", "k2", "काल", origin="user").content == "काल"  # a different word (time vs tomorrow)
     with pytest.raises(TombstonedValueError):
-        vault.put("c", "k2", "काल", origin="user")  # a different word (time vs tomorrow)
+        vault.put("c", "k3", "कल", origin="user")
+    assert vault.is_tombstoned("c", "k", "कल") and not vault.is_tombstoned("c", "k", "काल")
 
 
 def test_control_fold_keeps_latin_accents_distinct_from_their_base():
@@ -238,18 +280,18 @@ def test_control_fold_keeps_latin_accents_distinct_from_their_base():
 
 @pytest.mark.parametrize("blank", ["\u3164", "\u115f", "\u1160", "\uffa0"])
 def test_attack_hangul_filler_in_place_of_spaces_brings_a_rejected_value_back_through_mcp(vault, server, blank):
-    """R2-A5 (passing = bug). U+3164/U+115F/U+1160/U+FFA0 render as a blank the width of a Hangul
-    syllable, so 'DeploysㅤgoㅤoutㅤonㅤTuesdays.' reads as the rejected sentence; the fold DROPS
-    them (``_IGNORABLE_CODE_POINTS``) instead of turning them into a space, the words fuse, the
-    canonical digest differs and ``kibisis_remember`` accepts it. (Controls: braille
-    blank U+2800 and NBSP in place of spaces are refused.)"""
+    """R2-A5 fixed. U+3164/U+115F/U+1160/U+FFA0 render as a blank the width of a Hangul syllable,
+    so 'DeploysㅤgoㅤoutㅤonㅤTuesdays.' reads as the rejected sentence; the fold turns them into a
+    SPACE (``_BLANK_CODE_POINTS``), the canonical digest matches and ``kibisis_remember`` refuses it.
+    (Controls: braille blank U+2800 and NBSP in place of spaces are refused.)"""
     vault.put("c", "k", VALUE, origin="user")
     vault.tombstone("c", "k", origin="user")
     for control in ("\u2800", "\u00a0"):
         assert _call(server, "kibisis_remember", {"category": "c", "key": "c", "content": VALUE.replace(" ", control)})[0]
     err, text = _call(server, "kibisis_remember", {"category": "c", "key": "k2", "content": VALUE.replace(" ", blank)})
-    assert not err, text
-    assert vault.get("c", "k2").content == VALUE.replace(" ", blank)
+    assert err and "tombstone" in text, text
+    assert vault.get("c", "k2") is None
+    assert canonicalize_text("a" + blank + "b") == "a b"
 
 
 # ----------------------------------------------------------------------------------------------
@@ -276,15 +318,33 @@ def test_control_f5_variants_are_refused_through_mcp(vault, server, variant):
 
 
 # ----------------------------------------------------------------------------------------------
-# lift_tombstone is a public, un-gated library method
+# lift_tombstone is a person's act: the library method takes an origin and refuses the other classes
 # ----------------------------------------------------------------------------------------------
 
 
-def test_attack_lift_tombstone_has_no_origin_and_no_terminal_check(vault):
-    """R2-A6 (documents; passing = docs overstate). ``SQLiteMemoryVault.lift_tombstone`` takes no
-    ``origin`` and runs no check; README/SECURITY say the review CLI's lift verb is 'the only way
-    past a principal-class tombstone'. Any library embedder relaying an agent can call it."""
+@pytest.mark.parametrize("origin", ["model", "tool", "unknown"])
+def test_attack_lift_tombstone_has_no_origin_and_no_terminal_check(vault, origin):
+    """R2-A6 fixed. ``SQLiteMemoryVault.lift_tombstone`` takes ``origin``; a request from outside
+    the principal class is refused with ``PermissionError`` (journaled as a refusal), whatever class
+    the tombstone carries, and the value stays refused. A library embedder relaying an agent passes
+    the agent's origin and cannot lift."""
+    vault.put("c", "k", VALUE, origin="model")
+    vault.tombstone("c", "k", origin="model")  # an agent-class row: even that is not the agent's to lift
+    with pytest.raises(PermissionError, match="person's act"):
+        vault.lift_tombstone("c", "k", author_id="mcp-agent", origin=origin)
+    assert _classes(vault) == ["agent"]
+    with pytest.raises(TombstonedValueError):
+        vault.put("c", "k", VALUE, origin="model")
+    assert any(e.action == "refuse" and e.metadata.get("path") == "lift_tombstone" for e in vault.list_audit_events(limit=20))
+
+
+def test_control_lift_tombstone_by_a_person_or_a_vouching_caller(vault):
+    """A person (``origin='user'``) or a caller that vouches for one (``origin=None``, the review
+    CLI after its terminal check) lifts; the value is admitted again."""
     vault.put("c", "k", VALUE, origin="user")
     vault.tombstone("c", "k", origin="user")
-    assert vault.lift_tombstone("c", "k", author_id="mcp-agent") == 1
+    assert vault.lift_tombstone("c", "k", author_id="alice", origin="user") == 1
+    assert vault.put("c", "k", VALUE, origin="model").content == VALUE
+    vault.tombstone("c", "k", origin="user")
+    assert vault.lift_tombstone("c", "k", author_id="alice") == 1
     assert vault.put("c", "k", VALUE, origin="model").content == VALUE

@@ -85,32 +85,70 @@ def test_control_f7d_foreign_snapshot_attestations_are_dropped(tmp_path):
 
 
 def test_attack_f11_person_verified_agent_entry_is_demoted_by_its_own_vaults_snapshot(vault, server):
-    """R2-A7 (passing = bug). The common MCP case: an agent candidate a person approved. The
-    snapshot is this vault's (same digest_key_id, manifest verifies) so trust facts are kept, but
-    ``import_snapshot`` passes ``origin='model'`` and ``_put`` sets ``trust_ceiling`` for every
-    model-origin write BEFORE it looks at ``_review_verdict`` (vault.py L1135, L1191): the entry comes
-    back ``candidate`` with ``trust_capped_from='verified'`` while still carrying ``human_reviews`` and
-    ``attestations``. F11 is closed for user-origin rows only."""
+    """R2-A7 fixed. The common MCP case: an agent candidate a person approved. The snapshot is this
+    vault's (same digest_key_id, manifest verifies) so trust facts are kept and the state the
+    person decided is restored: ``import_snapshot`` passes ``_review_verdict`` for its own snapshot
+    and ``_put`` does not re-cap a model-origin entry under a verdict. The entry comes back
+    ``verified`` with ``human_reviews`` and ``attestations`` intact, and its origin stays ``model``."""
     assert not _call(server, "kibisis_remember", {"category": "c", "key": "k", "content": VALUE})[0]
     vault.review_entity("c", "k", "verified", reviewer_id="alice")
-    assert vault.get("c", "k").epistemic_state.value == "verified"
+    before = vault.get("c", "k")
+    assert before.epistemic_state.value == "verified"
     snap = vault.export_snapshot()
     assert vault.import_snapshot(snap, clear_existing=True) == 1
     e = vault.get("c", "k")
-    assert e.metadata.get("human_reviews") and e.metadata.get("attestations")  # trust facts were kept...
-    assert e.epistemic_state.value == "candidate"  # ...but the state they support was not
-    assert e.metadata.get("trust_capped_from") == "verified"
+    assert e.metadata.get("human_reviews") == before.metadata.get("human_reviews")
+    assert e.metadata.get("attestations") == before.metadata.get("attestations")
+    assert e.epistemic_state.value == "verified"
+    assert "trust_capped_from" not in e.metadata
+    assert e.origin == "model" and e.metadata.get("origin_class") == "agent"
 
 
 def test_attack_f11_restoring_own_snapshot_over_the_live_vault_aborts_on_a_person_verified_agent_entry(vault, server):
-    """R2-A7 variant (passing = bug). Same cause: the capped write hits the live reviewed row and
-    ``_put`` raises ``ReviewedEntryError`` (L1370), so ``import_snapshot`` without ``clear_existing``
-    aborts part-way (tombstones already committed, earlier entities already written)."""
+    """R2-A7 fixed (live vault). Restoring this vault's own snapshot over the live reviewed row is a
+    review-verdict write: no ``ReviewedEntryError``, the row stays verified, and the whole restore
+    applies."""
     assert not _call(server, "kibisis_remember", {"category": "c", "key": "k", "content": VALUE})[0]
     vault.review_entity("c", "k", "verified", reviewer_id="alice")
+    vault.put("c", "other", "a second fact", origin="user")
     snap = vault.export_snapshot()
-    with pytest.raises(ReviewedEntryError):
-        vault.import_snapshot(snap)
+    assert vault.import_snapshot(snap) == 2
+    e = vault.get("c", "k")
+    assert e.epistemic_state.value == "verified" and e.metadata.get("attestations")
+    assert vault.get("c", "other").content == "a second fact"
+
+
+def test_attack_f11_import_snapshot_is_all_or_nothing(vault, server, monkeypatch):
+    """R2-A7 fixed (atomicity). An error part-way through a restore rolls back everything the
+    restore wrote: the tombstones it had inserted, the clearing, and the entities written before
+    the failing one. The vault is as it was."""
+    vault.put("c", "a", "first", origin="user")
+    vault.put("c", "b", "second", origin="user")
+    vault.put("c", "z", "rejected", origin="user")
+    vault.tombstone("c", "z", origin="user")
+    snap = vault.export_snapshot()
+    assert len(snap["tombstones"]) == 1 and len(snap["entities"]) == 2
+    vault.lift_tombstone("c", "z", origin="user")
+    vault.put("c", "z", "rejected", origin="user")
+    assert vault.list_tombstones() == []
+
+    calls = {"n": 0}
+    real = vault._put_journaled
+
+    def failing(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("disk full, say")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(vault, "_put_journaled", failing)
+    with pytest.raises(RuntimeError):
+        vault.import_snapshot(snap, clear_existing=True)
+    monkeypatch.undo()
+    assert vault.list_tombstones() == [], "the snapshot's tombstone must not have been committed"
+    assert vault.get("c", "z").content == "rejected"
+    assert vault.get("c", "a").content == "first" and vault.get("c", "b").content == "second"
+    vault._check_tombstones()
 
 
 # ----------------------------------------------------------------------------------------------
@@ -147,15 +185,15 @@ def test_control_f7_quorum_cannot_be_lowered_and_is_adopted_when_unnamed(tmp_pat
     v.close()
 
 
+@pytest.mark.skip(reason="R2-A8 == R2-B4: verification_quorum goes under the vault meta MAC in area B "
+                         "(VAULT_META_BOUND_KEYS); unskip at merge")
 def test_attack_stored_quorum_is_not_under_the_vault_meta_mac(tmp_path):
-    """R2-A8 (passing = bug; file-writer, plain-file vaults). ``verification_quorum`` is persisted
-    in ``vault_meta`` but is not in ``VAULT_META_BOUND_KEYS``; on a vault whose file is plain SQLite
-    a file writer lowers it to 1 and the next unnamed open adopts it, so one attestation mints
-    ``verified``. (With SQLCipher active the file is encrypted and this needs the passphrase; the
-    other trust-deciding meta values ARE bound by ``meta_mac``.)"""
+    """R2-A8 (area B). ``verification_quorum`` is persisted in ``vault_meta``; once it is in
+    ``VAULT_META_BOUND_KEYS`` a file writer that lowers it to 1 on a plain-file vault is caught at
+    the next keyed open (``VaultIntegrityError``), and one attestation cannot mint ``verified``."""
     from kibisis.crypto import VAULT_META_BOUND_KEYS
 
-    assert "verification_quorum" not in VAULT_META_BOUND_KEYS
+    assert "verification_quorum" in VAULT_META_BOUND_KEYS
     p = str(tmp_path / "q.sqlite")
     v = _plain(p, verification_quorum=2)
     v.close()
@@ -164,22 +202,46 @@ def test_attack_stored_quorum_is_not_under_the_vault_meta_mac(tmp_path):
     con.commit()
     con.close()
     v = _plain(p)
-    assert v.verification_quorum == 1
     e = v.put("c", "k", VALUE, origin="user", epistemic_state="verified")
-    assert e.epistemic_state.value == "verified"
+    assert e.epistemic_state.value != "verified"
     v.close()
 
 
 def test_attack_attestations_carry_over_a_content_change(tmp_path):
-    """R2-A9 (passing = bug; library, principals only). ``_put`` seeds ``attested`` from the stored
-    row's ``attestations`` whatever the content: alice attested X, bob writes Y asking for verified,
-    and Y is verified with ['alice','bob'] although alice never saw Y."""
+    """R2-A9 fixed (library, principals only). The stored ``attestations`` were given for the stored
+    content: alice attested X, bob writes Y asking for verified. Y starts over (bob alone,
+    ``verification_pending`` 1 of 2, candidate), the reset is journaled with alice's name, and the
+    same content written again keeps the attestations it has."""
     v = _plain(str(tmp_path / "q.sqlite"), verification_quorum=2, trust_caller_identity=True)
     e = v.put("c", "k", "X", origin="user", epistemic_state="verified", attester="alice")
     assert e.epistemic_state.value == "candidate" and e.metadata["attestations"] == ["alice"]
     e = v.put("c", "k", "Y, a different claim", origin="user", epistemic_state="verified", attester="bob")
+    assert e.epistemic_state.value == "candidate"
+    assert e.metadata["attestations"] == ["bob"]
+    assert e.metadata["verification_pending"] == {"have": 1, "need": 2}
+    reset = [ev for ev in v.list_audit_events(limit=20) if ev.action == "attestations_reset"]
+    assert reset and reset[0].metadata["attestations"] == ["alice"]
+    # the same content again (a re-save) keeps what it has; a second account completes the quorum
+    e = v.put("c", "k", "Y, a different claim", origin="user", epistemic_state="verified", attester="bob")
+    assert e.metadata["attestations"] == ["bob"] and e.epistemic_state.value == "candidate"
+    e = v.put("c", "k", "Y, a different claim", origin="user", epistemic_state="verified", attester="alice")
+    assert e.epistemic_state.value == "verified" and e.metadata["attestations"] == ["bob", "alice"]
+    v.close()
+
+
+def test_control_content_change_by_an_agent_over_a_verified_entry_still_needs_the_person(tmp_path):
+    """R2-A9, the agent side: an agent (model) cannot re-write a person's verified entry at all
+    (``OriginClassError``), so there is no path by which it keeps the old attestations; a person's
+    re-write with other content starts over."""
+    from kibisis.vault import OriginClassError
+
+    v = _plain(str(tmp_path / "q.sqlite"), verification_quorum=1, trust_caller_identity=True)
+    e = v.put("c", "k", "X", origin="user", epistemic_state="verified", attester="alice")
     assert e.epistemic_state.value == "verified"
-    assert e.metadata["attestations"] == ["alice", "bob"]
+    with pytest.raises(OriginClassError):
+        v.put("c", "k", "Y", origin="model")
+    e = v.put("c", "k", "Y", origin="user")
+    assert e.epistemic_state.value == "candidate" and not e.metadata.get("attestations")
     v.close()
 
 
