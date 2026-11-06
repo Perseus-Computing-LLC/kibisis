@@ -62,13 +62,18 @@ class VaultIntegrityError(PermissionError):
     must verify before an upgrade does not. Nothing is written when it is raised."""
 
 
-#: Code points that render as nothing but are not ``Cf``/``Cc`` (Hangul fillers are ``Lo``), plus the
-#: Default_Ignorable blocks NFKC keeps: variation selectors, the combining grapheme joiner and the
-#: Mongolian free variation selectors are ``Mn`` and are dropped by category below; these are the rest.
+#: Default_Ignorable code points that take up space on the line: the Hangul fillers (``Lo``, NFKC
+#: keeps them) render as a blank the width of a syllable, so a sentence typed with them in place of
+#: its spaces reads as the sentence. They fold to a SPACE, not to nothing (R2-A5).
+_BLANK_CODE_POINTS = frozenset([0x115F, 0x1160, 0x3164, 0xFFA0])
+
+#: Code points that render as nothing but are not ``Cf``/``Cc``, plus the Default_Ignorable blocks
+#: NFKC keeps: variation selectors, the combining grapheme joiner and the Mongolian free variation
+#: selectors are ``Mn`` and are dropped by category below; these are the rest.
 _IGNORABLE_CODE_POINTS = frozenset(
-    [0x115F, 0x1160, 0x3164, 0xFFA0, 0x034F, 0x180B, 0x180C, 0x180D, 0x180E, 0x180F, 0x200B, 0x2060, 0x2061,
+    [0x034F, 0x180B, 0x180C, 0x180D, 0x180E, 0x180F, 0x200B, 0x2060, 0x2061,
      0x2062, 0x2063, 0x2064, 0xFEFF, 0xFE00, 0xFE01, 0xFE02, 0xFE03, 0xFE04, 0xFE05, 0xFE06, 0xFE07, 0xFE08,
-     0xFE09, 0xFE0A, 0xFE0B, 0xFE0C, 0xFE0D, 0xFE0E, 0xFE0F, 0x17B4, 0x17B5, 0x3164]
+     0xFE09, 0xFE0A, 0xFE0B, 0xFE0C, 0xFE0D, 0xFE0E, 0xFE0F, 0x17B4, 0x17B5]
     + list(range(0xE0100, 0xE01F0))
 )
 
@@ -94,32 +99,37 @@ def canonicalize_text(text: str) -> str:
     Transforms text by:
     1. Unicode NFKC normalization (fullwidth characters, compatibility ligatures, composed forms)
     2. Unicode case folding (.casefold())
-    3. Dropping invisible code points: format/control (``Cf``/``Cc``), nonspacing/enclosing/spacing
-       marks (``Mn``/``Me``/``Mc``: variation selectors, combining grapheme joiner, Mongolian FVS,
-       combining accents), and the Default_Ignorable code points NFKC keeps (Hangul fillers,
-       zero-width joiners, variation selectors)
-    4. Folding common Latin/Cyrillic/Greek homoglyphs and dotless i to their Latin letter (a small
+    3. Dropping invisible code points: format/control (``Cf``/``Cc``), nonspacing and enclosing
+       marks (``Mn``/``Me``: variation selectors, combining grapheme joiner, Mongolian FVS, combining
+       accents that NFKC could not compose), and the zero-width Default_Ignorable code points NFKC
+       keeps (zero-width joiners, word joiners, variation selectors). Spacing combining marks (``Mc``,
+       the side vowel signs of Devanagari, Tamil and other abugidas) are kept: they distinguish words.
+    4. Turning the Default_Ignorable code points that take up space (the Hangul fillers U+115F, U+1160,
+       U+3164, U+FFA0) into a space, like any other blank
+    5. Folding common Latin/Cyrillic/Greek homoglyphs and dotless i to their Latin letter (a small
        built-in table, not UTS #39's full skeleton)
-    5. Stripping all Unicode punctuation and symbols (replacing with space separators)
-    6. Collapsing all whitespace runs into single spaces and trimming
+    6. Stripping all Unicode punctuation and symbols (replacing with space separators)
+    7. Collapsing all whitespace runs into single spaces and trimming
 
     What it does not do: recognise a paraphrase, a translation, a different word order, or a
-    homoglyph outside the table. A tombstone stops a value and its spellings, not an idea.
+    homoglyph outside the table. A tombstone stops a value and its spellings, not an idea. Vowel
+    signs written as nonspacing marks (``Mn``, above or below the consonant) are still dropped, so
+    two words that differ only in such a sign fold alike.
     """
     if not text:
         return ""
     normalized = unicodedata.normalize("NFKC", text).casefold()
     chars: List[str] = []
     for ch in normalized:
-        if ch.isspace():
+        if ch.isspace() or ord(ch) in _BLANK_CODE_POINTS:
             chars.append(" ")
             continue
         if ord(ch) in _IGNORABLE_CODE_POINTS:
             continue
         cat = unicodedata.category(ch)
-        if cat in ("Cf", "Cc", "Mn", "Me", "Mc"):
+        if cat in ("Cf", "Cc", "Mn", "Me"):
             # Drop invisible format/control characters (e.g. \u200b, \u200c, \u200d, \ufeff, \u00ad)
-            # and combining marks (e.g. \ufe0f, \u034f, \u180b, accents added to evade a match).
+            # and nonspacing marks (e.g. \ufe0f, \u034f, \u180b, accents added to evade a match).
             continue
         ch = _CONFUSABLES.get(ch, ch)
         if cat.startswith(("P", "S")):
