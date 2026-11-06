@@ -1,9 +1,10 @@
-"""A2 quorum: every route by which one account reaches ``KIBISIS_VERIFICATION_QUORUM`` (kibisis 1299c28).
+"""A2 quorum: every route by which one account could reach ``KIBISIS_VERIFICATION_QUORUM``, as fixed.
 
-Each docstring says whether the test asserts INSECURE behaviour (passes = the route is open at this commit)
-or SECURE behaviour (passes = the route is closed). Controls sit beside each route.
+Each test asserts the SECURE behaviour: the route is closed. Controls sit beside each route. The attester
+of a user-origin act is the operating-system account running the process (``kibisis._operator``), so the
+tests read that account once and compare against it; ``reviewer_id`` / ``author_id`` are labels.
 
-Run: cd <worktree> && ARGUS_LEDGER_PATH=$TMPDIR/argus_a2.jsonl PYTHONPATH=src <venv>/python -m pytest -q -p no:cacheprovider tests/review_a2_quorum.py
+Run: cd <worktree> && ARGUS_LEDGER_PATH=$TMPDIR/argus_a2.jsonl PYTHONPATH=src <venv>/python -m pytest -q -p no:cacheprovider tests/test_review_a2_quorum.py
 """
 
 from __future__ import annotations
@@ -16,9 +17,12 @@ import sys
 import pytest
 
 from kibisis import EpistemicState, KibisisMCPServer, SQLiteMemoryVault
+from kibisis._operator import account_identity
+from kibisis.config import ConfigError
 from kibisis.vault import ReviewedEntryError
 
 KEY = "review-a2 test key only, not a secret"
+ME = account_identity()
 
 
 @pytest.fixture(autouse=True)
@@ -47,53 +51,73 @@ def _call(server, tool, arguments):
 
 
 def test_a_same_reviewer_id_twice_is_one_attestation(vault):
-    """SECURE behaviour (passes = closed): admit then review with the same ``reviewer_id`` stays 1 of 2."""
+    """admit then review from one process is one attestation (the account), whatever labels are typed."""
     vault.remember("c", "k", "fact", origin="model")
     vault.admit("c", "k", reviewer="acct", reviewer_origin="user")
     e = vault.review_entity("c", "k", "verified", reviewer_id="acct", reviewer_label="other label")
     assert e.epistemic_state == EpistemicState.CANDIDATE
-    assert e.metadata["attestations"] == ["acct"]
+    assert e.metadata["attestations"] == [ME]
     assert e.metadata["verification_pending"] == {"have": 1, "need": 2}
 
 
-# --- (b) principal writes: author_id is free text and each distinct string is one attestation ----------------
+# --- (b) principal writes: author_id is a label; the account attests, once ---------------------------------
 
 
-def test_b_two_user_writes_with_different_author_ids_reach_quorum(vault):
-    """INSECURE behaviour (passes = route open): ``put(origin="user", epistemic_state="verified")`` signs as
-    ``author_id``, a free-text argument (vault.py:946-949). Two writes from one process with two strings are
-    two attestations. No account lookup is involved on this path."""
+def test_b_two_user_writes_with_different_author_ids_are_one_attestation(vault):
+    """F7 fixed: ``put(origin="user", epistemic_state="verified")`` attests as the account running the
+    process, not as ``author_id``. Two writes from one process with two author strings are one attestation."""
     e1 = vault.put("c", "k", "fact", origin="user", author_id="alice", epistemic_state="verified")
-    assert e1.epistemic_state == EpistemicState.CANDIDATE and e1.metadata["attestations"] == ["alice"]
+    assert e1.epistemic_state == EpistemicState.CANDIDATE and e1.metadata["attestations"] == [ME]
     e2 = vault.put("c", "k", "fact", origin="user", author_id="bob", epistemic_state="verified")
-    assert e2.epistemic_state == EpistemicState.VERIFIED
-    assert e2.metadata["attestations"] == ["alice", "bob"]
+    assert e2.epistemic_state == EpistemicState.CANDIDATE
+    assert e2.metadata["attestations"] == [ME]
+    assert e2.metadata["verification_pending"] == {"have": 1, "need": 2}
+    assert e2.metadata["author_id"] == "bob"  # the label is kept; it just does not sign
 
 
-def test_b_user_write_with_no_author_id_signs_as_the_literal_principal(vault):
-    """INSECURE behaviour (passes = route open): with neither ``author_id`` nor ``principal_id`` the signer is
-    the string ``"principal"`` (vault.py:947), which then counts as a person distinct from every real account."""
+def test_b_user_write_with_no_author_id_attests_as_the_account_not_the_literal_principal(vault):
+    """F7 fixed: the literal ``"principal"`` is never a signer."""
     e = vault.put("c", "k", "fact", origin="user", epistemic_state="verified")
-    assert e.metadata["attestations"] == ["principal"]
+    assert e.metadata["attestations"] == [ME]
     e = vault.review_entity("c", "k", "verified", reviewer_id="acct")
-    assert e.epistemic_state == EpistemicState.VERIFIED
-    assert e.metadata["attestations"] == ["principal", "acct"]
+    assert e.epistemic_state == EpistemicState.CANDIDATE
+    assert e.metadata["attestations"] == [ME]
 
 
-def test_b_origin_less_rewrite_of_a_principal_row_adds_an_attestation_and_keeps_a_cap_marker(vault):
-    """INSECURE behaviour (passes = route open): a rewrite that states no origin inherits the stored principal
-    class (vault.py:894-895) and so attests as its new ``author_id``, although the pre-transaction check at
-    vault.py:821-823 had already stamped ``trust_capped_from="verified"`` on it. Result: a verified entry that
-    also says it was capped."""
+def test_b_explicit_attester_needs_trust_caller_identity(tmp_path):
+    """``attester=`` is an embedder's door: refused on a vault opened without ``trust_caller_identity=True``;
+    on one opened with it, two named accounts reach the quorum, and 'principal' / '' are refused."""
+    with pytest.raises(ValueError):
+        SQLiteMemoryVault(":memory:", auto_gate=False).put(
+            "c", "k", "fact", origin="user", epistemic_state="verified", attester="alice"
+        )
+    v = SQLiteMemoryVault(":memory:", auto_gate=False, trust_caller_identity=True)
+    try:
+        e = v.put("c", "k", "fact", origin="user", epistemic_state="verified", attester="alice")
+        assert e.metadata["attestations"] == ["alice"]
+        for bad in ("principal", "", "  "):
+            with pytest.raises(ValueError):
+                v.put("c", "k", "fact", origin="user", epistemic_state="verified", attester=bad)
+        e = v.review_entity("c", "k", "verified", reviewer_id="bob", attester="bob")
+        assert e.epistemic_state == EpistemicState.VERIFIED
+        assert e.metadata["attestations"] == ["alice", "bob"]
+        assert e.metadata["quorum_at_verification"] == 2
+    finally:
+        v.close()
+
+
+def test_b_origin_less_rewrite_of_a_principal_row_does_not_attest_again(vault):
+    """A rewrite that states no origin is not a person's act: it attests nothing, and the row keeps the
+    attestation it had (the account, once) rather than becoming a verified-and-capped contradiction."""
     vault.put("c", "k", "fact", origin="user", author_id="alice", epistemic_state="verified")
     e = vault.put("c", "k", "fact", epistemic_state="verified", author_id="mallory")  # origin omitted
-    assert e.epistemic_state == EpistemicState.VERIFIED
-    assert e.metadata["attestations"] == ["alice", "mallory"]
-    assert e.metadata.get("trust_capped_from") == "verified"
+    assert e.epistemic_state == EpistemicState.CANDIDATE
+    assert e.metadata["attestations"] == [ME]
+    assert e.metadata["verification_pending"] == {"have": 1, "need": 2}
 
 
 def test_b_control_model_and_tool_writes_never_attest(vault):
-    """Positive control (SECURE, passes): a non-principal write asking for verified is capped and signs nothing."""
+    """Positive control: a non-principal write asking for verified is capped and signs nothing."""
     for origin in ("model", "tool", "unknown"):
         e = vault.put("c", f"k-{origin}", "fact", origin=origin, author_id="x", epistemic_state="verified")
         assert e.epistemic_state == EpistemicState.CANDIDATE
@@ -105,16 +129,16 @@ def test_b_control_model_and_tool_writes_never_attest(vault):
 
 
 def test_c_reviewer_label_never_counts(vault):
-    """SECURE behaviour (passes = closed): ``reviewer_label`` is recorded beside ``reviewer_id`` and ignored by the quorum."""
+    """``reviewer_label`` is recorded beside ``reviewer_id`` and ignored by the quorum."""
     vault.remember("c", "k", "fact", origin="model")
     vault.review_entity("c", "k", "verified", reviewer_id="acct", reviewer_label="alice")
     e = vault.review_entity("c", "k", "verified", reviewer_id="acct", reviewer_label="bob")
     assert e.epistemic_state == EpistemicState.CANDIDATE
-    assert e.metadata["attestations"] == ["acct"]
+    assert e.metadata["attestations"] == [ME]
     assert [r["reviewer_label"] for r in e.metadata["human_reviews"]] == ["alice", "bob"]
 
 
-# --- (d) snapshot import: attestations in the file are trusted ----------------------------------------------
+# --- (d) snapshot import: attestations in a foreign file are dropped ----------------------------------------
 
 
 def _snapshot_of_one_candidate(tmp_path):
@@ -126,24 +150,24 @@ def _snapshot_of_one_candidate(tmp_path):
     return path
 
 
-def test_d_snapshot_import_trusts_forged_attestations_so_one_real_approval_mints_verified(vault, tmp_path):
-    """INSECURE behaviour (passes = route open): ``import_snapshot`` writes with ``_trusted_metadata=True``
-    (_vault_snapshot.py:290), so an ``attestations`` list in the file is stored as if principals had signed. The
-    import itself leaves the entry a candidate, but the next single approval reaches the quorum of 2."""
+def test_d_snapshot_import_drops_forged_attestations_so_one_approval_does_not_mint_verified(vault, tmp_path):
+    """F7 fixed: an ``attestations`` list in a snapshot that is not this vault's (no manifest here, and a
+    plaintext source has no seal this vault can check) is dropped on import; the next approval is 1 of 2."""
     path = _snapshot_of_one_candidate(tmp_path)
     data = json.loads(path.read_text())
     data["entities"][0]["metadata"]["attestations"] = ["ghost"]
-    data.pop("manifest_sha256", None)  # a snapshot without a manifest is accepted; with one it is recomputed by the forger
+    data.pop("manifest_sha256", None)
     path.write_text(json.dumps(data))
     assert vault.import_snapshot(str(path)) == 1
-    assert vault.get("c", "k").metadata["attestations"] == ["ghost"]
+    assert "attestations" not in vault.get("c", "k").metadata
     e = vault.review_entity("c", "k", "verified", reviewer_id="real-person")
-    assert e.epistemic_state == EpistemicState.VERIFIED
-    assert e.metadata["attestations"] == ["ghost", "real-person"]
+    assert e.epistemic_state == EpistemicState.CANDIDATE
+    assert e.metadata["attestations"] == [ME]
+    assert e.metadata["verification_pending"] == {"have": 1, "need": 2}
 
 
 def test_d_control_one_approval_on_an_unforged_import_stays_candidate(vault, tmp_path):
-    """Positive control (SECURE, passes): the same snapshot without the forged list needs two approvals."""
+    """Positive control: the same snapshot without the forged list needs two approvals."""
     path = _snapshot_of_one_candidate(tmp_path)
     assert vault.import_snapshot(str(path)) == 1
     e = vault.review_entity("c", "k", "verified", reviewer_id="real-person")
@@ -151,10 +175,9 @@ def test_d_control_one_approval_on_an_unforged_import_stays_candidate(vault, tmp
     assert e.metadata["verification_pending"] == {"have": 1, "need": 2}
 
 
-def test_d_snapshot_import_trusts_forged_human_reviews_which_lock_the_entry_against_the_agent(vault, tmp_path):
-    """INSECURE behaviour (passes = route open): a forged ``human_reviews`` entry makes ``_is_reviewed`` true
-    (vault.py:188-196), so a model-origin rewrite of the imported candidate is refused as if a person had
-    reviewed it, and the MCP recall envelope reports ``reviewed_by`` for a review nobody made."""
+def test_d_snapshot_import_drops_forged_human_reviews_so_the_entry_is_not_locked_against_the_agent(vault, tmp_path):
+    """F7 fixed: a forged ``human_reviews`` list does not survive import, so ``_is_reviewed`` is false, a
+    model-origin rewrite of the imported candidate is allowed, and recall reports no reviewer."""
     path = _snapshot_of_one_candidate(tmp_path)
     data = json.loads(path.read_text())
     data["entities"][0]["metadata"]["human_reviews"] = [
@@ -163,38 +186,60 @@ def test_d_snapshot_import_trusts_forged_human_reviews_which_lock_the_entry_agai
     data.pop("manifest_sha256", None)
     path.write_text(json.dumps(data))
     vault.import_snapshot(str(path))
-    with pytest.raises(ReviewedEntryError):
-        vault.remember("c", "k", "a correction", origin="model")
+    assert "human_reviews" not in vault.get("c", "k").metadata
+    vault.remember("c", "k", "a correction", origin="model")
     server = KibisisMCPServer(vault=vault, scope="default")
-    _, text = _call(server, "kibisis_recall", {"query": "fact"})
-    assert 'reviewed_by="ghost"' in text, text
+    _, text = _call(server, "kibisis_recall", {"query": "correction"})
+    assert "ghost" not in text, text
 
 
-def test_d_snapshot_round_trip_demotes_a_legitimately_verified_entry(tmp_path):
-    """Functional regression (passes = present): the snapshot carries no ``origin``, so ``import_snapshot``'s
-    ``put`` runs with origin ``None`` -> class ``external`` -> the requested ``verified`` is capped
-    (vault.py:821-823). A restore turns a verified principal entry into a candidate with
-    ``trust_capped_from`` and origin ``unknown``. tests/test_cold_start_reload_integrity.py:25 never asserts the
-    state after import, so this is not caught."""
-    src = SQLiteMemoryVault(":memory:", auto_gate=False, verification_quorum=1)
+def test_d_snapshot_round_trip_keeps_a_legitimately_verified_entry(tmp_path):
+    """F11 fixed: the snapshot carries ``origin`` and ``author_id``, and a restore into the same vault (its
+    digest key, manifest intact) keeps a verified principal entry verified and principal."""
+    db = str(tmp_path / "v.db")
+    v = SQLiteMemoryVault(db, passphrase=KEY, auto_gate=False, verification_quorum=1)
+    try:
+        v.put("c", "k", "fact", origin="user", author_id="alice", epistemic_state="verified")
+        assert v.get("c", "k").epistemic_state == EpistemicState.VERIFIED
+        path = tmp_path / "snap.json"
+        v.export_snapshot(str(path))
+        assert v.purge("c", "k", origin="user") is True
+        v.import_snapshot(str(path))
+        e = v.get("c", "k")
+        assert e.epistemic_state == EpistemicState.VERIFIED
+        assert e.origin == "user" and e.metadata["origin_class"] == "principal"
+        assert e.metadata["author_id"] == "alice" and e.metadata["attestations"] == [ME]
+        assert "trust_capped_from" not in e.metadata
+    finally:
+        v.close()
+
+
+def test_d_snapshot_restore_into_another_vault_keeps_the_class_but_not_the_verdict(tmp_path):
+    """F7 + F11: a restore into a vault with another passphrase keeps origin/author (the trust class) but
+    re-derives the state without the attestations it cannot check: candidate, principal, capped."""
+    src = SQLiteMemoryVault(str(tmp_path / "a.db"), passphrase=KEY, auto_gate=False, verification_quorum=1)
     src.put("c", "k", "fact", origin="user", author_id="alice", epistemic_state="verified")
-    assert src.get("c", "k").epistemic_state == EpistemicState.VERIFIED
     path = tmp_path / "snap.json"
     src.export_snapshot(str(path))
-    dst = SQLiteMemoryVault(":memory:", auto_gate=False, verification_quorum=1)
-    dst.import_snapshot(str(path))
-    e = dst.get("c", "k")
-    assert e.epistemic_state == EpistemicState.CANDIDATE
-    assert e.origin == "unknown" and e.metadata["origin_class"] == "external"
-    assert e.metadata["trust_capped_from"] == "verified"
+    src.close()
+    dst = SQLiteMemoryVault(str(tmp_path / "b.db"), passphrase="another " + KEY, auto_gate=False, verification_quorum=1)
+    try:
+        dst.import_snapshot(str(path))
+        e = dst.get("c", "k")
+        assert e.epistemic_state == EpistemicState.CANDIDATE
+        assert e.origin == "user" and e.metadata["origin_class"] == "principal"
+        assert e.metadata["trust_capped_from"] == "verified"
+        assert "attestations" not in e.metadata
+    finally:
+        dst.close()
 
 
 # --- (e) OKF import: closed for the quorum (model origin, reserved keys dropped) -------------------------------
 
 
 def test_e_okf_importer_writes_are_model_origin_and_drop_reserved_keys(vault):
-    """SECURE behaviour (passes = closed): the importer's ``_write`` (okf/importer.py:405, :418) calls ``put`` with
-    ``origin="model"`` and plain ``metadata`` (no ``_trusted_metadata``), so ``attestations`` cannot ride in."""
+    """The importer's ``_write`` calls ``put`` with ``origin="model"`` and plain ``metadata``, so
+    ``attestations`` cannot ride in."""
     from kibisis.okf import importer
 
     assert importer._ORIGIN == "model"
@@ -204,51 +249,60 @@ def test_e_okf_importer_writes_are_model_origin_and_drop_reserved_keys(vault):
     assert "attestations" not in e.metadata and "human_reviews" not in e.metadata
 
 
-# --- (f) KIBISIS_VERIFICATION_QUORUM: read per process at open, never stored ---------------------------------------
+# --- (f) KIBISIS_VERIFICATION_QUORUM: stored in the vault; a lower open is refused --------------------------------
 
 
-def test_f_quorum_is_a_per_process_setting_not_a_vault_property(tmp_path):
-    """INSECURE behaviour (passes = route open): the quorum is ``int(os.environ[...])`` at ``__init__``
-    (vault.py:267-271) and nowhere in the file. A process that opens the same vault with quorum 1 mints
-    ``verified`` with one approval, and a quorum-2 process reads it back as verified with no trace of which
-    quorum minted it."""
+def test_f_quorum_is_stored_and_a_lower_open_is_refused(tmp_path):
+    """F7 fixed: the quorum is persisted in ``vault_meta`` on first open. A process asking for a LOWER
+    quorum than stored gets ``ConfigError``; a higher one is allowed and stored; a verified entry
+    records ``quorum_at_verification``."""
     db = str(tmp_path / "v.db")
     strict = SQLiteMemoryVault(db, passphrase=KEY, auto_gate=False, verification_quorum=2)
     strict.remember("c", "k", "fact", origin="model")
     strict.close()
-    lax = SQLiteMemoryVault(db, passphrase=KEY, auto_gate=False, verification_quorum=1)
-    e = lax.review_entity("c", "k", "verified", reviewer_id="solo")
-    assert e.epistemic_state == EpistemicState.VERIFIED
-    lax.close()
-    strict = SQLiteMemoryVault(db, passphrase=KEY, auto_gate=False, verification_quorum=2)
-    e = strict.get("c", "k")
-    assert e.epistemic_state == EpistemicState.VERIFIED
-    assert "verification_pending" not in e.metadata and e.metadata["attestations"] == ["solo"]
-    strict.close()
+    with pytest.raises(ConfigError):
+        SQLiteMemoryVault(db, passphrase=KEY, auto_gate=False, verification_quorum=1)
+    higher = SQLiteMemoryVault(db, passphrase=KEY, auto_gate=False, verification_quorum=3)
+    assert higher.verification_quorum == 3
+    higher.close()
+    with pytest.raises(ConfigError):
+        SQLiteMemoryVault(db, passphrase=KEY, auto_gate=False, verification_quorum=2)
+    again = SQLiteMemoryVault(db, passphrase=KEY, auto_gate=False, verification_quorum=3)
+    e = again.review_entity("c", "k", "verified", reviewer_id="solo")
+    assert e.epistemic_state == EpistemicState.CANDIDATE
+    assert e.metadata["verification_pending"] == {"have": 1, "need": 3}
+    again.close()
 
 
-@pytest.mark.parametrize("value,expected", [("1", 1), (" 1 ", 1), ("1_0", 10)], ids=["one", "padded", "underscore"])
-def test_f_env_quorum_values_that_lower_or_change_the_quorum(monkeypatch, value, expected):
-    """Behaviour pin (passes): ``int()`` accepts padding and digit separators; ``1`` lowers the quorum to one."""
+def test_f_quorum_one_vault_records_the_quorum_at_verification(tmp_path):
+    db = str(tmp_path / "v.db")
+    v = SQLiteMemoryVault(db, passphrase=KEY, auto_gate=False, verification_quorum=1)
+    v.remember("c", "k", "fact", origin="model")
+    e = v.review_entity("c", "k", "verified", reviewer_id="solo")
+    assert e.epistemic_state == EpistemicState.VERIFIED
+    assert e.metadata["quorum_at_verification"] == 1 and e.metadata["attestations"] == [ME]
+    v.close()
+
+
+@pytest.mark.parametrize("value,expected", [("1", 1), (" 1 ", 1), ("3", 3)], ids=["one", "padded", "three"])
+def test_f_env_quorum_values_accepted(monkeypatch, value, expected):
+    """Whitespace is stripped; a plain positive decimal is the quorum."""
     monkeypatch.setenv("KIBISIS_VERIFICATION_QUORUM", value)
     v = SQLiteMemoryVault(":memory:", auto_gate=False)
     assert v.verification_quorum == expected
 
 
-@pytest.mark.parametrize("value", ["0", "-1", "abc", "2.0", ""], ids=["zero", "negative", "text", "float", "empty"])
-def test_f_env_quorum_values_that_crash_every_opener(monkeypatch, value):
-    """INSECURE-adjacent behaviour (passes = present): a non-positive or non-integer value raises ``ValueError``
-    out of ``SQLiteMemoryVault.__init__``; the MCP server and both CLIs do not catch it (review.py:106-111 catches
-    ConfigError and EncryptionRequiredError only). Whoever sets the variable in the operator's environment
-    denies review until it is unset."""
+@pytest.mark.parametrize("value", ["0", "-1", "abc", "2.0", "", "1_0"], ids=["zero", "negative", "text", "float", "empty", "underscore"])
+def test_f_env_quorum_values_are_refused_with_a_config_error(monkeypatch, value):
+    """F7 fixed: a non-positive, non-integer or digit-separated value is a ``ConfigError`` (not a
+    ``ValueError`` traceback); ``1_0`` is not accepted as ten."""
     monkeypatch.setenv("KIBISIS_VERIFICATION_QUORUM", value)
-    with pytest.raises(ValueError):
+    with pytest.raises(ConfigError):
         SQLiteMemoryVault(":memory:", auto_gate=False)
 
 
-def test_f_review_cli_list_crashes_with_a_traceback_on_a_bad_quorum_value(tmp_path):
-    """INSECURE-adjacent behaviour (passes = present): ``kibisis.review list`` needs no terminal and exits 1 with
-    a traceback, not a refusal message, when the variable is not an integer."""
+def test_f_review_cli_list_refuses_cleanly_on_a_bad_quorum_value(tmp_path):
+    """F7 fixed: ``kibisis.review list`` exits 2 with a one-line refusal, not a traceback."""
     env = {
         **os.environ, "PYTHONPATH": os.pathsep.join(sys.path), "ARGUS_LEDGER_PATH": "",
         "KIBISIS_DB_PATH": str(tmp_path / "v.db"), "KIBISIS_PASSPHRASE": KEY, "KIBISIS_SCOPE": "p",
@@ -256,37 +310,47 @@ def test_f_review_cli_list_crashes_with_a_traceback_on_a_bad_quorum_value(tmp_pa
     }
     r = subprocess.run([sys.executable, "-m", "kibisis.review", "list"], stdin=subprocess.DEVNULL,
                        capture_output=True, text=True, env=env, timeout=60)
-    assert r.returncode == 1
-    assert "Traceback" in r.stderr and "invalid literal for int()" in r.stderr
+    assert r.returncode == 2, (r.stdout, r.stderr)
+    assert "Traceback" not in r.stderr
+    assert "KIBISIS_VERIFICATION_QUORUM" in r.stderr
 
 
 # --- (g) reviewer_id passed directly ---------------------------------------------------------------------------
 
 
-def test_g_review_entity_counts_any_two_strings(vault):
-    """INSECURE behaviour (passes = route open): the library quorum counts ``reviewer_id`` strings
-    (_vault_review.py:474-479); the caller 'vouches'. Two calls from one process with two strings verify."""
+def test_g_review_entity_counts_accounts_not_strings(vault):
+    """F7 fixed: the quorum counts attesting accounts; two ``reviewer_id`` strings from one process are one."""
     vault.remember("c", "k", "fact", origin="model")
     vault.review_entity("c", "k", "verified", reviewer_id="x1")
     e = vault.review_entity("c", "k", "verified", reviewer_id="x2")
-    assert e.epistemic_state == EpistemicState.VERIFIED
-    assert e.metadata["attestations"] == ["x1", "x2"]
-
-
-def test_g_review_entity_with_reviewer_id_none_records_a_review_but_no_attestation(vault):
-    """Behaviour pin (passes): ``reviewer_id=None`` appends a ``human_reviews`` record (which makes ``_is_reviewed``
-    true and locks the entry against model rewrites) while attesting nothing: 0 of 2."""
-    vault.remember("c", "k", "fact", origin="model")
-    e = vault.review_entity("c", "k", "verified", reviewer_id=None)
     assert e.epistemic_state == EpistemicState.CANDIDATE
-    assert e.metadata["verification_pending"] == {"have": 0, "need": 2}
-    assert e.metadata["human_reviews"][0]["reviewer_id"] is None
-    with pytest.raises(ReviewedEntryError):
-        vault.remember("c", "k", "replacement", origin="model")
+    assert e.metadata["attestations"] == [ME]
+    assert [r["reviewer_id"] for r in e.metadata["human_reviews"]] == ["x1", "x2"]
+
+
+def test_g_review_entity_with_reviewer_id_none_records_nothing(vault):
+    """F9 fixed: ``reviewer_id=None`` is a ``ValueError``; no review is recorded, the entry is not locked."""
+    vault.remember("c", "k", "fact", origin="model")
+    with pytest.raises(ValueError):
+        vault.review_entity("c", "k", "verified", reviewer_id=None)
+    e = vault.get("c", "k")
+    assert "human_reviews" not in e.metadata and e.epistemic_state == EpistemicState.CANDIDATE
+    vault.remember("c", "k", "replacement", origin="model")
+
+
+@pytest.mark.parametrize("verdict", ["verified", "disputed", "revoked"])
+def test_g_review_entity_refuses_every_non_principal_reviewer_origin(vault, verdict):
+    """F8 fixed: any ``reviewer_origin`` other than ``user`` is a ``PermissionError`` for every verdict."""
+    vault.remember("c", "k", "fact", origin="model")
+    for origin in ("model", "tool", "import", "unknown"):
+        with pytest.raises(PermissionError):
+            vault.review_entity("c", "k", verdict, reviewer_id="x", reviewer_origin=origin)
+    e = vault.get("c", "k")
+    assert e.epistemic_state == EpistemicState.CANDIDATE and "human_reviews" not in e.metadata
 
 
 def test_g_control_mcp_exposes_no_review_admit_or_put_with_origin_user(vault):
-    """Positive control (SECURE, passes): the MCP surface is remember/recall/forget/verify_ledger/health; its
+    """Positive control: the MCP surface is remember/recall/forget/verify_ledger/health; its
     writes are model-origin and authority arguments are refused, so an MCP-only agent has no quorum route."""
     server = KibisisMCPServer(vault=vault, scope="default")
     resp = server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
@@ -301,4 +365,3 @@ def test_g_control_mcp_exposes_no_review_admit_or_put_with_origin_user(vault):
     e = vault.get("c", "k")
     assert e.epistemic_state == EpistemicState.CANDIDATE
     assert "attestations" not in e.metadata and "human_reviews" not in e.metadata
-    assert e.metadata["agent_metadata"] == {"attestations": ["a", "b"], "human_reviews": [{}]}

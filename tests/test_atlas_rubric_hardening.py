@@ -169,12 +169,12 @@ class TestAtlasRubricHardening(unittest.TestCase):
         # 2. Review invalid verdict rejected
         vault.admit_candidate("cat", "k", "test")
         with self.assertRaises(ValueError) as cm:
-            vault.review_entity("cat", "k", verdict="invalid_verdict")
+            vault.review_entity("cat", "k", verdict="invalid_verdict", reviewer_id="r")
         self.assertIn("Verdict must be one of", str(cm.exception))
 
         # 3. Review non-existent entity raises KeyError
         with self.assertRaises(KeyError) as cm:
-            vault.review_entity("non_cat", "non_k", verdict=EpistemicState.VERIFIED.value)
+            vault.review_entity("non_cat", "non_k", verdict=EpistemicState.VERIFIED.value, reviewer_id="r")
         self.assertIn("Entity not found for review", str(cm.exception))
 
 

@@ -63,7 +63,6 @@ def test_control_model_tombstone_without_content_is_refused(vault):
 # --- F1: tombstone(content=...) skips the origin check on the target --------------------------------
 
 
-@finding("F1")
 @pytest.mark.parametrize("content", [VALUE, "some other text that is stored nowhere"])
 def test_model_tombstone_with_content_argument_must_not_delete_a_verified_entry(vault, content):
     """FAILS if the defect exists. _vault_tombstone.py:185-204: when ``content`` is given, ``target``
@@ -75,7 +74,6 @@ def test_model_tombstone_with_content_argument_must_not_delete_a_verified_entry(
     assert vault.get("ops", "deploy_day") is not None, "verified entry was deleted by a model-origin tombstone"
 
 
-@finding("F1")
 def test_model_tombstone_with_content_must_not_delete_a_person_written_candidate(vault):
     """FAILS if the defect exists. Same path; the K-R1 class check is skipped too."""
     vault.put("ops", "note", "Budget reviews are on the first Monday.", origin="user", author_id="alice")
@@ -87,22 +85,23 @@ def test_model_tombstone_with_content_must_not_delete_a_person_written_candidate
 # --- F2: purge() has no origin at all ----------------------------------------------------------------
 
 
-def test_purge_has_no_origin_parameter_documents_insecure_behaviour(vault):
-    """Documents insecure behaviour (passes). ``purge`` (_vault_tombstone.py:25) takes no ``origin``
-    and deletes a verified principal entry with no check; any library caller relaying an agent has no
-    way to pass the agent's origin."""
+def test_purge_with_a_model_origin_cannot_delete_a_verified_entry(vault):
+    """F10 fixed: ``purge`` takes ``origin`` and runs the same protected() check as ``tombstone``. A
+    model-origin purge of a verified principal entry raises and deletes nothing; the refusal is journaled.
+    ``origin=None`` keeps the old library contract (the caller vouches)."""
     _verified(vault)
-    import inspect
-
-    assert "origin" not in inspect.signature(vault.purge).parameters
-    assert vault.purge("ops", "deploy_day", author_id="mcp-agent") is True
+    with pytest.raises(ReviewedEntryError):
+        vault.purge("ops", "deploy_day", author_id="mcp-agent", origin="model")
+    assert vault.get("ops", "deploy_day") is not None
+    events = [e for e in vault.list_audit_events(limit=50) if e.action == "refuse"]
+    assert any(e.metadata.get("path") == "purge" for e in events), [e.metadata for e in events]
+    assert vault.purge("ops", "deploy_day", author_id="alice", origin="user") is True
     assert vault.get("ops", "deploy_day") is None
 
 
 # --- F3: an agent can permanently deny a value to a person through MCP (remember + forget) ----------
 
 
-@finding("F3")
 def test_mcp_remember_then_forget_must_not_block_a_persons_later_write_of_that_value(vault, server):
     """FAILS if the defect exists. kibisis_forget on the agent's own candidate records a value
     tombstone in the scope (_vault_tombstone.py:223-235); _put refuses every later write of that value
@@ -118,7 +117,6 @@ def test_mcp_remember_then_forget_must_not_block_a_persons_later_write_of_that_v
     assert vault.get("ops", "deploy_day") is not None
 
 
-@finding("F3")
 def test_mcp_forget_canonical_lookalike_also_denies_the_person(vault, server):
     """FAILS if the defect exists. The tombstone matches on the canonical digest, so the denial covers
     look-alikes of the value as well."""
@@ -133,13 +131,13 @@ def test_mcp_forget_canonical_lookalike_also_denies_the_person(vault, server):
 # --- F4: scope='*' tombstone from a model origin --------------------------------------------------------
 
 
-@finding("F4")
 def test_model_origin_tombstone_with_content_and_wildcard_scope_must_not_write_a_global_tombstone(vault):
     """FAILS if the defect exists. With ``content`` and ``scope='*'`` nothing is looked up (no KeyError),
     the copy scan finds nothing, and a '*' tombstone is inserted that refuses the value in every scope."""
     try:
         vault.tombstone("any", "thing", content="A value nobody stored yet", origin="model", scope="*")
-    except (ReviewedEntryError, KeyError, ValueError):
+    except (PermissionError, KeyError, ValueError):  # F19: a non-principal cannot write a '*' tombstone
+        assert vault.list_tombstones() == []
         return  # refused: secure
     assert vault.is_tombstoned("c", "k", "A value nobody stored yet", scope="proj-a") is False, (
         "a model-origin request wrote a wildcard tombstone that binds every scope"

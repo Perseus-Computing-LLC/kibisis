@@ -55,7 +55,8 @@ a guarantee beyond what the named code does.
   see below.)
 - *Re-inserting a forgotten value.* Tombstones keep keyed digests of forgotten values
   (`crypto.keyed_value_digest`, crypto.py; `_seal_digests`, _vault_crypto.py), and `put`, restore and
-  `import_snapshot` refuse a value whose digest matches (`_find_tombstone`, _vault_tombstone.py). The digest is keyed, so
+  `import_snapshot` refuse a value whose digest matches, as content, key or a metadata string
+  (`_tombstones_matching`, _vault_tombstone.py). The digest is keyed, so
   it does not let the file reader test guesses of a short value without the passphrase.
 - *Stalling reads with an absurd KDF cost.* The iteration count in an envelope is read before the tag is
   checked, so it is capped (`AESGCMCryptoEnvelopeProvider.MAX_ITERATIONS`, crypto.py, checked at ).
@@ -108,27 +109,53 @@ also stored in plain text.
 
 **In scope, enforced:**
 
-- A write with `origin="model"` is stored as `candidate` whatever `epistemic_state` it asks for
-  (`_put`, vault.py: `if origin == "model": trust_ceiling = CANDIDATE`). A capped write
-  cannot replace an entry a person verified or reviewed (`ReviewedEntryError`, raised in the write
+- A write with any origin but `user` or `import` is stored as `candidate` whatever `epistemic_state` it
+  asks for, `revoked` included (`_put`, vault.py; the request is kept as `trust_capped_from`). A capped
+  write cannot replace an entry a person verified or reviewed (`ReviewedEntryError`, raised in the write
   transaction after `_is_reviewed`, vault.py); it can only propose a replacement with `supersedes_key`.
+  When such a proposal is approved and the retired entry's dependents are invalidated, a dependent of a
+  higher class or one a person reviewed keeps its state and gets an `invalidation_notice` instead
+  (`_cascade_invalidate`, _vault_review.py), and a lower-class writer's `conflicts_with` /
+  `contrasts_with` back-edges are stored on the writer only (`_record_edges`). The keys `author_id`,
+  `last_verified_at`, `supersession`, `proposed_supersedes` and `slot` are a person's: a non-principal
+  write that sets them has them moved under `agent_metadata`.
+- `tombstone()`, `purge()`, `archive()` and `set_persona_slot()` take `origin` and refuse, with nothing
+  changed and a `refuse` journal event, a model or tool request against an entry a person wrote or
+  reviewed; `tombstone(content=...)` looks the row up and runs the same check before any branch, and
+  deletes nothing when the stored value does not match. A non-principal may not tombstone with
+  `scope="*"`. A tombstone records the class of its maker: a person's write lifts a model-class
+  tombstone (journaled `tombstone_lifted`), a principal-class one blocks everyone until a person runs
+  `python -m kibisis.review lift`. A tombstoned value is refused as a key or a metadata string as well
+  as content; the MCP tools cap keys at 128 characters.
 - The MCP server fixes the trust arguments itself: `_remember` (mcp_server.py ) always passes
   `trust_ceiling="candidate"` and `origin="model"` (mcp_server.py). A call that tries to send
   `epistemic_state`, `auto_gate`, `trust_ceiling`, `author_id`, `reviewer_id`, `tenant_id`, `principal_id`,
   `include_unverified` or `verdict` is refused and journaled as `authority_claim` (`_AUTHORITY_ARGS`, mcp_server.py;
   `_check_args`, mcp_server.py). A call that names another scope is refused as `scope_widening` ().
-- Promotion to `verified` needs a person: `admit` (_vault_review.py) raises `AdmissionRefused` for any
-  `reviewer_origin` other than `"user"`, and `python -m kibisis admit` refuses when stdin is not a terminal
-  (`__main__.py` , exit 3), so the human path cannot be driven through an agent's shell tool or a pipe.
+- Promotion to `verified` needs a person: `admit` (_vault_review.py) raises `AdmissionRefused` and
+  `review_entity` raises `PermissionError` for any `reviewer_origin` other than `"user"`, every verdict,
+  and a verdict with no `reviewer_id` is refused. `python -m kibisis admit` and the review verdicts refuse
+  when stdin is not a terminal (`__main__.py`, exit 3). That check stops pipes and cron jobs; it does not
+  stop an agent that can allocate a pseudo-terminal in the operator's account (see README, Limits).
+- The attestation that counts toward the quorum is the operating-system account running the process
+  (`_resolve_attester`, vault.py), for `put(origin="user")`, `review_entity` and `admit` alike;
+  `author_id` / `reviewer_id` are labels. `attester=` is honoured only on a vault opened with
+  `trust_caller_identity=True` (embedders that authenticate their users), and `"principal"` or an
+  empty name is never a signer. The quorum is stored in `vault_meta` on first open; an open that asks
+  for less is refused (`ConfigError`), one that asks for more is stored, and a verified entry carries
+  `quorum_at_verification`. `_review_verdict` / `_trusted_metadata` are not parameters of the public
+  `put()`; `put_batch` rejects items that carry them.
 - Recall returns entries inside a `<kibisis-recall>` envelope with text escaped (`fence_recall`,
   mcp_server.py ), so a stored instruction cannot close the envelope.
 
 **Out of scope:**
 
 - Code running in the same process as the vault. `review_entity` (_vault_review.py) is the person's API and
-  takes `reviewer_origin` on trust; the library cannot tell who typed it. An agent that can run Python
-  against the vault, or that controls the terminal `python -m kibisis admit` runs in, can admit anything.
-  Keep the vault process and the agent's tool sandbox apart if that matters.
+  takes `reviewer_origin` on trust; the library cannot tell who typed it, though it attests as the
+  account the process runs as, so a library caller cannot add a second attestation by naming one. An
+  agent that can run Python against the vault, or that controls the terminal `python -m kibisis admit`
+  runs in, can admit anything that one account may. Keep the vault process and the agent's tool sandbox
+  apart if that matters.
 - What a candidate says. The admission gate (`MemoryAdmissionGate`) classifies text; it does not judge
   truth. A model can write a false candidate; it stays labelled `candidate` until a person reviews it.
 - A recall that returns the wrong thing is a retrieval quality problem, not a trust bypass: measure it with
@@ -138,14 +165,19 @@ also stored in plain text.
 
 `human_reviews` is what `_is_reviewed` (vault.py) consults, so it is a reserved metadata key
 (`RESERVED_METADATA_KEYS`, vault.py, with `tenant_id`, `principal_id` and `lineage_*`). `_put` drops reserved keys
-from any caller-supplied metadata () unless the caller is one of the vault's own paths that sets
-`_trusted_metadata=True`: `_review_locked` (), which appended the review inside the same write
-transaction, and `import_snapshot` (), which restores a snapshot's review history as exported.
+from any caller-supplied metadata unless the caller is one of the vault's own private paths
+(`_write_review`, which appended the review inside the same write transaction, and `import_snapshot`
+under the rule below); the public `put()` has no way to ask for that.
 
-**Out of scope:** a snapshot file is a trusted input. A forged snapshot can carry `human_reviews` and
-`verified` states; `import_snapshot` checks tombstones and, when the snapshot has one, its `manifest_sha256`
-(vault.py), which is a plain SHA-256 anyone can recompute, not a signature. Treat snapshot files like
-the database file.
+`import_snapshot` keeps a snapshot's `attestations`, `verification_pending` and `human_reviews` only when
+the snapshot is this vault's (its `digest_key_id`, or a `trust_seal` that opens under this passphrase and
+names the entities it carries) and its `manifest_sha256` is present and verifies; otherwise they are
+dropped, the drop is journaled, and the `epistemic_state` is re-derived from what survives (a `verified`
+claim with no attestations becomes `candidate`). Each entity's `origin` and `author_id` are exported and
+restored, so a person's verified entry round-trips as verified and principal within the vault that made
+it. **Out of scope:** a snapshot's content is still a trusted input: `manifest_sha256` is a plain SHA-256,
+and a forged snapshot can carry any content and any candidate. Treat snapshot files like the database
+file.
 
 ### Passphrase handling
 

@@ -190,11 +190,17 @@ def test_gate_can_be_tuned_per_call(vault):
     assert out.results == []  # default gate: a one-word query that matches a crowd is not an answer
 
 
-def test_ttl_by_origin_class_withholds_stale_entries(vault):
+def test_ttl_by_origin_class_withholds_stale_entries(vault, monkeypatch):
     old = time.time() - 10 * 86400
     vault.put("fact", "fresh", "reactor coolant valve note", origin="model")
-    vault.put("fact", "stale", "reactor coolant valve older note", origin="model",
-              metadata={"last_verified_at": old})
+    # last_verified_at is a person's key (L3): a model write cannot set the TTL clock, so the stale
+    # entry is one the agent wrote ten days ago.
+    real_time = time.time
+    monkeypatch.setattr(time, "time", lambda: old)
+    try:
+        vault.put("fact", "stale", "reactor coolant valve older note", origin="model")
+    finally:
+        monkeypatch.setattr(time, "time", real_time)
     out = vault.recall("reactor coolant valve", match="any", ttl_seconds={"agent": 7 * 86400})
     assert {r.entity.key for r in out.results} == {"fresh"}
     stale = [w for w in out.withheld if w.reason == "stale"]

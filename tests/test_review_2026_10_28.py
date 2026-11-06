@@ -35,10 +35,10 @@ def test_tombstone_cannot_land_between_check_and_insert(tmp_path):
 
         checked = threading.Event()
         resume = threading.Event()
-        original = SQLiteMemoryVault._find_tombstone
+        original = SQLiteMemoryVault._tombstones_matching  # the write path's gate
 
-        def paused_find(cursor, scope, val_hash, can_hash):
-            result = original(cursor, scope, val_hash, can_hash)
+        def paused_find(cursor, scope, digests):
+            result = original(cursor, scope, list(digests))
             checked.set()
             resume.wait(10)
             return result
@@ -57,7 +57,7 @@ def test_tombstone_cannot_land_between_check_and_insert(tmp_path):
             except Exception as exc:  # noqa: BLE001
                 errors["b"] = exc
 
-        SQLiteMemoryVault._find_tombstone = staticmethod(paused_find)
+        SQLiteMemoryVault._tombstones_matching = staticmethod(paused_find)
         try:
             t_a = threading.Thread(target=writer)
             t_a.start()
@@ -70,7 +70,7 @@ def test_tombstone_cannot_land_between_check_and_insert(tmp_path):
             t_a.join(30)
             t_b.join(30)
         finally:
-            SQLiteMemoryVault._find_tombstone = staticmethod(original)
+            SQLiteMemoryVault._tombstones_matching = staticmethod(original)
 
         assert not t_a.is_alive() and not t_b.is_alive()
         assert "b" not in errors, errors

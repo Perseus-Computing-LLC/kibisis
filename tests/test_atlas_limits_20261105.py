@@ -191,7 +191,7 @@ def test_library_tombstone_from_a_person_or_unstated_origin_still_deletes(vault,
 
 def test_a_model_origin_revocation_cannot_delete_a_reviewed_entry(vault):
     _verified(vault, "ops", "deploy_day", "Deploys go out on Tuesdays.")
-    with pytest.raises(ReviewedEntryError):
+    with pytest.raises(PermissionError):  # F8: any non-principal reviewer_origin is refused, every verdict
         vault.review_entity("ops", "deploy_day", verdict="revoked", reviewer_id="bot", reviewer_origin="model")
     entity = vault.get("ops", "deploy_day")
     assert entity is not None and entity.epistemic_state == EpistemicState.VERIFIED
