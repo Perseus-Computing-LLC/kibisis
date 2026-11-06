@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -17,6 +18,14 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
 from ._vault_crypto import EntryIntegrityError
+from ._vault_review import ORIGINS as VALID_ORIGINS
+from .models import EpistemicState
+
+#: AAD of a snapshot's trust seal (see ``export_snapshot``).
+_TRUST_SEAL_AAD = b"kibisis snapshot trust seal v1"
+
+#: Metadata an attestation or a person's review produced; see ``import_snapshot``.
+_TRUST_FACT_KEYS = ("attestations", "verification_pending", "human_reviews", "quorum_at_verification")
 
 # The vault's logger: records keep the name callers filter on.
 logger = logging.getLogger("kibisis.vault")
@@ -42,7 +51,7 @@ class SnapshotMixin:
                 """
                 SELECT category, key, content, metadata_json, version, archived,
                        created_at, updated_at, is_encrypted, encrypted_envelope_json,
-                       scope, epistemic_state, valid_from, valid_until, tenant_sig
+                       scope, epistemic_state, valid_from, valid_until, tenant_sig, origin
                 FROM entities
                 WHERE scope = ?
                 ORDER BY scope, category, key
@@ -54,7 +63,7 @@ class SnapshotMixin:
                 """
                 SELECT category, key, content, metadata_json, version, archived,
                        created_at, updated_at, is_encrypted, encrypted_envelope_json,
-                       scope, epistemic_state, valid_from, valid_until, tenant_sig
+                       scope, epistemic_state, valid_from, valid_until, tenant_sig, origin
                 FROM entities
                 ORDER BY scope, category, key
                 """
@@ -82,12 +91,15 @@ class SnapshotMixin:
                 "epistemic_state": r["epistemic_state"],
                 "valid_from": r["valid_from"],
                 "valid_until": r["valid_until"],
+                # K-R1: who wrote it and from where, so a restore keeps the entry's trust class.
+                "origin": r["origin"],
+                "author_id": (json.loads(r["metadata_json"] or "{}") or {}).get("author_id"),
             })
 
         cursor.execute(
             """
             SELECT category, key, value_sha256, canonical_sha256, reason, author_id, created_at, scope,
-                   sealed_digests
+                   sealed_digests, origin_class
             FROM rejected_value_tombstones
             ORDER BY category, key, scope
             """
@@ -103,6 +115,7 @@ class SnapshotMixin:
                 "created_at": r["created_at"],
                 "scope": r["scope"],
                 "sealed_digests": r["sealed_digests"],
+                "origin_class": r["origin_class"],
             }
             for r in cursor.fetchall()
         ]
@@ -127,6 +140,10 @@ class SnapshotMixin:
             "tombstones": tombstones_data,
             "audit_events": events_data,
         }
+        # Trust seal: the entities' digest, sealed under the passphrase (the envelope carries its own
+        # salt, so a vault with the same passphrase but another file can open it). A restore keeps
+        # attestations and reviews only when it can open this seal or the digest key id is its own.
+        snapshot["trust_seal"] = self._seal_trust(entities_data)
 
         canonical_bytes = json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")
         manifest_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
@@ -153,6 +170,33 @@ class SnapshotMixin:
 
         return snapshot
 
+    @staticmethod
+    def _entities_digest(entities: Any) -> str:
+        return hashlib.sha256(json.dumps(entities, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    def _seal_trust(self, entities: Any) -> Optional[str]:
+        if not self._keyed or self.crypto_provider is None or not self.passphrase:
+            return None
+        envelope = self.crypto_provider.encrypt(
+            self._entities_digest(entities).encode("ascii"), self.passphrase, aad=_TRUST_SEAL_AAD
+        )
+        return envelope.model_dump_json()
+
+    def _trust_seal_opens(self, data: Dict[str, Any]) -> bool:
+        """True when the snapshot's ``trust_seal`` opens under this vault's passphrase and names the
+        digest of the entities it carries."""
+        sealed = data.get("trust_seal")
+        if not sealed or self.crypto_provider is None or not self.passphrase:
+            return False
+        try:
+            from .models import EncryptedEnvelope
+
+            envelope = EncryptedEnvelope.model_validate_json(sealed)
+            plain = self.crypto_provider.decrypt(envelope, self.passphrase, aad=_TRUST_SEAL_AAD)
+        except Exception:
+            return False
+        return hmac.compare_digest(plain.decode("ascii", "replace"), self._entities_digest(data.get("entities", [])))
+
     def import_snapshot(
         self,
         snapshot_or_path: Union[str, Path, Dict[str, Any]],
@@ -170,6 +214,16 @@ class SnapshotMixin:
         counted. ``clear_existing`` purges current entities (journaled) but keeps tombstones and
         the audit journal. Archived entities are restored archived.
 
+        Trust facts travel only between vaults that share a passphrase: an entity's ``attestations``,
+        ``verification_pending``, ``human_reviews`` and ``quorum_at_verification`` are kept only when
+        the snapshot is this vault's or a same-passphrase vault's (its ``digest_key_id`` is this
+        vault's, or its ``trust_seal`` opens under this passphrase and names the entities it carries;
+        a vault without a passphrase has neither key nor seal, so its snapshots match any other
+        plaintext vault) and its ``manifest_sha256`` is present and verifies. Otherwise they are dropped, the ``epistemic_state`` is re-derived from what
+        survives (``verified`` and ``disputed`` become ``candidate``; ``revoked`` stays) and the
+        drop is journaled. An entity's ``origin`` and ``author_id`` are restored as exported, so a
+        person's verified entry stays verified and principal when the trust facts are kept.
+
         Returns the number of restored entities.
         """
         if isinstance(snapshot_or_path, (str, Path)):
@@ -181,12 +235,14 @@ class SnapshotMixin:
             raise TypeError("Expected snapshot dict or path")
 
         manifest_sha = data.get("manifest_sha256")
+        manifest_verified = False
         if manifest_sha:
             check_data = {k: v for k, v in data.items() if k != "manifest_sha256"}
             canonical_bytes = json.dumps(check_data, sort_keys=True, separators=(",", ":")).encode("utf-8")
             recomputed = hashlib.sha256(canonical_bytes).hexdigest()
             if recomputed != manifest_sha:
                 raise ValueError(f"Snapshot integrity violation: manifest mismatch {recomputed} != {manifest_sha}")
+            manifest_verified = True
 
         imported_count = 0
         foreign_tombstones = 0
@@ -194,6 +250,12 @@ class SnapshotMixin:
         same_key = (
             scheme == "hmac-sha256" and self._digest_key is not None and data.get("digest_key_id") == self._digest_key_id()
         )
+        # Attestations and reviews are facts this vault's people established. They are taken from a
+        # snapshot only when it came from this vault (its digest key id: per file when keyed, absent
+        # for a vault without a passphrase) and is whole (manifest present and verified).
+        same_vault = data.get("digest_key_id") == self._digest_key_id() or self._trust_seal_opens(data)
+        keep_trust_facts = same_vault and manifest_verified
+        stripped_trust_facts = 0
         with self._write_tx() as cursor:
             self._fence(cursor, fencing_token, resource, holder_id)
             for ts in data.get("tombstones", []):
@@ -215,9 +277,9 @@ class SnapshotMixin:
                     """
                     INSERT OR IGNORE INTO rejected_value_tombstones (
                         category, key, value_sha256, canonical_sha256, reason, author_id, created_at, scope,
-                        sealed_digests
+                        sealed_digests, origin_class
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         t_category,
@@ -229,6 +291,9 @@ class SnapshotMixin:
                         ts.get("created_at", time.time()),
                         t_scope,
                         sealed,
+                        # A tombstone from elsewhere keeps its class when it is known; one without a
+                        # class is as old as the column and was made by a vouching caller.
+                        ts.get("origin_class") or "principal",
                     ),
                 )
             if clear_existing:
@@ -262,32 +327,60 @@ class SnapshotMixin:
 
         for ent_data in data.get("entities", []):
             scope = ent_data.get("scope", "default")
+            category, key = ent_data["category"], ent_data["key"]
+            metadata = dict(ent_data.get("metadata") or {})
+            state = ent_data.get("epistemic_state", "verified")
+            origin = ent_data.get("origin") or None
+            if origin is not None and origin not in VALID_ORIGINS:
+                origin = None
             val_hash, can_hash = self._digests(ent_data["content"])
-            if self._find_tombstone(self._conn.cursor(), scope, val_hash, can_hash) is not None:
+            tomb = self._find_tombstone(self._conn.cursor(), scope, val_hash, can_hash)
+            if tomb is None:
+                tombs = self._tombstones_matching(
+                    self._conn.cursor(), scope, self._entry_digests(key, ent_data["content"], metadata)
+                )
+                tomb = tombs[0] if tombs else None
+            if tomb is not None:
                 self.record_refusal(
                     path="import_snapshot",
                     reason="tombstoned value",
                     scope=scope,
-                    category=ent_data.get("category", ""),
-                    key=ent_data.get("key", ""),
+                    category=category,
+                    key=key,
                     detail={"value_digest_prefix": val_hash[:12]},
                 )
                 continue
-            self.put(
-                category=ent_data["category"],
-                key=ent_data["key"],
+            if not keep_trust_facts:
+                dropped = [k for k in _TRUST_FACT_KEYS if k in metadata]
+                for k in dropped:
+                    metadata.pop(k)
+                if dropped:
+                    stripped_trust_facts += 1
+                    metadata["trust_facts_dropped_on_import"] = sorted(dropped)
+                if state in (EpistemicState.VERIFIED.value, EpistemicState.DISPUTED.value):
+                    # Those states are the outcome of attestations or reviews, which did not survive.
+                    metadata["trust_capped_from"] = state
+                    state = EpistemicState.CANDIDATE.value
+            self._put_journaled(
+                category=category,
+                key=key,
                 content=ent_data["content"],
-                metadata=ent_data.get("metadata"),
-                epistemic_state=ent_data.get("epistemic_state", "verified"),
+                metadata=metadata,
+                epistemic_state=state,
                 valid_from=ent_data.get("valid_from"),
                 valid_until=ent_data.get("valid_until"),
                 scope=scope,
+                origin=origin,
+                author_id=ent_data.get("author_id"),
                 fencing_token=fencing_token,
                 resource=resource,
                 holder_id=holder_id,
-                # A restore keeps the exported review history and tenant bounds. The snapshot's
-                # epistemic_state is already trusted here, so this grants nothing it did not have.
+                # A restore keeps the exported review history (when it is this vault's, see above) and
+                # tenant bounds; the state passed is the one the facts that survived support, and the
+                # vault still caps a non-principal origin to candidate. Nothing attests on a restore.
                 _trusted_metadata=True,
+                _review_verdict=keep_trust_facts and state != EpistemicState.CANDIDATE.value,
+                _attest=False,
             )
             if ent_data.get("archived"):
                 self.archive(
@@ -300,4 +393,15 @@ class SnapshotMixin:
                 )
             imported_count += 1
 
+        if stripped_trust_facts:
+            self.record_refusal(
+                path="import_snapshot",
+                reason="trust facts dropped: snapshot is not from this vault's key or has no verified manifest",
+                scope="*",
+                detail={
+                    "entities": stripped_trust_facts,
+                    "same_vault": "yes" if same_vault else "no",
+                    "manifest_verified": "yes" if manifest_verified else "no",
+                },
+            )
         return imported_count
