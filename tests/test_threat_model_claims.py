@@ -19,6 +19,7 @@ def _no_sqlcipher(monkeypatch):
     monkeypatch.delenv("KIBISIS_PASSPHRASE", raising=False)
     monkeypatch.delenv("KIBISIS_PASSPHRASE_FILE", raising=False)
     monkeypatch.setattr(vault_module, "sqlcipher3", sqlite3)
+    monkeypatch.setenv("KIBISIS_ALLOW_PLAINTEXT", "1")  # fallback mode is opt-in: the file is plain on disk
     monkeypatch.setattr(vault_module, "_sqlcipher_available", lambda: False)
 
 
@@ -87,12 +88,14 @@ def test_trust_flip_is_not_caught_without_sqlcipher(tmp_path):
     vault.close()
 
 
-def test_deleting_journal_and_head_together_is_not_caught(tmp_path):
-    """SECURITY.md, 'Deleting the whole journal together with its head'."""
+def test_deleting_journal_and_head_together_is_caught(tmp_path):
+    """SECURITY.md, 'Deleting the whole journal together with its head': a keyed vault records that its
+    journal has held a row, so an empty journal with no head fails verification."""
     path = _seeded(tmp_path / "v.sqlite")
     _edit(path, "DELETE FROM audit_journal")
     _edit(path, "DELETE FROM audit_head")
     vault = SQLiteMemoryVault(str(path), passphrase=PASS, auto_gate=False)
-    assert vault.verify_audit_chain() is True
+    assert vault.verify_audit_chain() is False
+    assert "no signed head" in vault.last_chain_error
     assert vault.get("decision", "person_fact") is not None  # entries stay readable
     vault.close()

@@ -75,7 +75,10 @@ class SnapshotMixin:
         for r in raw_entities:
             try:
                 content = self._open_entry(r)
-            except EntryIntegrityError:
+            except EntryIntegrityError as exc:
+                self._note_integrity_failure(r, exc)  # logged, counted; raised under strict=True
+                if self.strict:
+                    raise
                 unreadable += 1  # failed its integrity check; never exported
                 continue
             entities_data.append({
@@ -192,7 +195,10 @@ class SnapshotMixin:
             from .models import EncryptedEnvelope
 
             envelope = EncryptedEnvelope.model_validate_json(sealed)
-            plain = self.crypto_provider.decrypt(envelope, self.passphrase, aad=_TRUST_SEAL_AAD)
+            # The seal was made by another vault's provider under its own salt; open it the way a
+            # carried-over tombstone is opened (one envelope, iteration count capped).
+            opener = getattr(self.crypto_provider, "decrypt_foreign", self.crypto_provider.decrypt)
+            plain = opener(envelope, self.passphrase, aad=_TRUST_SEAL_AAD)
         except Exception:
             return False
         return hmac.compare_digest(plain.decode("ascii", "replace"), self._entities_digest(data.get("entities", [])))
@@ -277,9 +283,9 @@ class SnapshotMixin:
                     """
                     INSERT OR IGNORE INTO rejected_value_tombstones (
                         category, key, value_sha256, canonical_sha256, reason, author_id, created_at, scope,
-                        sealed_digests, origin_class
+                        sealed_digests, origin_class, tombstone_mac
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         t_category,
@@ -294,6 +300,7 @@ class SnapshotMixin:
                         # A tombstone from elsewhere keeps its class when it is known; one without a
                         # class is as old as the column and was made by a vouching caller.
                         ts.get("origin_class") or "principal",
+                        self._tombstone_mac(t_scope, t_category, t_key, exact, canonical, ts.get("origin_class") or "principal"),
                     ),
                 )
             if clear_existing:

@@ -99,29 +99,23 @@ def test_control_sequence_out_of_u64_raises_overflow(bad):
         native.event_hash_v3(bad, 0.0, "a", "b", "c", "d", "", "0" * 64, None, None)
 
 
-def test_attack_native_ttl_overflow_panics_across_pyo3(tmp_path):
-    """DEMONSTRATES (passing = bug, low): bindings/python/src/lib.rs:31-38 checks ttl is finite and > 0,
-    then calls Duration::from_secs_f64, which PANICS for values that overflow Duration (>= ~1.8e19).
-    The panic surfaces as pyo3_runtime.PanicException, a BaseException that `except Exception` does not
-    catch. kibisis.lease.FileLeaseCoordinator caps TTLs at 86400 s, so only direct native users hit it."""
+def test_attack_native_ttl_overflow_is_a_value_error(tmp_path):
+    """L6: a ttl that overflows Duration is refused with ValueError (Duration::try_from_secs_f64), never a
+    PanicException; the rejection for non-finite and non-positive values stays."""
     coord = native.FileLeaseCoordinator(str(tmp_path / "leases"))
-    caught = None
-    try:
-        coord.acquire("r", "h", 1e300)
-    except Exception as exc:  # a normal error would land here
-        caught = ("Exception", type(exc).__name__, str(exc))
-    except BaseException as exc:
-        caught = ("BaseException", type(exc).__name__, str(exc))
-    print("native acquire(ttl=1e300) ->", caught)
-    assert caught is not None
-    assert caught[0] == "BaseException" and caught[1] == "PanicException"
+    for bad in (1e300, float("inf"), float("nan"), 0.0, -1.0, 1.9e19):
+        with pytest.raises(ValueError):
+            coord.acquire("r", "h", bad)
+    lease = coord.acquire("r", "h", 5.0)
+    with pytest.raises(ValueError):
+        coord.renew(lease, 1e300)
+    assert coord.renew(lease, 5.0) is True
 
 
-def test_attack_native_coordinator_concurrent_mut_borrow_raises(tmp_path):
-    """DEMONSTRATES (passing = bug, low): PyFileLeaseCoordinator.acquire takes &mut self and releases the
-    GIL (py.detach) while blocking on the OS file lock. A second thread calling acquire on the same
-    native object gets RuntimeError('Already borrowed') instead of waiting. The Python wrapper
-    (kibisis.lease) serialises with an RLock, so this reaches only direct users of kibisis_native."""
+def test_attack_native_coordinator_concurrent_calls_wait_instead_of_raising(tmp_path):
+    """L6: the coordinator sits behind a mutex and every method takes &self, so a second thread calling
+    acquire while the first blocks on the OS file lock waits its turn; nobody sees 'Already borrowed'.
+    The first thread wins the lease, the second gets a LeaseConflict, in that order."""
     d = tmp_path / "leases"
     coord = native.FileLeaseCoordinator(str(d))
     lock_path = d / (hashlib.sha256(b"res").hexdigest() + ".lock")
@@ -143,14 +137,23 @@ def test_attack_native_coordinator_concurrent_mut_borrow_raises(tmp_path):
     started.wait()
     import time
     time.sleep(0.3)  # let thread A enter py.detach and block on flock
-    try:
-        coord.acquire("res", "B", 5.0)
-        result["b"] = "ok"
-    except BaseException as exc:
-        result["b"] = f"{type(exc).__name__}: {exc}"
-    finally:
-        fcntl.flock(holder, fcntl.LOCK_UN)
-        holder.close()
+
+    def second():
+        try:
+            coord.acquire("res", "B", 5.0)
+            result["b"] = "ok"
+        except BaseException as exc:
+            result["b"] = f"{type(exc).__name__}: {exc}"
+
+    t2 = threading.Thread(target=second)
+    t2.start()
+    t2.join(0.5)
+    assert t2.is_alive(), "the second call must wait, not return while the first still blocks"
+    assert "b" not in result
+    fcntl.flock(holder, fcntl.LOCK_UN)
+    holder.close()
     t.join(5)
-    print("thread A:", result.get("a"), "| main B:", result.get("b"))
-    assert "Already" in str(result["b"]) and "RuntimeError" in str(result["b"])
+    t2.join(5)
+    assert result["a"] == 1
+    assert result["b"].startswith("LeaseConflict")
+    assert "Already" not in result["b"]

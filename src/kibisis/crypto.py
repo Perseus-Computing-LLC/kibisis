@@ -8,7 +8,7 @@ import hashlib
 import hmac
 import json
 import os
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -94,25 +94,43 @@ class AESGCMCryptoEnvelopeProvider(CryptoEnvelopeProvider):
 
     def decrypt(self, envelope: EncryptedEnvelope, passphrase: str, aad: Optional[bytes] = None) -> bytes:
         """Open an envelope. Fails (``cryptography.exceptions.InvalidTag``) on a wrong passphrase, damaged
-        data, or ``aad`` that differs from the bytes it was sealed with."""
-        if envelope.cipher != "aes-256-gcm":
-            raise ValueError(f"Unsupported cipher: {envelope.cipher}")
+        data, or ``aad`` that differs from the bytes it was sealed with.
+
+        A provider bound to a vault salt (``salt=`` given) derives the key from that salt at
+        :attr:`ITERATIONS` only: the envelope's own ``salt_b64`` and ``iterations`` are not used, and an
+        envelope that names another salt is refused (``ValueError``) before any key derivation, so a
+        writer with database access cannot pick the salt or the cost a read runs under. Every envelope a
+        vault has written since 0.1.0a5 carries the vault salt at this count, so stored rows still open.
+        An unbound provider keeps opening envelopes under their own salt and count (capped by
+        :attr:`MAX_ITERATIONS`); :meth:`decrypt_foreign` does the same for one envelope of a bound one.
+        """
+        if self._salt is not None:
+            envelope_salt = base64.b64decode(envelope.salt_b64)
+            if not hmac.compare_digest(envelope_salt, self._salt):
+                raise ValueError("Envelope was not sealed under this vault's salt")
+            return self._open(envelope, passphrase, self._salt, self.ITERATIONS, aad)
+        return self.decrypt_foreign(envelope, passphrase, aad)
+
+    def decrypt_foreign(self, envelope: EncryptedEnvelope, passphrase: str, aad: Optional[bytes] = None) -> bytes:
+        """Open an envelope sealed under another salt (a tombstone carried over from another vault that
+        shares the passphrase). The envelope's iteration count is honoured up to :attr:`MAX_ITERATIONS`."""
         if envelope.iterations > self.MAX_ITERATIONS:
             # Checked before PBKDF2 runs: the cost is paid before the tag could reject the row.
             raise ValueError(
                 f"Envelope iteration count {envelope.iterations} exceeds the limit {self.MAX_ITERATIONS}"
             )
+        return self._open(envelope, passphrase, base64.b64decode(envelope.salt_b64), envelope.iterations, aad)
 
-        salt = base64.b64decode(envelope.salt_b64)
+    def _open(
+        self, envelope: EncryptedEnvelope, passphrase: str, salt: bytes, iterations: int, aad: Optional[bytes]
+    ) -> bytes:
+        if envelope.cipher != "aes-256-gcm":
+            raise ValueError(f"Unsupported cipher: {envelope.cipher}")
         nonce = base64.b64decode(envelope.nonce_b64)
         ciphertext = base64.b64decode(envelope.ciphertext_b64)
         tag = base64.b64decode(envelope.tag_b64) if envelope.tag_b64 else b""
-
-        full_payload = ciphertext + tag
-        key = self._derive_key(passphrase, salt, envelope.iterations)
-        aesgcm = AESGCM(key)
-
-        return aesgcm.decrypt(nonce, full_payload, associated_data=aad)
+        key = self._derive_key(passphrase, salt, iterations)
+        return AESGCM(key).decrypt(nonce, ciphertext + tag, associated_data=aad)
 
 
 def derive_vault_keys(passphrase: str, vault_salt: bytes) -> Tuple[bytes, bytes, bytes]:
@@ -179,6 +197,62 @@ def keyed_value_digest(digest_key: bytes, sha256_hex: str) -> str:
     if not sha256_hex:
         return ""
     return hmac.new(digest_key, b"kibisis-value-digest:" + sha256_hex.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def tombstone_mac(
+    signing_key: bytes, scope: str, category: str, key: str, value_sha256: str, canonical_sha256: str,
+    origin_class: str = "principal",
+) -> str:
+    """HMAC-SHA256 over a tombstone row's identifying columns, stored in ``tombstone_mac``.
+
+    A tombstone is what keeps a rejected value out; without this a writer with database access could
+    delete or edit the row and the value would be accepted again, unnoticed. The origin class is covered
+    too, so a principal tombstone cannot be relabelled as one an agent may override. Every lookup hit and
+    every open verifies it. Without a passphrase the key is not secret (it is derived from the path), so the
+    MAC then catches accidental damage only.
+    """
+    msg = _encode(["kibisis-tombstone-mac", 2, scope, category, key, value_sha256, canonical_sha256, origin_class])
+    return hmac.new(signing_key, msg, hashlib.sha256).hexdigest()
+
+
+def verify_tombstone_mac(
+    signing_key: bytes,
+    scope: str,
+    category: str,
+    key: str,
+    value_sha256: str,
+    canonical_sha256: str,
+    mac: Optional[str],
+    origin_class: str = "principal",
+) -> bool:
+    """Constant-time check of a :func:`tombstone_mac`. A missing MAC fails."""
+    if not mac:
+        return False
+    return hmac.compare_digest(
+        str(mac), tombstone_mac(signing_key, scope, category, key, value_sha256, canonical_sha256, origin_class)
+    )
+
+
+#: ``vault_meta`` keys bound together by :func:`vault_meta_mac`, in the order they are encoded.
+VAULT_META_BOUND_KEYS = ("integrity_format", "kdf_salt", "key_check", "journal_format_floor", "journal_anchored",
+                         "term_index_format")
+
+
+def vault_meta_mac(signing_key: bytes, fields: Dict[str, Any]) -> str:
+    """HMAC-SHA256 over the ``vault_meta`` values that decide how a vault is checked and opened
+    (:data:`VAULT_META_BOUND_KEYS`). Each is encoded as its text form, bytes as hex, a missing key as
+    ``null``, so a writer with database access cannot lower the integrity format, swap the salt, drop
+    the key check or the journal floor, or change the term index format without the signing key."""
+    parts: List[Any] = ["kibisis-vault-meta-mac", 1]
+    for name in VAULT_META_BOUND_KEYS:
+        value = fields.get(name)
+        if value is None:
+            parts.append(None)
+        elif isinstance(value, (bytes, bytearray, memoryview)):
+            parts.append(bytes(value).hex())
+        else:
+            parts.append(str(value))
+    return hmac.new(signing_key, _encode(parts), hashlib.sha256).hexdigest()
 
 
 def sign_tenant_payload(key: bytes, tenant_id: str, entity_id: str, content: str) -> str:

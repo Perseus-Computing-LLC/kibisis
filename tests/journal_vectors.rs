@@ -6,7 +6,8 @@
 
 use kibisis::journal::{
     event_hash_v3, event_payload_v3, head_mac_v1, hmac_sha256_hex, json_quote, verify_chain,
-    ChainError, EventFields, JournalHead, GENESIS_HASH, HEAD_MAC_DOMAIN, JOURNAL_FORMAT,
+    verify_chain_with, ChainError, EventFields, JournalHead, GENESIS_HASH, HEAD_MAC_DOMAIN,
+    JOURNAL_FORMAT,
 };
 use kibisis::AuditEvent;
 use serde_json::Value;
@@ -202,8 +203,25 @@ fn chain_vector_verifies() {
         JournalHead::sign(&key, head.sequence, &head.event_hash),
         head
     );
-    // An empty journal with no head is sound.
+    // An empty journal with no head is sound, unless the vault records that the journal has held a
+    // row: then the head is demanded, and only a head naming a row that is there satisfies it.
     assert_eq!(verify_chain(&[], None, &key), Ok(()));
+    assert_eq!(
+        verify_chain_with(&[], None, &key, true),
+        Err(ChainError::MissingHead)
+    );
+    assert_eq!(
+        verify_chain_with(&events, None, &key, true),
+        Err(ChainError::MissingHead)
+    );
+    assert_eq!(verify_chain_with(&events, Some(&head), &key, true), Ok(()));
+    assert!(matches!(
+        verify_chain_with(&[], Some(&head), &key, true),
+        Err(ChainError::TailCut {
+            head_sequence: 5,
+            last_sequence: None
+        })
+    ));
 }
 
 #[test]

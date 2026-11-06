@@ -156,17 +156,17 @@ class TombstoneMixin:
                 )
             return purged
 
-    @staticmethod
-    def _find_tombstone(cursor: Any, scope: str, val_hash: str, can_hash: str) -> Optional[Any]:
+    def _find_tombstone(self, cursor: Any, scope: str, val_hash: str, can_hash: str) -> Optional[Any]:
         """Return the first tombstone in ``scope`` (or a ``'*'`` tombstone) that rejects this value.
 
         Category and key play no part: a tombstone stops a value, not a key, so a rejected value
         cannot come back under a new key or category. Scopes stay separate, so one tenant's
-        rejection neither blocks nor reveals another tenant's writes.
+        rejection neither blocks nor reveals another tenant's writes. A hit must carry a valid
+        ``tombstone_mac`` (:meth:`_verify_tombstone_row`); an edited row raises ``VaultIntegrityError``.
         """
         cursor.execute(
             """
-            SELECT id, category, key, reason, author_id, origin_class, scope, value_sha256
+            SELECT id, category, key, reason, author_id, origin_class, scope, value_sha256, canonical_sha256, tombstone_mac
             FROM rejected_value_tombstones
             WHERE (scope = ? OR scope = '*')
               AND (value_sha256 = ? OR (canonical_sha256 != '' AND canonical_sha256 = ?))
@@ -175,16 +175,20 @@ class TombstoneMixin:
             """,
             (scope, val_hash, can_hash),
         )
-        return cursor.fetchone()
+        row = cursor.fetchone()
+        if row is not None:
+            self._verify_tombstone_row(row)
+        return row
 
-    @staticmethod
-    def _tombstones_matching(cursor: Any, scope: str, digests: Iterable[Tuple[str, str]]) -> List[Any]:
-        """Every tombstone in ``scope`` (or global) that rejects any of the ``(exact, canonical)`` digests."""
+    def _tombstones_matching(self, cursor: Any, scope: str, digests: Iterable[Tuple[str, str]]) -> List[Any]:
+        """Every tombstone in ``scope`` (or global) that rejects any of the ``(exact, canonical)`` digests.
+        Each hit must carry a valid ``tombstone_mac`` (:meth:`_verify_tombstone_row`)."""
         found: Dict[int, Any] = {}
         for val_hash, can_hash in digests:
             cursor.execute(
                 """
-                SELECT id, category, key, reason, author_id, origin_class, scope, value_sha256
+                SELECT id, category, key, reason, author_id, origin_class, scope, value_sha256,
+                       canonical_sha256, tombstone_mac
                 FROM rejected_value_tombstones
                 WHERE (scope = ? OR scope = '*')
                   AND (value_sha256 = ? OR (canonical_sha256 != '' AND canonical_sha256 = ?))
@@ -193,7 +197,9 @@ class TombstoneMixin:
                 (scope, val_hash, can_hash),
             )
             for row in cursor.fetchall():
-                found.setdefault(row["id"], row)
+                if row["id"] not in found:
+                    self._verify_tombstone_row(row)
+                    found[row["id"]] = row
         return [found[i] for i in sorted(found)]
 
     def _entry_digests(self, key: str, content: str, meta: Optional[Dict[str, Any]]) -> List[Tuple[str, str]]:
@@ -386,13 +392,14 @@ class TombstoneMixin:
                 """
                 INSERT OR REPLACE INTO rejected_value_tombstones (
                     category, key, value_sha256, canonical_sha256, reason, author_id, created_at, scope,
-                    sealed_digests, origin_class
+                    sealed_digests, origin_class, tombstone_mac
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     category, key, val_hash, can_hash, reason, author_id, now, scope,
                     self._seal_digests(scope, category, key, plain_exact, plain_canonical), requester,
+                    self._tombstone_mac(scope, category, key, val_hash, can_hash, requester),
                 ),
             )
             # Physical purge of the entity when it holds the value (the FTS index follows through triggers).

@@ -16,7 +16,7 @@ Subject: `[SECURITY] Kibisis Vulnerability Report`
 - **Fix & Advisory**: Within 14 calendar days for verified high/critical vulnerabilities.
 
 ## Scope
-- **Python package:** each entry's content is sealed with AES-256-GCM under a key derived with PBKDF2-HMAC-SHA256 (600,000 iterations). An on-disk vault will not open without a passphrase unless you pass `allow_plaintext=True`. With `sqlcipher3` installed, SQLCipher also encrypts the whole database file, including categories, keys and metadata. Without it, those fields are stored in plain text and Kibisis logs a warning. With or without SQLCipher, each entry is signed with a key derived from the passphrase by PBKDF2 and its sealed content is bound to the entry, so entries cannot be swapped or altered without the passphrase, and the value digests kept in the journal and in tombstones are keyed, so they do not reveal short values.
+- **Python package:** each entry's content is sealed with AES-256-GCM under a key derived with PBKDF2-HMAC-SHA256 (600,000 iterations). An on-disk vault will not open without a passphrase unless you pass `allow_plaintext=True` (or set `KIBISIS_ALLOW_PLAINTEXT=1`; `aml-serve --plaintext` does the same). With `sqlcipher3` installed, SQLCipher also encrypts the whole database file, including categories, keys and metadata. Without it, an on-disk vault with a passphrase is refused as well (`EncryptionRequiredError`, naming what would be stored in plain text) unless the same opt-in is given, in which case those fields are stored in plain text and Kibisis logs a warning; `vault.encrypted_at_rest` reports which it is. With or without SQLCipher, each entry is signed with a key derived from the passphrase by PBKDF2 and its sealed content is bound to the entry, so entries cannot be swapped or altered without the passphrase, and the value digests kept in the journal and in tombstones are keyed, so they do not reveal short values.
 - **Search index:** with SQLCipher, a vault with a passphrase keeps a full-text index of entry content in the database file so that search can rank sealed entries. It holds each entry's words and their positions, enough to rebuild the entry's text without case or punctuation, and SQLCipher's whole-file encryption protects it, not the entry's AES-256-GCM seal; both keys come from the passphrase. Without SQLCipher, entry words are never written to disk: search uses an index of keyed tokens of the words (HMAC under a passphrase-derived key), whose shape, not content, is readable from the file; see the threat model. Words of deleted or replaced entries stay in index pages until `scrub()` rebuilds the index (the MCP server's forget runs it).
 - **Rust crate:** holds memory in RAM and does not encrypt it.
 - **Leases:** Rust's `InMemoryLeaseCoordinator` coordinates threads in one process. Rust's `FileLeaseCoordinator` and Python's `SQLiteLeaseCoordinator` coordinate processes on one machine that share a directory or an SQLite file on a local filesystem. None of them is a distributed lock. A Python vault opened with `enforce_fencing=True` refuses writes that do not carry the current fencing token; otherwise it checks a token only when a call passes one. The MCP server and the Rust crate do not check tokens.
@@ -44,22 +44,42 @@ a guarantee beyond what the named code does.
 - *Changing an entry's text.* Each entry is signed over its scope, category, key and content
   (`crypto.sign_entry`, crypto.py; applied by `SQLiteMemoryVault._sign`, _vault_crypto.py). A vault with a
   passphrase derives the signing key from the passphrase (`crypto.derive_integrity_keys`: one PBKDF2
-  stretch, split with HKDF). Every read checks the signature (`_open_entry`, _vault_crypto.py) and search
-  leaves a failing row out (`_readable_content`, _vault_crypto.py). Sealed content is also bound to its entry by
-  AES-GCM associated data (`crypto.entry_aad`), so a sealed value moved to another row fails to open.
+  stretch, split with HKDF). Every read checks the signature (`_open_entry`, _vault_crypto.py); `get` raises
+  `EntryIntegrityError`, and search, listing and snapshot export leave a failing row out and say so: a WARNING
+  naming the category and key, a count and the last few names in `vault.integrity_failures`, and under
+  `strict=True` the same error instead (`_readable_content`, _vault_crypto.py). Sealed content is also bound to
+  its entry by AES-GCM associated data (`crypto.entry_aad`), so a sealed value moved to another row fails to
+  open, and an envelope that names another salt is refused before any key derivation (the vault's own
+  `kdf_salt` and iteration count are the only ones used).
 - *Removing the tail of the journal, or rows under its head.* Every write appends a row whose hash chains from
   the previous one (`_record_audit_event`, _vault_audit.py) and re-signs the chain head with an HMAC under the
   signing key (`_write_audit_head`, _vault_audit.py; `_head_mac`, _vault_audit.py). `verify_audit_chain` (_vault_audit.py) recomputes every
-  row, then requires a head with a valid MAC that names the last row; a deleted tail, a deleted head with
-  rows still present, or rows removed under a head fails. (Deleting rows and head together is not caught:
-  see below.)
+  row (streaming, so any journal size verifies), then requires a head with a valid MAC that names the last
+  row; a deleted tail, a deleted head with rows still present, or rows removed under a head fails. The rules
+  are those of `kibisis::journal::verify_chain` in the crate (`kibisis_native.verify_chain` gives the same
+  verdict on the same rows). A keyed vault pins the lowest journal format it holds and whether its journal
+  has ever held a row in `vault_meta` (`journal_format_floor`, `journal_anchored`), under the meta MAC
+  below, so rows rewritten in an older, unkeyed hash layout are refused and deleting every row together
+  with the head is caught too.
 - *Re-inserting a forgotten value.* Tombstones keep keyed digests of forgotten values
   (`crypto.keyed_value_digest`, crypto.py; `_seal_digests`, _vault_crypto.py), and `put`, restore and
   `import_snapshot` refuse a value whose digest matches, as content, key or a metadata string
   (`_tombstones_matching`, _vault_tombstone.py). The digest is keyed, so
   it does not let the file reader test guesses of a short value without the passphrase.
-- *Stalling reads with an absurd KDF cost.* The iteration count in an envelope is read before the tag is
-  checked, so it is capped (`AESGCMCryptoEnvelopeProvider.MAX_ITERATIONS`, crypto.py, checked at ).
+  Each tombstone row
+  carries an HMAC under the signing key (`crypto.tombstone_mac`), checked at open and on every hit, so an
+  edited or planted row is refused rather than honoured; and at open every `tombstone` event in the journal
+  (not undone by a `tombstone_lifted` event) must still have its row, so a deleted row refuses the open
+  (`VaultIntegrityError`) instead of readmitting the value.
+- *Editing the integrity record.* `vault_meta.integrity_format`, `kdf_salt`, `key_check`, the journal format
+  floor and anchoring, and `term_index_format` are bound under one HMAC (`meta_mac`, `crypto.vault_meta_mac`).
+  A keyed vault whose MAC is missing or does not verify, or whose `key_check` is missing, refuses to open;
+  the key check is compared before any migration or file conversion, and a migration whose previous chain
+  does not verify refuses instead of re-signing it.
+- *Stalling reads with an absurd KDF cost.* A provider bound to a vault derives keys from the vault's own
+  salt at the fixed iteration count only; the salt and count written in an envelope are not used, and a
+  foreign salt is refused before any derivation (`AESGCMCryptoEnvelopeProvider.decrypt`, crypto.py). The cap
+  (`MAX_ITERATIONS`) still applies to the unbound provider.
 
 **In scope, caught only with SQLCipher:** when `sqlcipher3` is installed and the vault has a passphrase, the
 whole file is encrypted (`PRAGMA key` in `__init__`, vault.py), so the file writer cannot read or usefully change any
@@ -86,10 +106,11 @@ also stored in plain text.
   the journal head, so it does not catch a rollback either; only a copy of the head's sequence and hash kept
   outside the file would.
 - *Deleting the file.*
-- *Deleting the whole journal together with its head.* With no rows and no head there is nothing left to
-  check, and `verify_audit_chain` returns true (pinned by `tests/test_threat_model_claims.py`). The entries
-  stay readable. A journal that was emptied this way can be told apart from a new vault only by a copy of
-  the head kept outside the file.
+- *Deleting the whole journal together with its head, and the integrity record.* `journal_anchored` under
+  the meta MAC records that the journal has held a row, so emptying the journal and removing the head is
+  caught (pinned by `tests/test_threat_model_claims.py`). A writer who also removes `kdf_salt`, `key_check`,
+  `integrity_format` and the MAC turns the file into one that looks like it never had a passphrase; that is
+  told apart from a new vault only by a copy of the head kept outside the file.
 - *Reading everything that is not sealed content:* categories, keys, scopes, metadata, states, origins, the
   journal's categories, keys and author ids, and the `entities_fts` index of category, key and scope terms
   (created in `_init_schema`, vault.py). The content column of a sealed row is empty (`_seal`, _vault_crypto.py), so entry text and

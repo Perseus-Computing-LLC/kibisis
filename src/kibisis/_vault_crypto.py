@@ -15,18 +15,22 @@ import os
 import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
 
-from ._vault_audit import _event_hash
+from ._vault_audit import JOURNAL_FORMAT, _event_hash
 from .crypto import (
     ENTRY_BINDING,
     ENTRY_SIGNATURE_PREFIX,
     TOMBSTONE_BINDING,
+    VAULT_META_BOUND_KEYS,
     entry_aad,
     keyed_value_digest,
     sign_entry,
     sign_tenant_payload,
     tombstone_aad,
+    tombstone_mac,
+    vault_meta_mac,
     verify_entry,
     verify_tenant_payload,
+    verify_tombstone_mac,
 )
 from .models import EncryptedEnvelope
 from .protocols import EncryptionRequiredError
@@ -37,9 +41,25 @@ logger = logging.getLogger("kibisis.vault")
 
 #: Integrity format this version writes (vault_meta 'integrity_format'). Format 2 binds sealed content
 #: to its entry, signs entries with a key derived by PBKDF2, keys the value digests kept in the journal
-#: and in tombstones, and refuses entries without a signature. A vault without the marker is upgraded
-#: the first time it is opened with its passphrase.
-INTEGRITY_FORMAT = 2
+#: and in tombstones, and refuses entries without a signature. Format 3 signs every tombstone row
+#: (``tombstone_mac``), pins the journal's format floor and anchoring, and binds the ``vault_meta``
+#: values that decide how the vault is checked under one MAC (``meta_mac``). A vault below the current
+#: format is upgraded the first time it is opened with its passphrase, after the passphrase has been
+#: checked and the journal has verified.
+INTEGRITY_FORMAT = 3
+
+
+class EntryIntegrityError(PermissionError):
+    """Raised when a stored entry fails its integrity check: it has no signature, its signature does
+    not verify, or its sealed content does not belong to it. ``get`` raises it; ``search`` and
+    ``list_entities`` leave such an entry out (logged at WARNING, counted in ``integrity_failures``,
+    raised instead under ``strict=True``)."""
+
+
+class VaultIntegrityError(PermissionError):
+    """Raised on open when the vault's own integrity records do not hold: the meta MAC is missing or
+    wrong, a keyed vault has no key check, a tombstone row is missing or fails its MAC, or a journal that
+    must verify before an upgrade does not. Nothing is written when it is raised."""
 
 
 #: Code points that render as nothing but are not ``Cf``/``Cc`` (Hangul fillers are ``Lo``), plus the
@@ -119,12 +139,6 @@ def value_digests(content: str) -> Tuple[str, str]:
     can_text = canonicalize_text(content)
     canonical = hashlib.sha256(can_text.encode("utf-8")).hexdigest() if can_text else ""
     return exact, canonical
-
-
-class EntryIntegrityError(PermissionError):
-    """Raised when a stored entry fails its integrity check: it has no signature, its signature does
-    not verify, or its sealed content does not belong to it. ``get`` raises it; ``search`` and
-    ``list_entities`` leave such an entry out."""
 
 
 def _rekey_metadata(metadata: Dict[str, Any], digest_key: bytes) -> bool:
@@ -254,13 +268,33 @@ class EntryIntegrityMixin:
 
     def _readable_content(self, r: Any) -> Optional[str]:
         """Content for search and listing: None when the row fails its integrity check (leave it out),
-        "[ENCRYPTED]" when it is sealed and this vault has no key to open it."""
+        "[ENCRYPTED]" when it is sealed and this vault has no key to open it.
+
+        A row left out is never silent: it is logged at WARNING with its category and key, counted in
+        :attr:`integrity_failures`, and under ``strict=True`` the :class:`EntryIntegrityError` is raised
+        instead of the row being dropped.
+        """
         try:
             return self._open_entry(r)
-        except EntryIntegrityError:
+        except EntryIntegrityError as exc:
+            self._note_integrity_failure(r, exc)
+            if self.strict:
+                raise
             return None
         except PermissionError:
             return "[ENCRYPTED]"
+
+    def _note_integrity_failure(self, r: Any, exc: BaseException) -> None:
+        """Record a row that a read refused (see :attr:`integrity_failures`)."""
+        failures = self.integrity_failures
+        failures["count"] += 1
+        recent = failures["recent"]
+        recent.append((r["category"], r["key"]))
+        del recent[:-10]
+        logger.warning(
+            "%s: entry '%s:%s' [scope=%s] left out of the results: %s",
+            self.db_path, r["category"], r["key"], r["scope"], exc,
+        )
 
     def _open_legacy(self, r: Any) -> str:
         """Content of a row as integrity format 1 stored it (sealed without binding). Upgrade use only."""
@@ -300,12 +334,21 @@ class EntryIntegrityMixin:
         return envelope.model_copy(update={"binding": TOMBSTONE_BINDING}).model_dump_json()
 
     def _unseal_digests(self, scope: str, category: str, key: str, sealed: str) -> Optional[Tuple[str, str]]:
-        """Plain digests of a sealed tombstone (this vault's, or another's with the same passphrase), or None."""
+        """Plain digests of a sealed tombstone (this vault's, or another's with the same passphrase), or None.
+
+        A tombstone carried in by a snapshot was sealed under the other vault's salt: that is the one
+        place an envelope's own salt is honoured (:meth:`AESGCMCryptoEnvelopeProvider.decrypt_foreign`).
+        """
         if self.crypto_provider is None or not self.passphrase:
             return None
         try:
             envelope = EncryptedEnvelope.model_validate_json(sealed)
-            plain = self.crypto_provider.decrypt(envelope, self.passphrase, aad=tombstone_aad(scope, category, key))
+            aad = tombstone_aad(scope, category, key)
+            opener = getattr(self.crypto_provider, "decrypt_foreign", None)
+            if opener is None:
+                plain = self.crypto_provider.decrypt(envelope, self.passphrase, aad=aad)
+            else:
+                plain = opener(envelope, self.passphrase, aad=aad)
             exact, canonical = json.loads(plain)
             return str(exact), str(canonical)
         except Exception:
@@ -315,13 +358,175 @@ class EntryIntegrityMixin:
         return hmac.new(self._signing_key, b"kibisis key check v2", hashlib.sha256).hexdigest()
 
     def _upgrade_integrity(self) -> None:
-        """Bring an older vault up to INTEGRITY_FORMAT, then check the passphrase against the key check."""
-        if int(self._meta("integrity_format") or 0) < INTEGRITY_FORMAT:
-            self.integrity_upgrade = self._migrate_integrity()
+        """Check the passphrase, then bring an older vault up to INTEGRITY_FORMAT, then check the records.
+
+        Order matters. The key check (``vault_meta.key_check``) is compared first, before any migration
+        writes, so a wrong passphrase can never re-key a vault; a keyed vault (integrity format 2 or
+        higher) without a key check is refused (:class:`VaultIntegrityError`). A vault at format 1 is
+        migrated to 2 (:meth:`_migrate_integrity`; it authenticates through the entries it opens and
+        refuses when its journal does not verify), then any vault below 3 is brought to 3
+        (:meth:`_upgrade_to_format_3`). A vault already at format 3 must carry a meta MAC that verifies.
+        Finally every tombstone row's MAC is checked and the journal's tombstone events are reconciled
+        with the rows (:meth:`_check_tombstones`).
+        """
+        stored_format = int(self._meta("integrity_format") or 0)
         stored = self._meta("key_check")
-        if stored is not None and not hmac.compare_digest(str(stored), self._key_check_value()):
-            raise ValueError("Failed to authenticate or decrypt vault database with provided passphrase")
+        if stored is not None:
+            if not hmac.compare_digest(str(stored), self._key_check_value()):
+                raise ValueError("Failed to authenticate or decrypt vault database with provided passphrase")
+        elif stored_format >= 2:
+            raise VaultIntegrityError(
+                f"{self.db_path}: the vault is keyed (integrity format {stored_format}) but has no key check; "
+                "refusing to open"
+            )
+        if stored_format < 2 and (stored is not None or self._meta("meta_mac") is not None):
+            # Format 1 wrote neither record. A vault that carries one while claiming format 1 had its
+            # integrity_format edited down; migrating it would re-sign under the editor's story.
+            raise VaultIntegrityError(
+                f"{self.db_path}: vault_meta.integrity_format says {stored_format} but the vault carries a key "
+                "check or meta MAC, which only integrity format 2 and later write; the integrity record was "
+                "edited. Refusing to migrate; restore the record before opening."
+            )
+        if stored_format < 2:
+            self.integrity_upgrade = self._migrate_integrity()
+            stored_format = int(self._meta("integrity_format") or 0)
+        if stored_format < INTEGRITY_FORMAT:
+            self._upgrade_to_format_3()
+        else:
+            self._verify_meta_mac()
         self._integrity_format = INTEGRITY_FORMAT
+        self._journal_anchored = bool(int(self._meta("journal_anchored") or 0))
+        self._check_tombstones()
+
+    # --- vault_meta MAC (integrity format 3) ------------------------------------------------------------
+
+    def _meta_mac_fields(self) -> Dict[str, Any]:
+        return {name: self._meta(name) for name in VAULT_META_BOUND_KEYS}
+
+    def _write_meta_mac(self, cursor: Any) -> None:
+        """Sign the bound ``vault_meta`` values as they stand now; every change to one of them ends here.
+        Nothing is written for a vault without a passphrase: it has no secret to sign with."""
+        if not self._keyed:
+            return
+        self._set_meta(cursor, "meta_mac", vault_meta_mac(self._signing_key, self._meta_mac_fields()))
+
+    def _verify_meta_mac(self) -> None:
+        """Refuse a keyed vault whose meta MAC is missing or does not cover the stored values."""
+        stored = self._meta("meta_mac")
+        if stored is None:
+            raise VaultIntegrityError(f"{self.db_path}: the vault's meta MAC is missing; refusing to open")
+        if not hmac.compare_digest(str(stored), vault_meta_mac(self._signing_key, self._meta_mac_fields())):
+            raise VaultIntegrityError(
+                f"{self.db_path}: the vault's meta MAC does not cover its integrity records (integrity format, "
+                "salt, key check, journal floor or term index format were changed); refusing to open"
+            )
+
+    def _upgrade_to_format_3(self) -> None:
+        """Bring a format 2 vault (or a vault just migrated to 2) to format 3, in one transaction.
+
+        The journal must verify first, under the rule it was written with (a journal from before
+        0.1.0a10 may have no head); a journal that fails is refused, never re-signed. A journal that
+        verified but has no head gets one for its last row, since from now on the head is demanded.
+        Every tombstone row then gets its MAC, the journal's format floor is pinned at the lowest
+        format the journal holds (3 for a journal with no legacy rows), the journal is marked anchored
+        if it holds a row, and the meta MAC is written. The passphrase was checked before this runs.
+        An empty vault reports nothing (``integrity_upgrade`` stays None); one with data adds
+        ``tombstones_signed`` and ``journal_format_floor`` to the report.
+        """
+        with self._write_tx() as cursor:
+            if int(self._meta("integrity_format") or 0) >= INTEGRITY_FORMAT:
+                self._verify_meta_mac()
+                return  # another process upgraded it first
+            if not self.verify_audit_chain():
+                raise VaultIntegrityError(
+                    f"{self.db_path}: the audit journal does not verify ({self.last_chain_error}); refusing to "
+                    "upgrade it to integrity format 3. Verify the journal and repair it before opening."
+                )
+            signed = 0
+            for t in cursor.execute(
+                "SELECT id, category, key, scope, value_sha256, canonical_sha256, origin_class FROM rejected_value_tombstones"
+            ).fetchall():
+                cursor.execute(
+                    "UPDATE rejected_value_tombstones SET tombstone_mac = ? WHERE id = ?",
+                    (self._tombstone_mac(t["scope"], t["category"], t["key"], t["value_sha256"], t["canonical_sha256"],
+                                         t["origin_class"] or "principal"),
+                     t["id"]),
+                )
+                signed += 1
+            lowest = cursor.execute("SELECT MIN(format), COUNT(*) FROM audit_journal").fetchone()
+            floor = int(lowest[0]) if lowest[0] is not None else JOURNAL_FORMAT
+            if lowest[1] and cursor.execute("SELECT 1 FROM audit_head WHERE id = 1").fetchone() is None:
+                last = cursor.execute(
+                    "SELECT sequence, event_hash FROM audit_journal ORDER BY sequence DESC LIMIT 1"
+                ).fetchone()
+                self._write_audit_head(cursor, last["sequence"], last["event_hash"])
+            self._set_meta(cursor, "journal_format_floor", floor)
+            self._set_meta(cursor, "journal_anchored", 1 if lowest[1] else 0)
+            self._set_meta(cursor, "integrity_format", INTEGRITY_FORMAT)
+            self._set_meta(cursor, "key_check", self._key_check_value())
+            self._write_meta_mac(cursor)
+        if not (signed or lowest[1]):
+            return
+        if self.integrity_upgrade is None:
+            self.integrity_upgrade = {}
+        self.integrity_upgrade["tombstones_signed"] = signed
+        self.integrity_upgrade["journal_format_floor"] = floor
+
+    # --- tombstone MACs ------------------------------------------------------------------------------
+
+    def _tombstone_mac(
+        self, scope: str, category: str, key: str, value_sha256: str, canonical_sha256: str,
+        origin_class: str = "principal",
+    ) -> str:
+        """MAC of a tombstone row under this vault's signing key (see :func:`kibisis.crypto.tombstone_mac`)."""
+        return tombstone_mac(self._signing_key, scope, category, key, value_sha256, canonical_sha256 or "", origin_class)
+
+    def _verify_tombstone_row(self, row: Any) -> None:
+        """Raise :class:`VaultIntegrityError` unless ``row`` (with scope, category, key, value_sha256,
+        canonical_sha256, tombstone_mac) carries a MAC under this vault's key. A vault still below
+        integrity format 3 has unsigned rows; they are signed by the upgrade before any lookup runs."""
+        if self._integrity_format < 3:
+            return
+        if not verify_tombstone_mac(
+            self._signing_key, row["scope"], row["category"], row["key"], row["value_sha256"],
+            row["canonical_sha256"] or "", row["tombstone_mac"], row["origin_class"] or "principal",
+        ):
+            raise VaultIntegrityError(
+                f"{self.db_path}: tombstone '{row['category']}:{row['key']}' [scope={row['scope']}] "
+                f"{'has no MAC' if not row['tombstone_mac'] else 'fails its MAC'}: the tombstone table was changed "
+                "outside kibisis"
+            )
+
+    def _check_tombstones(self) -> None:
+        """At open: every tombstone row must carry a valid MAC, and every ``tombstone`` event in the journal
+        that no later ``tombstone_lifted`` event undid must still have its row (by category, key, value
+        digest and scope). A row removed or edited behind the vault's back raises
+        :class:`VaultIntegrityError`. Other journal actions are not consulted."""
+        rows = self._conn.execute(
+            "SELECT category, key, scope, value_sha256, canonical_sha256, origin_class, tombstone_mac "
+            "FROM rejected_value_tombstones"
+        ).fetchall()
+        for row in rows:
+            self._verify_tombstone_row(row)
+        present = {(r["category"], r["key"], r["value_sha256"], r["scope"]) for r in rows}
+        expected: Dict[Tuple[str, str, str, str], int] = {}
+        for ev in self._conn.execute(
+            "SELECT sequence, action, category, key, scope, value_sha256 FROM audit_journal "
+            "WHERE action IN ('tombstone', 'tombstone_lifted') ORDER BY sequence ASC"
+        ).fetchall():
+            ident = (ev["category"], ev["key"], ev["value_sha256"], ev["scope"])
+            if ev["action"] == "tombstone":
+                expected[ident] = ev["sequence"]
+            else:
+                expected.pop(ident, None)
+        missing = [ident for ident in expected if ident not in present]
+        if missing:
+            category, key, _, scope = missing[0]
+            raise VaultIntegrityError(
+                f"{self.db_path}: {len(missing)} journaled tombstone(s) have no row, first '{category}:{key}' "
+                f"[scope={scope}] (journal sequence {expected[missing[0]]}): the tombstone table was changed outside "
+                "kibisis"
+            )
 
     def _migrate_integrity(self) -> Optional[Dict[str, Any]]:
         """Upgrade a vault written by Kibisis 0.1.0a5 or earlier to integrity format 2, in one transaction.
@@ -349,20 +554,20 @@ class EntryIntegrityMixin:
         assert digest_key is not None
         trust_unsigned = self._sqlcipher_active and not self._converted_to_sqlcipher
         with self._write_tx() as cursor:
-            if int(self._meta("integrity_format") or 0) >= INTEGRITY_FORMAT:
+            if int(self._meta("integrity_format") or 0) >= 2:
                 return None  # another process upgraded it first
             rows = cursor.execute(
                 "SELECT id, category, key, scope, content, is_encrypted, encrypted_envelope_json, tenant_sig FROM entities"
             ).fetchall()
             tombstones = cursor.execute(
-                "SELECT id, category, key, scope, value_sha256, canonical_sha256 FROM rejected_value_tombstones"
+                "SELECT id, category, key, scope, value_sha256, canonical_sha256, origin_class FROM rejected_value_tombstones"
             ).fetchall()
             events = cursor.execute(
                 "SELECT sequence, timestamp, action, category, key, scope, value_sha256, prev_hash, event_hash, "
                 "author_id, metadata_json, format FROM audit_journal ORDER BY sequence ASC"
             ).fetchall()
             if not (rows or tombstones or events):
-                self._set_meta(cursor, "integrity_format", INTEGRITY_FORMAT)
+                self._set_meta(cursor, "integrity_format", 2)
                 self._set_meta(cursor, "key_check", self._key_check_value())
                 return None
 
@@ -410,20 +615,41 @@ class EntryIntegrityMixin:
 
             for t in tombstones:
                 exact, canonical = t["value_sha256"], t["canonical_sha256"] or ""
+                new_exact = keyed_value_digest(digest_key, exact)
+                new_canonical = keyed_value_digest(digest_key, canonical)
+                klass = t["origin_class"] or "principal"
                 cursor.execute(
-                    "UPDATE rejected_value_tombstones SET value_sha256 = ?, canonical_sha256 = ?, sealed_digests = ? "
-                    "WHERE id = ?",
+                    "UPDATE rejected_value_tombstones SET value_sha256 = ?, canonical_sha256 = ?, sealed_digests = ?, "
+                    "tombstone_mac = ? WHERE id = ?",
                     (
-                        keyed_value_digest(digest_key, exact),
-                        keyed_value_digest(digest_key, canonical),
+                        new_exact,
+                        new_canonical,
                         self._seal_digests(t["scope"], t["category"], t["key"], exact, canonical),
+                        self._tombstone_mac(t["scope"], t["category"], t["key"], new_exact, new_canonical, klass),
                         t["id"],
                     ),
                 )
                 counts["tombstones_rekeyed"] += 1
 
             old_head = events[-1]["event_hash"] if events else "0" * 64
-            chain_was_valid = self.verify_audit_chain()
+            # The format 1 journal head was signed under the legacy key: the passphrase's for a vault that had
+            # one, the path's for a vault opened without. Verify under whichever this vault used before.
+            chain_was_valid = False
+            current_key = self._signing_key
+            try:
+                for candidate in (self._legacy_signing_key,
+                                  hashlib.sha256(f"kibisis-tenant-sig:{self.db_path}".encode("utf-8")).digest()):
+                    self._signing_key = candidate
+                    if self.verify_audit_chain():
+                        chain_was_valid = True
+                        break
+            finally:
+                self._signing_key = current_key
+            if not chain_was_valid:
+                raise VaultIntegrityError(
+                    f"{self.db_path}: the audit journal does not verify ({self.last_chain_error}); refusing to "
+                    "upgrade it to integrity format 2, which would re-sign it. Verify and repair the journal first."
+                )
             prev_hash = "0" * 64
             for ev in events:
                 value = keyed_value_digest(digest_key, ev["value_sha256"])
@@ -454,13 +680,13 @@ class EntryIntegrityMixin:
                 scope="*",
                 value_sha256="",
                 metadata={
-                    "integrity_format": INTEGRITY_FORMAT,
+                    "integrity_format": 2,
                     "previous_head": old_head,
                     "previous_chain_valid": chain_was_valid,
                     **counts,
                 },
             )
-            self._set_meta(cursor, "integrity_format", INTEGRITY_FORMAT)
+            self._set_meta(cursor, "integrity_format", 2)
             if opened or verified or self._sqlcipher_active or not was_keyed:
                 self._set_meta(cursor, "key_check", self._key_check_value())
         if counts["entries_left_unsigned"]:

@@ -27,16 +27,24 @@ const FIELDS: [&str; 5] = ["resource", "holder", "token", "acquired", "expires"]
 ///
 /// Each resource has two files, named by the SHA-256 hex digest of the resource name so that any
 /// name is safe to use: `<digest>.lock`, which every operation locks for its whole
-/// read-decide-write, and `<digest>.lease`, a small versioned text file with the current lease.
-/// Lock files are never deleted. Leases follow the rules of [`crate::InMemoryLeaseCoordinator`],
-/// including deadlines in whole seconds, rounded up.
+/// read-decide-write, `<digest>.lease`, a small versioned text file with the current lease, and
+/// `<digest>.highest`, the highest fencing token ever issued for the resource. Lock files are
+/// never deleted. Leases follow the rules of [`crate::InMemoryLeaseCoordinator`], including
+/// deadlines in whole seconds, rounded up.
 ///
-/// Fencing tokens never go backwards. A resource with no state file starts at token 1. A state
-/// file that cannot be read or parsed, or that names a different resource, makes every operation
-/// on that resource fail with [`LeaseError::Conflict`] and a message starting `lease store:`; the
-/// token is never silently reset. File and lock failures are reported the same way. Deleting a
-/// state file resets that resource's token to 1, so do not delete files in the directory while
-/// any process uses it.
+/// Fencing tokens only go up. A resource with no files starts at token 1; every grant is one
+/// above both the token in the state file and the one in the `.highest` file, and the `.highest`
+/// file is written (atomically, like the state file) before the lease that carries the token,
+/// so removing the state file, or putting an older copy of it back, cannot hand out a token that
+/// was issued before. A state or highest-token file that cannot be read or parsed, or a state
+/// file that names a different resource, makes every operation on that resource fail with
+/// [`LeaseError::Conflict`] and a message starting `lease store:`; the token is never silently
+/// reset. File and lock failures are reported the same way.
+///
+/// Out of scope: deleting the `.highest` file (together with the state file) does reset the
+/// resource's tokens, and deleting a `.lock` file lets a second process lock a new inode while
+/// the first still holds the old one. Nothing in the directory should be deleted while any
+/// process uses it; the files are the coordinator's record, not a cache.
 ///
 /// On Unix the directory is created with mode `0o700` and its files with mode `0o600`.
 ///
@@ -140,19 +148,54 @@ impl FileLeaseCoordinator {
     /// by a crash is simply overwritten.
     fn write_state(&self, lease: &Lease) -> Result<(), LeaseError> {
         let resource = lease.resource.as_str();
-        let temp = self.path(resource, "lease.tmp");
+        self.write_atomically(resource, "lease", &encode_state(lease), "state file")
+    }
+
+    /// The highest fencing token ever issued for `resource` (its `.highest` file), or 0 when
+    /// none was recorded; the caller holds the lock. A state file that was removed or rolled
+    /// back cannot bring tokens down past this.
+    fn read_highest_token(&self, resource: &str) -> Result<u64, LeaseError> {
+        match fs::read_to_string(self.path(resource, "highest")) {
+            Ok(text) => parse_u64(text.trim())
+                .ok_or_else(|| store_error(resource, "the highest-token file is not a number")),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
+            Err(e) => Err(io_error(resource, "read highest-token file", e)),
+        }
+    }
+
+    /// Record `token` as the highest issued for `resource`, atomically, before the lease that
+    /// carries it is written: a crash between the two leaves the counter ahead, never behind.
+    fn write_highest_token(&self, resource: &str, token: u64) -> Result<(), LeaseError> {
+        self.write_atomically(
+            resource,
+            "highest",
+            &token.to_string(),
+            "highest-token file",
+        )
+    }
+
+    /// Write `content` to the `extension` file of `resource` through a temporary file and a
+    /// rename, so a reader sees the old content or the new one, never a partial write.
+    fn write_atomically(
+        &self,
+        resource: &str,
+        extension: &str,
+        content: &str,
+        what: &str,
+    ) -> Result<(), LeaseError> {
+        let temp = self.path(resource, &format!("{extension}.tmp"));
         let mut file = private_options()
             .write(true)
             .create(true)
             .truncate(true)
             .open(&temp)
-            .map_err(|e| io_error(resource, "create temporary state file", e))?;
-        file.write_all(encode_state(lease).as_bytes())
+            .map_err(|e| io_error(resource, &format!("create temporary {what}"), e))?;
+        file.write_all(content.as_bytes())
             .and_then(|()| file.sync_all())
-            .map_err(|e| io_error(resource, "write temporary state file", e))?;
+            .map_err(|e| io_error(resource, &format!("write temporary {what}"), e))?;
         drop(file);
-        fs::rename(&temp, self.path(resource, "lease"))
-            .map_err(|e| io_error(resource, "replace state file", e))?;
+        fs::rename(&temp, self.path(resource, extension))
+            .map_err(|e| io_error(resource, &format!("replace {what}"), e))?;
         sync_dir(&self.dir);
         Ok(())
     }
@@ -168,19 +211,24 @@ impl LeaseCoordinator for FileLeaseCoordinator {
         let _lock = self.lock(resource)?;
         let since_epoch = clock();
         let now = since_epoch.as_secs();
-        let fencing_token = match self.read_state(resource)? {
+        let last_issued = match self.read_state(resource)? {
             Some(existing) if existing.expires_at > now && existing.holder_id != holder_id => {
                 return Err(LeaseError::Conflict(format!(
                     "Resource '{}' already held by '{}'",
                     resource, existing.holder_id
                 )));
             }
-            Some(existing) => existing
-                .fencing_token
-                .checked_add(1)
-                .ok_or_else(|| store_error(resource, "the fencing token cannot go any higher"))?,
-            None => 1,
+            Some(existing) => existing.fencing_token,
+            None => 0,
         };
+        // Tokens only go up: the new one is above the current state file's token and above the
+        // highest ever recorded for the resource, so a state file that was removed or replaced
+        // with an older copy cannot make a token come back.
+        let fencing_token = last_issued
+            .max(self.read_highest_token(resource)?)
+            .checked_add(1)
+            .ok_or_else(|| store_error(resource, "the fencing token cannot go any higher"))?;
+        self.write_highest_token(resource, fencing_token)?;
         let lease = Lease {
             resource: resource.to_string(),
             holder_id: holder_id.to_string(),
@@ -196,10 +244,12 @@ impl LeaseCoordinator for FileLeaseCoordinator {
         let _lock = self.lock(&lease.resource)?;
         let since_epoch = clock();
         match self.read_state(&lease.resource)? {
+            // The same rule as validate_fencing_token and acquire: a lease whose deadline second
+            // has arrived is expired, so it can neither be renewed nor fence a write.
             Some(mut current)
                 if current.holder_id == lease.holder_id
                     && current.fencing_token == lease.fencing_token
-                    && current.expires_at >= since_epoch.as_secs() =>
+                    && current.expires_at > since_epoch.as_secs() =>
             {
                 current.expires_at = lease_deadline(since_epoch, ttl);
                 self.write_state(&current)?;
@@ -494,6 +544,66 @@ mod file_lease_tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
+    fn tokens_never_go_below_the_highest_issued() {
+        let dir = scratch("monotonic");
+        let mut coordinator = FileLeaseCoordinator::new(&dir).unwrap();
+        let first = coordinator.acquire("doc", "a", HOUR).unwrap();
+        assert!(coordinator.release(&first).unwrap());
+        let second = coordinator.acquire("doc", "a", HOUR).unwrap();
+        assert!(coordinator.release(&second).unwrap());
+        assert_eq!(second.fencing_token, 2);
+        let state = coordinator.path("doc", "lease");
+        let highest = coordinator.path("doc", "highest");
+        assert_eq!(fs::read_to_string(&highest).unwrap().trim(), "2");
+
+        // The state file is removed: the next grant still goes above the highest issued.
+        fs::remove_file(&state).unwrap();
+        let third = coordinator.acquire("doc", "a", HOUR).unwrap();
+        assert_eq!(third.fencing_token, 3);
+        assert!(coordinator.release(&third).unwrap());
+
+        // An older copy of the state file is put back: same rule.
+        let stale = encode_state(&first);
+        fs::write(&state, stale).unwrap();
+        let fourth = coordinator.acquire("doc", "a", HOUR).unwrap();
+        assert_eq!(fourth.fencing_token, 4);
+        assert!(!coordinator
+            .validate_fencing_token("doc", "a", first.fencing_token)
+            .unwrap());
+        assert!(coordinator
+            .validate_fencing_token("doc", "a", fourth.fencing_token)
+            .unwrap());
+        assert_eq!(fs::read_to_string(&highest).unwrap().trim(), "4");
+
+        // A damaged highest-token file is an error, never a reset.
+        fs::write(&highest, "not a number").unwrap();
+        assert!(is_store_error(&coordinator.acquire("doc", "a", HOUR)));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_lease_at_its_deadline_second_neither_renews_nor_fences() {
+        let dir = scratch("deadline");
+        let mut coordinator = FileLeaseCoordinator::new(&dir).unwrap();
+        let lease = coordinator
+            .acquire("doc", "a", Duration::from_millis(2))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        let now = clock().as_secs();
+        assert!(lease.expires_at <= now);
+        assert_eq!(
+            coordinator.renew(&lease, HOUR).unwrap(),
+            coordinator
+                .validate_fencing_token("doc", "a", lease.fencing_token)
+                .unwrap()
+        );
+        assert!(!coordinator.renew(&lease, HOUR).unwrap());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
     fn a_new_coordinator_on_the_same_directory_sees_the_same_leases() {
         let dir = scratch("reopen");
         let lease = FileLeaseCoordinator::new(&dir)
@@ -583,8 +693,8 @@ mod file_lease_tests {
                 "{name:?} shares a state file"
             );
         }
-        // One lock file and one state file per resource, all directly in the directory.
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2 * names.len());
+        // One lock file, one state file and one highest-token file per resource, all directly in the directory.
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 3 * names.len());
         fs::remove_dir_all(&dir).unwrap();
     }
 

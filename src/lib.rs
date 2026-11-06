@@ -11,7 +11,9 @@
 //!    token that only goes up, so storage that compares tokens can reject a worker whose lease
 //!    expired. The vault does not compare them for you. [`InMemoryLeaseCoordinator`] works
 //!    across threads in one process; [`FileLeaseCoordinator`] works across processes that
-//!    share one local filesystem (one machine) through per-resource file locks.
+//!    share one local filesystem (one machine) through per-resource file locks, and keeps each
+//!    resource's highest token in its own file so a removed or rolled-back state file cannot
+//!    bring tokens back down (removing that file too is outside what it guards against).
 //! 3. **No encryption here**: this crate keeps memory in RAM and does not encrypt it. The
 //!    Python package is the encrypted, on-disk vault (AES-256-GCM entries, optional SQLCipher
 //!    whole-file encryption).
@@ -1210,9 +1212,11 @@ impl LeaseCoordinator for InMemoryLeaseCoordinator {
         let now = clock.as_secs();
 
         if let Some(existing) = store.get_mut(&lease.resource) {
+            // The same rule as `validate_fencing_token` and `acquire`: a lease whose deadline
+            // second has arrived is expired, so it can neither be renewed nor fence a write.
             if existing.holder_id == lease.holder_id
                 && existing.fencing_token == lease.fencing_token
-                && existing.expires_at >= now
+                && existing.expires_at > now
             {
                 existing.expires_at = lease_deadline(clock, ttl);
                 return Ok(true);

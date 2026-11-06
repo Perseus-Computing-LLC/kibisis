@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import hmac
 import inspect
 import json
 import logging
@@ -45,6 +46,7 @@ from ._vault_crypto import (  # noqa: F401  (re-exported)
     INTEGRITY_FORMAT,
     EntryIntegrityError,
     EntryIntegrityMixin,
+    VaultIntegrityError,
     _rekey_metadata,
     canonicalize_text,
     value_digests,
@@ -126,6 +128,12 @@ _ORIGIN_CHECK = "CHECK (origin IN ('user','model','tool','import','unknown'))"
 def _sqlcipher_available() -> bool:
     """True when the real sqlcipher3 driver is loaded; the import above falls back to the standard sqlite3."""
     return sqlcipher3 is not sqlite3
+
+
+def _plaintext_allowed_by_env() -> bool:
+    """``KIBISIS_ALLOW_PLAINTEXT`` set to 1, true or yes (the same rule as ``kibisis.config.plaintext_allowed``,
+    which cannot be imported here)."""
+    return os.environ.get("KIBISIS_ALLOW_PLAINTEXT", "").strip().lower() in ("1", "true", "yes")
 
 
 class TombstonedValueError(ValueError):
@@ -231,6 +239,7 @@ class SQLiteMemoryVault(
         verification_quorum: Optional[int] = None,
         term_index: bool = True,
         trust_caller_identity: bool = False,
+        strict: bool = False,
     ) -> None:
         """Open a vault. Entry content is encrypted by default.
 
@@ -252,6 +261,23 @@ class SQLiteMemoryVault(
         The passphrase comes from the argument, then KIBISIS_PASSPHRASE_FILE, then KIBISIS_PASSPHRASE.
         With no passphrase the vault refuses to open (EncryptionRequiredError) unless ``allow_plaintext=True``.
         An in-memory vault never touches disk, so it may run without a passphrase.
+
+        With a passphrase but without the ``sqlcipher3`` driver, an on-disk vault is also refused
+        (EncryptionRequiredError) unless ``allow_plaintext=True`` or ``KIBISIS_ALLOW_PLAINTEXT=1``: entry
+        content would still be sealed, but categories, keys, scopes, metadata, the journal and the
+        tombstone digests would lie in plain text in the file. :attr:`encrypted_at_rest` says whether
+        the open file is actually SQLCipher-encrypted, which is not the same as a passphrase being set.
+
+        A wrong passphrase on an existing vault raises ``ValueError`` ("Failed to authenticate ...")
+        before anything is written: the stored key check is compared first, also before a plain SQLite
+        file is converted to SQLCipher, so a wrong passphrase never converts, re-keys or upgrades a vault.
+        A keyed vault whose integrity records are missing or do not verify (meta MAC, key check,
+        tombstone MACs, journaled tombstones without rows, a journal that must verify before an upgrade)
+        raises :class:`VaultIntegrityError`.
+
+        ``strict=True`` makes every read raise :class:`EntryIntegrityError` for an entry that fails its
+        integrity check instead of leaving it out; either way each such entry is logged at WARNING and
+        counted in :attr:`integrity_failures`.
 
         With ``enforce_fencing=True`` (which needs ``coordinator``), every call that adds, changes or
         removes entries must pass the caller's current ``fencing_token`` and ``resource``, and may
@@ -301,6 +327,12 @@ class SQLiteMemoryVault(
         if enforce_fencing and coordinator is None:
             raise ValueError("enforce_fencing=True needs a lease coordinator: pass coordinator=")
         self._fallback_search_warned = False
+        self.strict = bool(strict)
+        #: Entries that reads refused and left out: ``{"count": n, "recent": [(category, key), ...]}`` (last 10).
+        self.integrity_failures: Dict[str, Any] = {"count": 0, "recent": []}
+        #: What the last :meth:`verify_audit_chain` found wrong, or None.
+        self.last_chain_error: Optional[str] = None
+        self._journal_anchored = False
         on_disk = self.db_path != ":memory:"
         passphrase = resolve_passphrase(passphrase)
         if passphrase and len(passphrase) < MIN_PASSPHRASE_LENGTH:
@@ -326,12 +358,20 @@ class SQLiteMemoryVault(
         self._integrity_format = 1
         self._converted_to_sqlcipher = False
         self._was_keyed = False
+        self._prechecked_keys: Optional[Tuple[bytes, Tuple[bytes, bytes, bytes]]] = None
         #: Counts from the integrity upgrade this open performed, or None when none was needed.
         self.integrity_upgrade: Optional[Dict[str, Any]] = None
 
         # Convert an existing plain SQLite file to SQLCipher when a passphrase is given. Without sqlcipher3 there
-        # is nothing to convert with: the file stays plain SQLite and the first open that has sqlcipher3 converts it.
+        # is nothing to convert with: the file stays plain SQLite, which is only allowed when the caller opted in.
         if on_disk and passphrase and not _sqlcipher_available():
+            if not (allow_plaintext or _plaintext_allowed_by_env()):
+                raise EncryptionRequiredError(
+                    f"sqlcipher3 is not installed, so {self.db_path} would not be encrypted as a whole file: entry "
+                    "content would be sealed, but categories, keys, scopes, metadata, the audit journal and the "
+                    "tombstone digests would be stored in plain text. Install kibisis[sqlcipher], or open with "
+                    "allow_plaintext=True or KIBISIS_ALLOW_PLAINTEXT=1 to accept that."
+                )
             logger.warning(
                 "sqlcipher3 is not installed, so %s is not encrypted as a whole file: entry content is still "
                 "sealed, but categories, keys and metadata are stored in plain text",
@@ -347,7 +387,9 @@ class SQLiteMemoryVault(
             with open(self.db_path, "rb") as f:
                 hdr = f.read(16)
             if hdr.startswith(b"SQLite format 3"):
-                # Migrate existing plaintext SQLite database to encrypted SQLCipher database
+                # Migrate an existing plain SQLite database to SQLCipher: only after the passphrase has been
+                # checked against the plain file's own key check, so a wrong passphrase leaves it untouched.
+                self._prechecked_keys = self._check_plain_file_passphrase(self.db_path, passphrase)
                 self._migrate_file_to_sqlcipher(self.db_path, passphrase)
                 self._converted_to_sqlcipher = True
 
@@ -390,7 +432,11 @@ class SQLiteMemoryVault(
             salt = self._vault_salt()
             if crypto_provider is None:
                 self.crypto_provider = AESGCMCryptoEnvelopeProvider(salt=salt)
-            self._signing_key, self._digest_key, self._term_key = derive_vault_keys(passphrase, salt)
+            if self._prechecked_keys is not None and self._prechecked_keys[0] == salt:
+                self._signing_key, self._digest_key, self._term_key = self._prechecked_keys[1]
+            else:
+                self._signing_key, self._digest_key, self._term_key = derive_vault_keys(passphrase, salt)
+            self._prechecked_keys = None
             self._keyed = True
             try:
                 self._upgrade_integrity()
@@ -404,11 +450,56 @@ class SQLiteMemoryVault(
                             cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
                         cursor.execute("DROP TABLE IF EXISTS entities_search_dirty")
                         self._drop_term_index(cursor)
+                        self._write_meta_mac(cursor)  # term_index_format is one of the values the meta MAC covers
             except BaseException:
                 self._conn.close()
                 raise
         if on_disk:
             self._restrict_permissions()
+
+    @property
+    def encrypted_at_rest(self) -> bool:
+        """True when the open file is SQLCipher-encrypted as a whole. A passphrase alone does not make
+        it so: without the ``sqlcipher3`` driver only entry content is sealed (see ``allow_plaintext``)."""
+        return bool(self._sqlcipher_active)
+
+    @staticmethod
+    def _check_plain_file_passphrase(path: str, passphrase: str) -> Optional[Tuple[bytes, Tuple[bytes, bytes, bytes]]]:
+        """Check ``passphrase`` against the key check a plain SQLite vault file stores, before it is converted.
+
+        The file is opened read-only with the standard sqlite3 module; nothing is written. With a key
+        check, the keys are derived from the file's own ``kdf_salt`` and compared: a mismatch raises
+        ``ValueError`` ("Failed to authenticate ...") and the file stays as it is. A keyed file (integrity
+        format 2 or higher) without a key check raises :class:`VaultIntegrityError`. Returns the salt and
+        the derived keys so the open that follows need not derive them again, or None when the file has
+        no vault_meta yet (a vault never opened with a passphrase).
+        """
+        uri = "file:" + Path(path).resolve().as_uri()[len("file://"):] + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            try:
+                rows = conn.execute(
+                    "SELECT key, value FROM vault_meta WHERE key IN ('kdf_salt', 'key_check', 'integrity_format')"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return None  # no vault_meta table: nothing to check against
+        finally:
+            conn.close()
+        meta = {k: v for k, v in rows}
+        salt = meta.get("kdf_salt")
+        stored = meta.get("key_check")
+        if salt is None:
+            return None
+        salt = bytes(salt)
+        keys = derive_vault_keys(passphrase, salt)
+        if stored is None:
+            if int(meta.get("integrity_format") or 0) >= 2:
+                raise VaultIntegrityError(f"{path}: the vault is keyed but has no key check; refusing to open")
+            return salt, keys
+        expected = hmac.new(keys[0], b"kibisis key check v2", hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(str(stored), expected):
+            raise ValueError("Failed to authenticate or decrypt vault database with provided passphrase")
+        return salt, keys
 
     def _validate_fencing(
         self,
@@ -494,17 +585,35 @@ class SQLiteMemoryVault(
 
     @staticmethod
     def _migrate_file_to_sqlcipher(path: str, passphrase: str) -> None:
+        """Convert a plain SQLite vault file to SQLCipher in place.
+
+        The export goes to a sibling temp file; that file is then opened with the key and read, and only
+        after that succeeds does it replace the original (``os.replace``). A failure at any step leaves
+        the plain file as it was. The passphrase was checked against the file's key check before this runs
+        (:meth:`_check_plain_file_passphrase`).
+        """
         temp_enc = path + ".tmp_enc"
         if os.path.exists(temp_enc):
             os.unlink(temp_enc)
         escaped_pass = passphrase.replace("'", "''")
-        conn_raw = sqlcipher3.connect(path)
         try:
-            conn_raw.execute(f"ATTACH DATABASE '{temp_enc}' AS encrypted KEY '{escaped_pass}';")
-            conn_raw.execute("SELECT sqlcipher_export('encrypted');")
-            conn_raw.execute("DETACH DATABASE encrypted;")
-        finally:
-            conn_raw.close()
+            conn_raw = sqlcipher3.connect(path)
+            try:
+                conn_raw.execute(f"ATTACH DATABASE '{temp_enc}' AS encrypted KEY '{escaped_pass}';")
+                conn_raw.execute("SELECT sqlcipher_export('encrypted');")
+                conn_raw.execute("DETACH DATABASE encrypted;")
+            finally:
+                conn_raw.close()
+            check = sqlcipher3.connect(temp_enc)
+            try:
+                check.execute(f"PRAGMA key = '{escaped_pass}';")
+                check.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            finally:
+                check.close()
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(temp_enc)
+            raise
         for ext in ("-wal", "-shm"):
             p = path + ext
             if os.path.exists(p):
@@ -682,6 +791,10 @@ class SQLiteMemoryVault(
                     "ALTER TABLE rejected_value_tombstones ADD COLUMN origin_class TEXT NOT NULL DEFAULT 'principal'"
                 )
             self._conn.execute("CREATE TABLE IF NOT EXISTS vault_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL)")
+            if "tombstone_mac" not in tomb_cols:
+                # HMAC over the row under the vault's signing key (integrity format 3): a lookup hit and every
+                # open verify it, so a row edited or added behind the vault's back is detected.
+                self._conn.execute("ALTER TABLE rejected_value_tombstones ADD COLUMN tombstone_mac TEXT DEFAULT NULL")
 
             self._conn.execute(
                 """

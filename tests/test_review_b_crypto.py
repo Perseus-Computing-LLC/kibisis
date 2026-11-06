@@ -1,7 +1,7 @@
 """Review B: entry cryptography against a local file writer (no SQLCipher, passphrase set).
 
-``test_control_*`` assert the SECURE behaviour (failing = bug); ``test_attack_*`` demonstrate an insecure or
-costly behaviour (passing = bug/observation).
+``test_control_*`` assert behaviour that was already secure; ``test_attack_*`` replay the review's attacks
+and assert they are now refused (L5 foreign envelope salts, L4 missing key check).
 """
 
 import base64
@@ -24,6 +24,7 @@ def _no_sqlcipher(monkeypatch):
     monkeypatch.delenv("KIBISIS_PASSPHRASE_FILE", raising=False)
     monkeypatch.setattr(vault_module, "sqlcipher3", sqlite3)
     monkeypatch.setattr(vault_module, "_sqlcipher_available", lambda: False)
+    monkeypatch.setenv("KIBISIS_ALLOW_PLAINTEXT", "1")  # the file writer's position: a plain SQLite file
 
 
 def _seeded(path):
@@ -102,11 +103,10 @@ def test_control_key_separation_labels():
     assert ck not in (s, d, t)
 
 
-def test_attack_per_row_salt_forces_pbkdf2_per_read(tmp_path):
-    """OBSERVATION (passing = cost shown): the envelope's salt and iteration count are read before the tag
-    check (crypto.py:106-112). A file writer who gives N rows N distinct salts makes every read of those
-    rows pay a full PBKDF2 (600k iterations, bounded by MAX_ITERATIONS) before the InvalidTag is raised;
-    the key cache (64 entries) does not help because each salt is new. Prints the cost of one such read."""
+def test_attack_per_row_salt_is_refused_before_any_key_derivation(tmp_path):
+    """L5: the envelope's salt and iteration count no longer choose the key or the cost of a read. A
+    provider bound to the vault salt refuses an envelope naming another salt before any PBKDF2 runs
+    (an integrity failure for the row, counted and logged), and a forged iteration count is ignored."""
     p = _seeded(tmp_path / "v.sqlite")
     c = _conn(p)
     env = json.loads(c.execute("SELECT encrypted_envelope_json FROM entities WHERE key='b'").fetchone()[0])
@@ -117,17 +117,25 @@ def test_attack_per_row_salt_forces_pbkdf2_per_read(tmp_path):
     v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
     v.get("decision", "a")
     t0 = time.perf_counter(); v.get("decision", "a"); t_good = time.perf_counter() - t0  # warm
-    # The open above already paid the PBKDF2 for the forged salt (the term-index drain opened the row) and
-    # cached it; clear the 64-entry cache to show the per-salt cost a reader pays (an attacker with > 64
-    # distinct salts thrashes it, crypto.py:63-64).
+    # The open's index drain already met the row: dropped from the index with a WARNING and counted.
+    assert v.integrity_failures["count"] >= 1
+    assert ("decision", "b") in v.integrity_failures["recent"]
     v.crypto_provider._cache.clear()
     t0 = time.perf_counter()
-    with pytest.raises(EntryIntegrityError):
+    with pytest.raises(EntryIntegrityError):  # a direct read raises; it is never silent
         v.get("decision", "b")
     t_bad = time.perf_counter() - t0
+    # No PBKDF2 ran for the forged salt: the refusal costs about what a good read costs, not 600k rounds.
+    assert t_bad < max(50 * t_good, 0.05), (t_good, t_bad)
+    assert not any(b"\xaa" * 16 in k for k in v.crypto_provider._cache)  # the forged salt never reached the KDF
+    # An iteration count edited on an envelope that keeps the vault salt is ignored, not honoured.
+    c = _conn(p)
+    env = json.loads(c.execute("SELECT encrypted_envelope_json FROM entities WHERE key='a'").fetchone()[0])
+    env["iterations"] = 1
+    c.execute("UPDATE entities SET encrypted_envelope_json=? WHERE key='a'", (json.dumps(env),))
+    c.commit(); c.close()
+    assert v.get("decision", "a").content == "value of A"
     v.close()
-    print(f"warm read of untouched row: {t_good*1000:.1f} ms; cold read of salt-edited row: {t_bad*1000:.1f} ms")
-    assert t_bad > 10 * max(t_good, 0.001)
 
 
 def test_control_wrong_passphrase_refused_by_key_check(tmp_path):
@@ -137,24 +145,17 @@ def test_control_wrong_passphrase_refused_by_key_check(tmp_path):
         SQLiteMemoryVault(str(p), passphrase="definitely the wrong passphrase", auto_gate=False)
 
 
-def test_attack_key_check_deletion_lets_wrong_passphrase_open_silently(tmp_path):
-    """DEMONSTRATES (passing = bug, low): with vault_meta.key_check removed (and integrity_format intact)
-    a wrong passphrase opens the vault without error; every sealed entry then fails its integrity check
-    and search returns nothing, which looks like an empty/damaged vault rather than a wrong key."""
+def test_attack_key_check_deletion_refuses_every_passphrase(tmp_path):
+    """L4: a keyed vault (integrity_format >= 2, kdf_salt present) whose vault_meta.key_check was removed
+    is refused at open, under the wrong passphrase and under the right one alike, so a wrong key can
+    neither read the vault as 'empty' nor write rows under a second key set into the same file."""
     p = _seeded(tmp_path / "v.sqlite")
     c = _conn(p)
     c.execute("DELETE FROM vault_meta WHERE key='key_check'")
     c.commit(); c.close()
-    v = SQLiteMemoryVault(str(p), passphrase="definitely the wrong passphrase", auto_gate=False)  # no error
-    with pytest.raises(EntryIntegrityError):
-        v.get("decision", "a")
-    assert v.search("value", match="any", include_unverified=True) == [] or True
-    # and a write under the wrong key succeeds, mixing two key sets in one file
-    v.remember("decision", "c", "written under wrong key", origin="user")
-    v.close()
-    # The real passphrase still opens (nothing re-wrote key_check), but the foreign row is now refused there.
-    v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
-    assert v.get("decision", "a") is not None
-    with pytest.raises(EntryIntegrityError):
-        v.get("decision", "c")
-    v.close()
+    for passphrase in ("definitely the wrong passphrase", PASS):
+        with pytest.raises(vault_module.VaultIntegrityError, match="no key check"):
+            SQLiteMemoryVault(str(p), passphrase=passphrase, auto_gate=False)
+    c = _conn(p)
+    assert c.execute("SELECT count(*) FROM entities WHERE key='c'").fetchone()[0] == 0  # nothing was written
+    c.close()
