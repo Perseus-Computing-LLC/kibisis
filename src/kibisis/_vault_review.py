@@ -172,9 +172,15 @@ class AdmissionReviewMixin:
         now: float,
         existing_meta: Dict[str, Any],
         keep_existing: bool,
+        writer_class: Optional[str] = None,
     ) -> List[str]:
-        """Record a symmetric ``category:key`` edge list (``conflicts_with`` / ``contrasts_with``) on this
-        entry and on each target, which must exist in the scope. Returns this entry's edge list."""
+        """Record a ``category:key`` edge list (``conflicts_with`` / ``contrasts_with``) on this entry
+        and, where allowed, on each target, which must exist in the scope. Returns this entry's edge list.
+
+        The back-edge is written onto a target only when the target's origin class is at or below
+        ``writer_class``: an agent's claim of a conflict is stored on the agent's own entry and never
+        touches a person's row. ``None`` (the vault's own paths) writes both sides.
+        """
         kept: List[str] = list(existing_meta.get(field) or []) if keep_existing else []
         if not refs:
             return kept
@@ -185,13 +191,16 @@ class AdmissionReviewMixin:
             if ref == self_ref:
                 raise ValueError(f"an entry cannot be in {field} with itself")
             c, k = ref.split(":", 1)
-            cursor.execute("SELECT id, metadata_json FROM entities WHERE category = ? AND key = ? AND scope = ?", (c, k, scope))
+            cursor.execute(
+                "SELECT id, metadata_json, origin FROM entities WHERE category = ? AND key = ? AND scope = ?", (c, k, scope)
+            )
             other = cursor.fetchone()
             if other is None:
                 raise ValueError(f"{field} target '{ref}' [scope={scope}] does not exist")
             other_meta = json.loads(other["metadata_json"] or "{}")
             back = list(other_meta.get(field) or [])
-            if self_ref not in back:
+            may_write_back = writer_class is None or _class_rank(_row_origin_class(other)) <= _class_rank(writer_class)
+            if self_ref not in back and may_write_back:
                 back.append(self_ref)
                 other_meta[field] = back
                 cursor.execute(
@@ -203,11 +212,26 @@ class AdmissionReviewMixin:
         return kept
 
     def _cascade_invalidate(
-        self, cursor: sqlite3.Cursor, scope: str, retired_ref: str, author_id: Optional[str], now: float
+        self,
+        cursor: sqlite3.Cursor,
+        scope: str,
+        retired_ref: str,
+        author_id: Optional[str],
+        now: float,
+        writer_class: Optional[str] = None,
     ) -> List[str]:
         """K-R2 cascading invalidation: every active entry that ``derived_from`` a retired entry becomes
         ``disputed`` with ``invalidated_by`` set, and the cascade continues through their dependents.
-        Entries are marked once; cycles terminate. Returns the refs marked, in order."""
+        Entries are marked once; cycles terminate. Returns the refs marked, in order.
+
+        ``writer_class`` is the K-R1 class of the act that retired the entry. A cascade a non-principal
+        started does not change the state of a dependent of a higher class, or one a person verified
+        or reviewed: such a dependent gets an ``invalidation_notice`` in its metadata (the fact it drew
+        on was retired, by whom) and the cascade does not continue through it. A person's retirement
+        (``principal`` or ``None``, the vault's own paths) marks every dependent as before.
+        """
+        from .vault import _is_reviewed  # vault.py imports this module
+
         marked: List[str] = []
         seen = {retired_ref}
         queue = [retired_ref]
@@ -226,6 +250,25 @@ class AdmissionReviewMixin:
                 if ref not in (dep_meta.get("derived_from") or []):
                     continue
                 seen.add(dep_ref)
+                protected = writer_class not in (None, "principal") and (
+                    _is_reviewed(dep) or _class_rank(_row_origin_class(dep)) > _class_rank(writer_class)
+                )
+                if protected:
+                    notices = list(dep_meta.get("invalidation_notice") or [])
+                    notice = {"retired": ref, "by_class": writer_class, "at": now}
+                    if not any(n.get("retired") == ref for n in notices if isinstance(n, dict)):
+                        notices.append(notice)
+                    dep_meta["invalidation_notice"] = notices
+                    cursor.execute(
+                        "UPDATE entities SET metadata_json = ?, updated_at = ? WHERE id = ?",
+                        (json.dumps(dep_meta, sort_keys=True), now, dep["id"]),
+                    )
+                    self._record_audit_event(
+                        cursor=cursor, action="invalidation_notice", category=dep["category"], key=dep["key"],
+                        scope=scope, value_sha256="", author_id=author_id,
+                        metadata={"retired": ref, "by_class": writer_class, "dependent_class": _row_origin_class(dep)},
+                    )
+                    continue
                 dep_meta["invalidated_by"] = ref
                 cursor.execute(
                     "UPDATE entities SET epistemic_state = ?, metadata_json = ?, updated_at = ? WHERE id = ?",
@@ -375,27 +418,42 @@ class AdmissionReviewMixin:
         holder_id: Optional[str] = None,
         reviewer_origin: str = "user",
         reviewer_label: Optional[str] = None,
+        attester: Optional[str] = None,
     ) -> MemoryEntity:
         """Human review gate: update epistemic state based on review decision (verified, disputed, revoked).
 
-        This is the person's API; callers that relay a model's request use :meth:`admit`, which refuses
-        anything but ``reviewer_origin="user"``. The verdict's origin is kept in ``human_reviews``.
+        This is the person's API. Every verdict needs ``reviewer_origin="user"``: any other origin
+        raises :class:`PermissionError` and records nothing, so a model, a tool or a document cannot
+        verify, dispute or revoke an entry by calling this. Callers that relay a model's request use
+        :meth:`admit`. The verdict's origin is kept in ``human_reviews``.
 
-        The verification quorum counts distinct ``reviewer_id`` values, so the caller vouches that each
-        one is a different person. The review CLI and ``admit`` pass the operating-system account they
-        run as, never a typed name; ``reviewer_label`` keeps a typed name alongside it without counting.
+        A review with no ``reviewer_id`` raises ``ValueError``: a verdict nobody signed is not a review.
+
+        The verification quorum counts distinct attesting accounts. The attester is the
+        operating-system account running the process, not ``reviewer_id``; ``attester`` is honoured
+        only on a vault opened with ``trust_caller_identity=True`` (see :class:`SQLiteMemoryVault`).
+        ``reviewer_label`` keeps a typed name alongside without counting.
         """
         valid_verdicts = {EpistemicState.VERIFIED.value, EpistemicState.DISPUTED.value, EpistemicState.REVOKED.value}
         if verdict not in valid_verdicts:
             raise ValueError(f"Verdict must be one of {valid_verdicts}, got '{verdict}'")
         _validate_origin(reviewer_origin, "reviewer_origin")
+        if reviewer_origin != "user":
+            raise PermissionError(
+                f"review_entity records a person's verdict only (reviewer_origin='user'); "
+                f"got reviewer_origin={reviewer_origin!r} for {category}:{key} [scope={scope}]"
+            )
+        if reviewer_id is None or not str(reviewer_id).strip():
+            raise ValueError("review_entity needs a reviewer_id: a verdict nobody signed is not a review")
+        reviewer_id = str(reviewer_id).strip()
+        signer = self._resolve_attester(reviewer_origin, attester)
 
         # One write transaction from the read to the re-write: the entry a reviewer looked at is the
         # entry the verdict lands on, and a concurrent write cannot slip in between the two.
         with self._write_tx():
             return self._review_locked(
                 category, key, verdict, scope, reviewer_id, notes, fencing_token, resource, holder_id, reviewer_origin,
-                reviewer_label,
+                reviewer_label, signer,
             )
 
     def _review_locked(
@@ -411,8 +469,10 @@ class AdmissionReviewMixin:
         holder_id: Optional[str],
         reviewer_origin: str,
         reviewer_label: Optional[str] = None,
+        signer: Optional[str] = None,
     ) -> MemoryEntity:
-        """Body of :meth:`review_entity`; runs inside the caller's write transaction."""
+        """Body of :meth:`review_entity`; runs inside the caller's write transaction. ``signer`` is the
+        account the verdict attests as (resolved by ``review_entity``), ``None`` when nothing attests."""
         entity = self.get(category=category, key=key, scope=scope)
         if entity is None:
             raise KeyError(f"Entity not found for review: {category}:{key} [scope={scope}]")
@@ -472,19 +532,21 @@ class AdmissionReviewMixin:
             # K-R1 quorum: a person's verified review is one attestation; the entry is verified once
             # verification_quorum distinct principals have attested. Other reviewer origins never count.
             attested = list(meta.get("attestations") or [])
-            if reviewer_origin == "user" and reviewer_id and reviewer_id not in attested:
-                attested.append(reviewer_id)
+            if signer and signer not in attested:
+                attested.append(signer)
             if attested:
                 meta["attestations"] = attested
             if len(attested) >= self.verification_quorum:
                 meta.pop("verification_pending", None)
+                meta["quorum_at_verification"] = self.verification_quorum
             else:
                 meta["verification_pending"] = {"have": len(attested), "need": self.verification_quorum}
+                meta.pop("quorum_at_verification", None)
                 stored_state = EpistemicState.CANDIDATE.value
         proposal = meta.pop("proposed_supersedes", None) if stored_state == EpistemicState.VERIFIED.value else None
         if proposal:
             meta["supersession_approved_by"] = reviewer_id
-        return self.put(
+        return self._write_review(
             category=category,
             key=key,
             content=entity.content,
@@ -499,8 +561,6 @@ class AdmissionReviewMixin:
             holder_id=holder_id,
             supersedes_key=proposal["key"] if proposal else None,
             supersedes_category=proposal["category"] if proposal else None,
-            _trusted_metadata=True,  # human_reviews was appended here, inside the write transaction
-            _review_verdict=True,
         )
 
     def evaluate_abstention(

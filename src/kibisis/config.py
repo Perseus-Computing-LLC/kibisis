@@ -34,6 +34,30 @@ class ConfigError(RuntimeError):
     """Raised when the environment does not describe a usable vault."""
 
 
+ENV_VERIFICATION_QUORUM = "KIBISIS_VERIFICATION_QUORUM"
+
+
+def parse_verification_quorum(value: Optional[str], default: int = 2) -> int:
+    """The verification quorum ``KIBISIS_VERIFICATION_QUORUM`` names: a positive decimal integer.
+
+    Surrounding whitespace is ignored. Anything else (``''``, ``abc``, ``2.0``, ``1_0``, ``0``, ``-1``)
+    raises :class:`ConfigError` with the offending value, so a bad setting is a refusal message from
+    the CLIs and the server rather than a traceback. ``None`` (unset) gives ``default``.
+    """
+    if value is None:
+        return int(default)
+    text = value.strip()
+    if not text.isdecimal() or not text.isascii():
+        raise ConfigError(
+            f"{ENV_VERIFICATION_QUORUM} must be a positive integer (number of distinct accounts that must "
+            f"attest before an entry is verified), got {value!r}"
+        )
+    quorum = int(text)
+    if quorum < 1:
+        raise ConfigError(f"{ENV_VERIFICATION_QUORUM} must be at least 1, got {value!r}")
+    return quorum
+
+
 def default_data_dir(env: Optional[Mapping[str, str]] = None, platform: Optional[str] = None) -> Path:
     """Per-user data directory: XDG on Linux, Application Support on macOS, LOCALAPPDATA on Windows."""
     env = os.environ if env is None else env

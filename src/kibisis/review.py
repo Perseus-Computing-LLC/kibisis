@@ -7,10 +7,25 @@ them here and approves, disputes or rejects them:
     python -m kibisis.review approve CATEGORY KEY [--notes TEXT]
     python -m kibisis.review dispute CATEGORY KEY [--notes TEXT]
     python -m kibisis.review reject  CATEGORY KEY [--notes TEXT]
+    python -m kibisis.review lift    CATEGORY KEY [--digest HEXPREFIX]
 
-``approve``, ``dispute`` and ``reject`` need a terminal on stdin, as ``kibisis admit`` does, and record
-the operating-system account they run as, read from the process's user id. ``--reviewer`` adds a label
-beside the account; it does not change who reviewed.
+``approve``, ``dispute``, ``reject`` and ``lift`` need a terminal on stdin, as ``kibisis admit`` does,
+and record the operating-system account they run as, read from the process's user id. ``--reviewer``
+adds a label beside the account; it does not change who reviewed. The terminal check stops pipes and
+cron jobs; a process that can allocate a pseudo-terminal passes it, so it is a guard against accident,
+not against an agent that has a shell.
+
+Every run prints the vault path and the scope it resolved, and a verdict on an entry that is not in
+that scope lists the scopes that do hold the entry, so the person can set ``KIBISIS_SCOPE``.
+
+``lift`` removes the tombstones recorded under ``CATEGORY KEY`` (``--digest`` narrows it to one value)
+and journals each as ``tombstone_lifted``; the value may be written again afterwards. It is the only
+way past a principal-class tombstone (one a person made, or one made before tombstones had classes).
+A tombstone the agent made through ``kibisis_forget`` is model-class: a person's later write of the
+value lifts it on its own.
+
+Approving a candidate that proposed to supersede a verified entry retires that entry; ``list`` says so
+beside the candidate and ``approve`` repeats it.
 
 Approving records one account's approval. The entry becomes verified once ``KIBISIS_VERIFICATION_QUORUM``
 distinct accounts have approved it (two unless set; a person who wrote the entry as verified counts as
@@ -34,7 +49,7 @@ from datetime import datetime, timezone
 from typing import Any, List, Optional
 
 from ._operator import NotInteractive, account_identity, require_terminal
-from .config import ConfigError, open_vault, resolve_scope
+from .config import ConfigError, default_db_path, open_vault, resolve_scope
 from .models import EpistemicState
 from .protocols import EncryptionRequiredError
 
@@ -59,7 +74,46 @@ def _parser() -> argparse.ArgumentParser:
             "--reviewer",
             help="label to record beside your account; the quorum counts accounts, not labels",
         )
+    lift = sub.add_parser("lift", help="remove the tombstones under CATEGORY KEY so the value may be written again (needs a terminal)")
+    lift.add_argument("category")
+    lift.add_argument("key")
+    lift.add_argument("--digest", help="hex digest (or prefix) of the one tombstoned value to lift")
     return parser
+
+
+def _supersession_notice(vault: Any, entity: Any, scope: str) -> Optional[str]:
+    """What approving ``entity`` does to the entry it proposed to supersede, or ``None``."""
+    proposal = (entity.metadata or {}).get("proposed_supersedes")
+    if not isinstance(proposal, dict):
+        return None
+    category, key = proposal.get("category"), proposal.get("key")
+    if not category or not key:
+        return None
+    target = vault.get(category, key, scope=scope)
+    state = _state(target) if target is not None else "missing"
+    return f"approving retires {category}:{key} ({state})"
+
+
+def _scopes_holding(vault: Any, category: str, key: str) -> List[str]:
+    """Scopes that hold an entry ``category:key`` (any state, archived or not)."""
+    cursor = vault._conn.cursor()
+    cursor.execute(
+        "SELECT DISTINCT scope FROM entities WHERE category = ? AND key = ? ORDER BY scope", (category, key)
+    )
+    return [row[0] for row in cursor.fetchall()]
+
+
+def _not_found(vault: Any, category: str, key: str, scope: str, stream: Any = None, prog: str = "kibisis-review") -> None:
+    """Explain a missing entry: the scope it was looked up in and the scopes that do hold it."""
+    stream = stream or sys.stderr
+    print(f"{prog}: {category}:{key} is not in scope {scope!r}.", file=stream)
+    held = _scopes_holding(vault, category, key)
+    if held:
+        print(
+            f"{prog}: it exists in scope(s) {', '.join(repr(s) for s in held)}; "
+            f"set KIBISIS_SCOPE to one of them (or run from that checkout) and retry.",
+            file=stream,
+        )
 
 
 def _state(entity: Any) -> str:
@@ -81,6 +135,9 @@ def _list(vault: Any, scope: str, category: Optional[str]) -> int:
         pending = meta.get("verification_pending")
         approvals = f", approvals {pending['have']} of {pending['need']}" if pending else ""
         print(f"{entity.category}:{entity.key}  (author {author}, version {entity.version}{approvals})")
+        notice = _supersession_notice(vault, entity, scope)
+        if notice:
+            print(f"    ! {notice}")
         for line in (entity.content or "").splitlines() or [""]:
             print(f"    {line}")
     if requests:
@@ -105,16 +162,31 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 3
     try:
         scope = resolve_scope()
-        vault = open_vault()
+        db_path = default_db_path()
+        vault = open_vault(db_path)
     except (ConfigError, EncryptionRequiredError) as exc:
         print(f"kibisis-review: {exc}", file=sys.stderr)
         return 2
+    print(f"vault {db_path}  scope {scope!r}", file=sys.stderr)
 
     try:
         if args.command == "list":
             return _list(vault, scope, args.category)
 
         reviewer = account_identity()
+        if args.command == "lift":
+            lifted = vault.lift_tombstone(args.category, args.key, scope=scope, digest=args.digest, author_id=reviewer)
+            if not lifted:
+                print(f"kibisis-review: no tombstone under {args.category}:{args.key} in scope {scope!r}.", file=sys.stderr)
+                return 1
+            print(f"Lifted {lifted} tombstone(s) under {args.category}:{args.key} in scope {scope!r} (account {reviewer}).")
+            return 0
+
+        before = vault.get(args.category, args.key, scope=scope)
+        if before is None:
+            _not_found(vault, args.category, args.key, scope)
+            return 1
+        notice = _supersession_notice(vault, before, scope) if args.command == "approve" else None
         try:
             entity = vault.review_entity(
                 category=args.category,
@@ -139,8 +211,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"{args.category}:{args.key} has {pending['have']} of {pending['need']} approvals (account "
                 f"{reviewer}{label}); it stays a candidate until another account approves it."
             )
+            if notice:
+                print(f"    ! {notice} once the quorum is met")
         else:
             print(f"{args.category}:{args.key} is now {_state(entity)} (account {reviewer}{label}).")
+            if notice:
+                print(f"    ! {notice.replace('approving retires', 'this approval retired')}")
         return 0
     finally:
         vault.close()

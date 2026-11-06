@@ -100,6 +100,14 @@ RESERVED_METADATA_KEYS = frozenset({
 })
 RESERVED_METADATA_PREFIX = "lineage_"
 
+#: Metadata keys the vault reads back as facts a principal or the vault itself established: who wrote
+#: an entry (``author_id``, shown as the author in recall), when a person last verified it
+#: (``last_verified_at``, recall's TTL clock), supersession state (``supersession``,
+#: ``proposed_supersedes``) and the persona ``slot``. A write from outside the principal class cannot
+#: set them at the top level: ``_put`` moves them under ``agent_metadata`` and logs the move. Principal
+#: writes may set them (an import of a person's notes names its author).
+PRINCIPAL_METADATA_KEYS = frozenset({"author_id", "last_verified_at", "supersession", "proposed_supersedes", "slot"})
+
 #: ``inform`` entries may be shown to a model; only ``act`` entries may drive an action (conventions,
 #: standing instructions). Agent and external writers are capped at ``inform``.
 ACT_CLASSES = ("inform", "act")
@@ -222,13 +230,24 @@ class SQLiteMemoryVault(
         cache_mb: Optional[int] = None,
         verification_quorum: Optional[int] = None,
         term_index: bool = True,
+        trust_caller_identity: bool = False,
     ) -> None:
         """Open a vault. Entry content is encrypted by default.
 
-        ``verification_quorum`` (K-R1) is how many distinct principals must attest to an entry before
-        it is stored as ``verified``: the author of a ``origin="user"`` write that asked for
+        ``verification_quorum`` (K-R1) is how many distinct accounts must attest to an entry before
+        it is stored as ``verified``: the person behind a ``origin="user"`` write that asked for
         ``verified`` counts as one, each person reviewing it as ``verified`` counts as one more. It
-        defaults to ``KIBISIS_VERIFICATION_QUORUM`` or :data:`DEFAULT_VERIFICATION_QUORUM`.
+        defaults to ``KIBISIS_VERIFICATION_QUORUM`` or :data:`DEFAULT_VERIFICATION_QUORUM`. The vault
+        file remembers the quorum it was opened with (``vault_meta`` ``verification_quorum``): a later
+        open asking for a LOWER quorum raises :class:`~kibisis.config.ConfigError`, a higher one is
+        stored, so a process cannot lower the bar for the entries other processes verified.
+
+        ``trust_caller_identity`` is for embedders only. By default the attester of a ``user``-origin
+        write or review is the operating-system account running the process
+        (:func:`kibisis._operator.account_identity`), whatever ``author_id`` or ``reviewer_id`` says.
+        With ``trust_caller_identity=True`` an explicit ``attester=`` on :meth:`put` or
+        :meth:`review_entity` is used instead: for a host that has authenticated its users itself and
+        wants their identities on the attestations. Never set it for a vault an agent can reach.
 
         The passphrase comes from the argument, then KIBISIS_PASSPHRASE_FILE, then KIBISIS_PASSPHRASE.
         With no passphrase the vault refuses to open (EncryptionRequiredError) unless ``allow_plaintext=True``.
@@ -264,11 +283,21 @@ class SQLiteMemoryVault(
         self.coordinator = coordinator
         self.enforce_fencing = enforce_fencing
         self.auto_gate = auto_gate
+        # A quorum named by the caller or the environment is a demand; one that is neither is the
+        # default, and an existing file's stored quorum takes its place (see _persist_verification_quorum).
+        self._quorum_requested = verification_quorum is not None or bool(
+            (os.environ.get("KIBISIS_VERIFICATION_QUORUM") or "").strip()
+        )
         if verification_quorum is None:
-            verification_quorum = int(os.environ.get("KIBISIS_VERIFICATION_QUORUM", DEFAULT_VERIFICATION_QUORUM))
-        if verification_quorum < 1:
-            raise ValueError("verification_quorum must be at least 1")
+            from .config import parse_verification_quorum  # config imports this module
+
+            verification_quorum = parse_verification_quorum(
+                os.environ.get("KIBISIS_VERIFICATION_QUORUM"), DEFAULT_VERIFICATION_QUORUM
+            )
+        if not isinstance(verification_quorum, int) or isinstance(verification_quorum, bool) or verification_quorum < 1:
+            raise ValueError("verification_quorum must be a positive integer")
         self.verification_quorum = int(verification_quorum)
+        self.trust_caller_identity = bool(trust_caller_identity)
         if enforce_fencing and coordinator is None:
             raise ValueError("enforce_fencing=True needs a lease coordinator: pass coordinator=")
         self._fallback_search_warned = False
@@ -351,6 +380,11 @@ class SQLiteMemoryVault(
         if self._cache_mb is not None:
             self._conn.execute(f"PRAGMA cache_size = -{self._cache_mb * 1024}")
         self._init_schema()
+        try:
+            self._persist_verification_quorum()
+        except BaseException:
+            self._conn.close()
+            raise
         if passphrase:
             self._was_keyed = self._has_meta_key("kdf_salt")  # written by an earlier open with a passphrase
             salt = self._vault_salt()
@@ -641,6 +675,13 @@ class SQLiteMemoryVault(
                 # A vault with a passphrase keeps a tombstone's plain digests sealed here, so a snapshot can
                 # carry the tombstone to another vault that has the same passphrase.
                 self._conn.execute("ALTER TABLE rejected_value_tombstones ADD COLUMN sealed_digests TEXT DEFAULT NULL")
+            if "origin_class" not in tomb_cols:
+                # The K-R1 class of the request that made the tombstone. Rows from before the column
+                # existed were made by callers that vouched (no origin), so they stay principal-class.
+                self._conn.execute(
+                    "ALTER TABLE rejected_value_tombstones ADD COLUMN origin_class TEXT NOT NULL DEFAULT 'principal'"
+                )
+            self._conn.execute("CREATE TABLE IF NOT EXISTS vault_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL)")
 
             self._conn.execute(
                 """
@@ -718,6 +759,101 @@ class SQLiteMemoryVault(
     def _set_meta(cursor: Any, key: str, value: Any) -> None:
         cursor.execute("INSERT OR REPLACE INTO vault_meta (key, value) VALUES (?, ?)", (key, value))
 
+    def _persist_verification_quorum(self) -> None:
+        """Store the quorum on first open; refuse an open that asks for less than the file remembers.
+
+        A verified entry means "``verification_quorum`` distinct accounts attested". A process opening
+        the same file with a smaller quorum would mint ``verified`` on fewer attestations, so it is
+        refused (:class:`~kibisis.config.ConfigError`). A larger quorum is allowed and becomes the
+        file's: raising the bar never un-verifies anything on its own. A process that names no quorum
+        (no argument, no ``KIBISIS_VERIFICATION_QUORUM``) adopts the file's.
+        """
+        from .config import ConfigError  # config imports this module
+
+        stored_raw = self._meta("verification_quorum")
+        stored: Optional[int] = None
+        if stored_raw is not None:
+            try:
+                stored = int(bytes(stored_raw).decode("ascii") if isinstance(stored_raw, (bytes, memoryview)) else stored_raw)
+            except (TypeError, ValueError):
+                stored = None
+        if stored is not None and stored >= 1 and not self._quorum_requested:
+            self.verification_quorum = stored
+            return
+        if stored is not None and self.verification_quorum < stored:
+            raise ConfigError(
+                f"{self.db_path} was opened with verification_quorum={stored}; this process asks for "
+                f"{self.verification_quorum}. A quorum may be raised but not lowered: set "
+                f"KIBISIS_VERIFICATION_QUORUM to {stored} or more."
+            )
+        if stored is None or self.verification_quorum > stored:
+            with self._write_tx() as cursor:
+                self._set_meta(cursor, "verification_quorum", str(self.verification_quorum))
+
+    def _resolve_attester(self, origin: Optional[str], attester: Optional[str]) -> Optional[str]:
+        """The account an attestation is recorded for, or ``None`` when nothing is recorded.
+
+        Only a ``user``-origin act attests: the identity is the operating-system account running
+        the process (:func:`kibisis._operator.account_identity`), or ``attester`` when the vault was
+        opened with ``trust_caller_identity=True`` and the caller named one. The literal
+        ``"principal"`` and an empty name are never signers. ``import`` is principal-class but no
+        person is present, so it records nothing: an import carries the attestations it was given.
+        """
+        if origin != "user":
+            return None
+        if attester is not None:
+            attester = str(attester).strip()
+            if not attester or attester == "principal":
+                raise ValueError("attester must name an account; 'principal' and an empty name are not signers")
+            if not self.trust_caller_identity:
+                raise ValueError(
+                    "attester= is honoured only on a vault opened with trust_caller_identity=True (embedders only); "
+                    "the attester is otherwise the account running this process"
+                )
+            return attester
+        from ._operator import account_identity
+
+        identity = account_identity()
+        if not identity or identity == "principal":
+            return None
+        return identity
+
+    def _write_review(
+        self,
+        category: str,
+        key: str,
+        content: str,
+        *,
+        metadata: Dict[str, Any],
+        epistemic_state: Union[str, EpistemicState],
+        author_id: Optional[str],
+        scope: str,
+        origin: Optional[str] = None,
+        fencing_token: Optional[int] = None,
+        resource: Optional[str] = None,
+        holder_id: Optional[str] = None,
+        **kwargs: Any,
+    ) -> MemoryEntity:
+        """The write a review makes. Private: ``review_entity`` decided the state and the metadata
+        it passes here, so both are taken as given (``_review_verdict``/``_trusted_metadata``).
+        Nothing public reaches this path."""
+        return self._put_journaled(
+            category,
+            key,
+            content,
+            metadata=metadata,
+            epistemic_state=epistemic_state,
+            origin=origin,
+            author_id=author_id,
+            scope=scope,
+            fencing_token=fencing_token,
+            resource=resource,
+            holder_id=holder_id,
+            _trusted_metadata=True,
+            _review_verdict=True,
+            **kwargs,
+        )
+
     def _put(
         self,
         category: str,
@@ -748,14 +884,20 @@ class SQLiteMemoryVault(
         contrasts_with: Optional[List[str]] = None,
         _trusted_metadata: bool = False,
         _review_verdict: bool = False,
+        attester: Optional[str] = None,
+        _attest: bool = True,
     ) -> MemoryEntity:
         """Write path behind :meth:`put`, which journals the tombstone refusals this raises.
 
-        ``_review_verdict`` is set by :meth:`review_entity` only: the state it passes was decided
-        under the quorum rule there, with ``attestations`` already in ``metadata``.
+        ``_review_verdict`` is set by :meth:`_write_review` only: the state it passes was decided
+        under the quorum rule in ``review_entity``, with ``attestations`` already in ``metadata``.
 
         ``_trusted_metadata`` is set only by internal callers whose ``metadata`` the vault itself
         produced; a caller's reserved keys (:data:`RESERVED_METADATA_KEYS`) are dropped otherwise.
+
+        ``attester`` names the account a ``user``-origin write that asks for ``verified`` attests as;
+        it is honoured only when the vault was opened with ``trust_caller_identity=True``, else the
+        attester is the account running the process (:meth:`_resolve_attester`).
         """
         if trust_ceiling is not None and trust_ceiling != EpistemicState.CANDIDATE.value:
             raise ValueError("trust_ceiling supports only 'candidate'")
@@ -777,6 +919,21 @@ class SQLiteMemoryVault(
                 meta.pop(k)
             if dropped:
                 logger.warning("put %s:%s [scope=%s] dropped reserved metadata keys %s", category, key, scope, dropped)
+            if origin_class_of(origin) != "principal":
+                # A non-principal write (or one that states no origin) cannot name its author, refresh
+                # the TTL clock, or set supersession or persona facts at the top level. The values are
+                # kept where the agent's own fields live, so nothing the agent sent is lost.
+                moved = sorted(k for k in meta if k in PRINCIPAL_METADATA_KEYS)
+                if moved:
+                    agent_meta = meta.get("agent_metadata")
+                    agent_meta = dict(agent_meta) if isinstance(agent_meta, dict) else {}
+                    for k in moved:
+                        agent_meta[k] = meta.pop(k)
+                    meta["agent_metadata"] = agent_meta
+                    logger.warning(
+                        "put %s:%s [scope=%s] moved principal-only metadata keys %s under agent_metadata",
+                        category, key, scope, moved,
+                    )
         if author_id:
             # Keep the original author when a reviewer re-writes an entry; the review is in human_reviews.
             meta.setdefault("author_id", author_id)
@@ -814,6 +971,18 @@ class SQLiteMemoryVault(
         # K-R1: the trust class of this write. A re-write that states no origin keeps the entry's
         # stored origin (and class); that is resolved against the stored row inside the transaction.
         writer_class: Optional[str] = origin_class_of(origin) if origin is not None else None
+        if (
+            epistemic_state is not None
+            and not _review_verdict
+            and ep_state != EpistemicState.CANDIDATE
+            and origin_class_of(origin) != "principal"
+        ):
+            # A non-principal write is stored as a candidate whatever epistemic_state it states:
+            # verified and disputed are a person's verdicts, revoked is a retirement (K-E). An
+            # origin-less rewrite of a principal row is resolved below once the stored class is known.
+            if writer_class is not None:
+                meta["trust_capped_from"] = ep_state.value
+                ep_state = EpistemicState.CANDIDATE
         requested_verified = ep_state == EpistemicState.VERIFIED and not _review_verdict
         if requested_verified:
             # An explicit "verified" from a principal is that principal's attestation, counted toward
@@ -870,8 +1039,14 @@ class SQLiteMemoryVault(
                     existing_meta = json.loads(existing["metadata_json"] or "{}")
                 except (TypeError, ValueError):
                     existing_meta = {}
+            # The class the edges are written with: a back-edge lands on a target only when the target
+            # is of this class or below. The vault's own paths (trusted metadata) write both sides.
+            edge_class: Optional[str] = None
+            if not _trusted_metadata:
+                edge_class = writer_class or (_row_origin_class(existing) if existing is not None else "external")
             conflict_refs = self._record_edges(
-                cursor, "conflicts_with", conflicts_with, category, key, scope, now, existing_meta, _trusted_metadata
+                cursor, "conflicts_with", conflicts_with, category, key, scope, now, existing_meta, _trusted_metadata,
+                writer_class=edge_class,
             )
             if conflicts_with:
                 self._record_audit_event(
@@ -883,7 +1058,8 @@ class SQLiteMemoryVault(
             # Contrast edges name confusables: entries a reader could mistake for each other. Both are
             # returned; the receipt carries the edge so the scaffold can show the distinction.
             contrast_refs = self._record_edges(
-                cursor, "contrasts_with", contrasts_with, category, key, scope, now, existing_meta, _trusted_metadata
+                cursor, "contrasts_with", contrasts_with, category, key, scope, now, existing_meta, _trusted_metadata,
+                writer_class=edge_class,
             )
             if contrast_refs:
                 meta["contrasts_with"] = contrast_refs
@@ -943,9 +1119,9 @@ class SQLiteMemoryVault(
                     except (TypeError, ValueError):
                         prior_meta = {}
                 attested = list(prior_meta.get("attestations") or []) if existing is not None else []
-                if requested_verified and entry_class == "principal":
-                    signer = author_id or principal_id or "principal"
-                    if signer not in attested:
+                if requested_verified and entry_class == "principal" and _attest:
+                    signer = self._resolve_attester(origin, attester)
+                    if signer is not None and signer not in attested:
                         attested.append(signer)
                 if attested:
                     meta["attestations"] = attested
@@ -953,8 +1129,14 @@ class SQLiteMemoryVault(
                     if len(attested) >= self.verification_quorum:
                         ep_state = EpistemicState.VERIFIED
                         meta.pop("verification_pending", None)
+                        meta["quorum_at_verification"] = self.verification_quorum
                     else:
                         meta["verification_pending"] = {"have": len(attested), "need": self.verification_quorum}
+                        meta.pop("quorum_at_verification", None)
+            if ep_state != EpistemicState.CANDIDATE and entry_class != "principal" and not _review_verdict:
+                # An origin-less rewrite resolved to a non-principal class: same cap as an explicit one.
+                meta["trust_capped_from"] = ep_state.value
+                ep_state = EpistemicState.CANDIDATE
             meta_str = json.dumps(meta, sort_keys=True)
 
             if trust_ceiling is not None:
@@ -1059,23 +1241,35 @@ class SQLiteMemoryVault(
                             cursor, target_cat, supersedes_key, scope, target_row["epistemic_state"],
                             EpistemicState.REVOKED.value, row_origin(target_row), author_id, cause="supersede",
                         )
-                    self._cascade_invalidate(cursor, scope, target_ref, author_id, now)
+                    self._cascade_invalidate(
+                        cursor, scope, target_ref, author_id, now,
+                        writer_class=None if confirmed_by else entry_class,
+                    )
 
             # Skip canonicalization when the vault has no tombstones. Asked of the database on every
             # write: a flag cached at open misses tombstones that other processes add later.
             cursor.execute("SELECT EXISTS (SELECT 1 FROM rejected_value_tombstones)")
             if cursor.fetchone()[0]:
-                tomb = self._find_tombstone(cursor, scope, val_hash, can_hash)
-                if tomb is not None:
+                # A tombstoned value is refused wherever the entry would hold it: content, key, or any
+                # string in its metadata. A tombstone of a lower class than the writer is lifted by the
+                # write (journaled); one of the writer's class or above refuses it.
+                tombs = self._tombstones_matching(cursor, scope, self._entry_digests(key, content, meta))
+                blocking = [t for t in tombs if _class_rank(t["origin_class"]) >= _class_rank(entry_class)]
+                if blocking:
+                    tomb = blocking[0]
+                    where = "content" if tomb["value_sha256"] == val_hash else "key or metadata"
                     raise TombstonedValueError(
-                        f"Write rejected by tombstone: entity '{category}:{key}' [scope={scope}] matches rejected tombstone "
-                        f"(digest: {val_hash[:12]}..., reason: {tomb['reason']})",
+                        f"Write rejected by tombstone: entity '{category}:{key}' [scope={scope}] matches rejected "
+                        f"tombstone in its {where} (digest: {tomb['value_sha256'][:12]}..., reason: {tomb['reason']}, "
+                        f"tombstone class: {tomb['origin_class']})",
                         category=category,
                         key=key,
                         scope=scope,
-                        digest=val_hash,
+                        digest=tomb["value_sha256"],
                         author_id=author_id,
                     )
+                if tombs:
+                    self._lift_lower_class_tombstones(cursor, tombs, entry_class, category, key, scope, author_id)
 
             if self.crypto_provider is not None and not self.passphrase:
                 raise ValueError("Crypto provider configured but no passphrase supplied to SQLiteMemoryVault.")
@@ -1161,7 +1355,10 @@ class SQLiteMemoryVault(
                     cause="review" if _review_verdict else "write",
                 )
                 if ep_state == EpistemicState.REVOKED:
-                    self._cascade_invalidate(cursor, scope, f"{category}:{key}", author_id, now)
+                    self._cascade_invalidate(
+                        cursor, scope, f"{category}:{key}", author_id, now,
+                        writer_class=None if _review_verdict else entry_class,
+                    )
             # Return what was stored, through the same constructor the read paths use, so the write
             # path cannot report a field differently from a later get() or search().
             cursor.execute(f"SELECT {_ENTITY_COLUMNS} FROM entities e WHERE e.id = ?", (entity_id,))
@@ -1197,8 +1394,7 @@ class SQLiteMemoryVault(
         revive: bool = False,
         conflicts_with: Optional[List[str]] = None,
         contrasts_with: Optional[List[str]] = None,
-        _trusted_metadata: bool = False,
-        _review_verdict: bool = False,
+        attester: Optional[str] = None,
     ) -> MemoryEntity:
         """Insert or update an entity. See ``__init__`` for ``fencing_token``, ``resource`` and ``holder_id``.
 
@@ -1237,38 +1433,73 @@ class SQLiteMemoryVault(
 
         Reserved metadata keys (:data:`RESERVED_METADATA_KEYS`, ``lineage_*``) in ``metadata`` are
         dropped and logged; the vault sets them itself (``review_entity``, the ``tenant_id`` and
-        ``principal_id`` arguments). ``_trusted_metadata`` is internal.
+        ``principal_id`` arguments). A write from outside the principal class cannot set
+        :data:`PRINCIPAL_METADATA_KEYS` at the top level; they are moved under ``agent_metadata``.
+        A non-principal write is stored as ``candidate`` whatever ``epistemic_state`` says
+        (``trust_capped_from`` records the claim).
+
+        ``attester`` names the account a ``origin="user"`` write that asks for ``verified`` attests
+        as. It is honoured only on a vault opened with ``trust_caller_identity=True`` (embedders that
+        authenticated the person themselves); otherwise the attester is the account running the
+        process and passing ``attester`` raises ``ValueError``. ``author_id`` is a label and never
+        counts toward the quorum.
+
+        The review path writes through a private method; ``put`` takes no review or trusted-metadata
+        flag, so nothing public mints a reviewed state or plants trust facts.
         """
+        return self._put_journaled(
+            category=category,
+            key=key,
+            content=content,
+            metadata=metadata,
+            epistemic_state=epistemic_state,
+            valid_from=valid_from,
+            valid_until=valid_until,
+            scope=scope,
+            author_id=author_id,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            derived_from=derived_from,
+            fencing_token=fencing_token,
+            resource=resource,
+            holder_id=holder_id,
+            supersedes_key=supersedes_key,
+            supersedes_category=supersedes_category,
+            auto_gate=auto_gate,
+            trust_ceiling=trust_ceiling,
+            origin=origin,
+            source_ref=source_ref,
+            confidence=confidence,
+            act_class=act_class,
+            revive=revive,
+            conflicts_with=conflicts_with,
+            contrasts_with=contrasts_with,
+            attester=attester,
+        )
+
+    def _put_journaled(
+        self,
+        category: str,
+        key: str,
+        content: str,
+        *,
+        scope: str = "default",
+        author_id: Optional[str] = None,
+        origin: Optional[str] = None,
+        **kwargs: Any,
+    ) -> MemoryEntity:
+        """Run :meth:`_put` and journal the refusals it raises (each in its own transaction, after the
+        write's rolled back). Internal paths (the review write, the snapshot import) use this with the
+        private flags; :meth:`put` uses it without them."""
         try:
             return self._put(
                 category=category,
                 key=key,
                 content=content,
-                metadata=metadata,
-                epistemic_state=epistemic_state,
-                valid_from=valid_from,
-                valid_until=valid_until,
                 scope=scope,
                 author_id=author_id,
-                tenant_id=tenant_id,
-                principal_id=principal_id,
-                derived_from=derived_from,
-                fencing_token=fencing_token,
-                resource=resource,
-                holder_id=holder_id,
-                supersedes_key=supersedes_key,
-                supersedes_category=supersedes_category,
-                auto_gate=auto_gate,
-                trust_ceiling=trust_ceiling,
                 origin=origin,
-                source_ref=source_ref,
-                confidence=confidence,
-                _trusted_metadata=_trusted_metadata,
-                act_class=act_class,
-                revive=revive,
-                conflicts_with=conflicts_with,
-                contrasts_with=contrasts_with,
-                _review_verdict=_review_verdict,
+                **kwargs,
             )
         except TombstonedValueError as exc:
             # The write's transaction rolled back; journal the refusal in its own transaction.
@@ -1297,7 +1528,8 @@ class SQLiteMemoryVault(
         except SupersededEntryError:
             self.record_refusal(
                 path="put", reason="superseded_entry", scope=scope, category=category, key=key,
-                author_id=author_id, detail={"origin": origin or "", "revive": "yes" if revive else "no"},
+                author_id=author_id,
+                detail={"origin": origin or "", "revive": "yes" if kwargs.get("revive") else "no"},
             )
             raise
 
@@ -1371,7 +1603,7 @@ class SQLiteMemoryVault(
         if detail:
             meta["detail"] = detail
         with self._write_tx() as cursor:
-            return self._record_audit_event(
+            event = self._record_audit_event(
                 cursor=cursor,
                 action="refuse",
                 category=category or "",
@@ -1381,6 +1613,21 @@ class SQLiteMemoryVault(
                 author_id=author_id,
                 metadata=meta,
             )
+            if reason == "reviewed_entry" and (detail or {}).get("tool") == "kibisis_forget":
+                # A refused forget of a reviewed entry is also a request to the person. It gets its own
+                # journal action so the review queue finds it by an indexed column, not by scanning the
+                # last N refusals: a flood of other refusals cannot push it out of view.
+                self._record_audit_event(
+                    cursor=cursor,
+                    action="forget_request",
+                    category=category or "",
+                    key=key or "",
+                    scope=scope,
+                    value_sha256="",
+                    author_id=author_id,
+                    metadata=meta,
+                )
+            return event
 
     def forget_requests(self, scope: str, limit: int = 50) -> List[Dict[str, Any]]:
         """Refused requests to forget a reviewed entry in ``scope``, newest first, one per entry.
@@ -1391,9 +1638,11 @@ class SQLiteMemoryVault(
         ``category``, ``key``, ``requested_at``, ``author_id`` and ``reason``.
         """
         cursor = self._conn.cursor()
+        # Filtered in SQL on the dedicated action (see record_refusal), so the number of other
+        # refusals in the journal has no bearing on whether a request is found.
         cursor.execute(
             "SELECT category, key, timestamp, author_id, metadata_json FROM audit_journal "
-            "WHERE action = 'refuse' AND scope = ? ORDER BY sequence DESC LIMIT 5000",
+            "WHERE action = 'forget_request' AND scope = ? ORDER BY sequence DESC",
             (scope,),
         )
         seen = set()
@@ -1404,8 +1653,6 @@ class SQLiteMemoryVault(
             except (TypeError, ValueError):
                 continue
             detail = meta.get("detail") or {}
-            if meta.get("reason") != "reviewed_entry" or detail.get("tool") != "kibisis_forget":
-                continue
             ref = (row["category"], row["key"])
             if ref in seen:
                 continue
@@ -1482,8 +1729,17 @@ class SQLiteMemoryVault(
 
         The batch stops at the first item that fails, and the items before it stay written.
         ``fencing_token``, ``resource`` and ``holder_id`` apply to every item; a dict item may set its own.
+        A dict item is the keyword arguments of :meth:`put`; keys that are not ``put`` parameters
+        (private flags such as ``_review_verdict`` and ``_trusted_metadata`` included) raise
+        ``TypeError`` before anything is written.
         """
         fence = {"fencing_token": fencing_token, "resource": resource, "holder_id": holder_id}
+        allowed = _PUT_PARAMETERS
+        for item in items:
+            if isinstance(item, dict):
+                unknown = sorted(str(k) for k in item if k not in allowed)
+                if unknown:
+                    raise TypeError(f"put_batch item has arguments put() does not take: {unknown}")
         results: List[MemoryEntity] = []
         with self._conn:
             for item in items:
@@ -1539,17 +1795,30 @@ class SQLiteMemoryVault(
         fencing_token: Optional[int] = None,
         resource: Optional[str] = None,
         holder_id: Optional[str] = None,
+        origin: Optional[str] = None,
     ) -> bool:
+        """Archive the entry at ``category:key`` (hidden from reads, kept in the file) and cascade an
+        invalidation to what derived from it.
+
+        ``origin`` names who asked, as on :meth:`tombstone`: a non-principal origin cannot archive an
+        entry a person verified or reviewed, or one a higher class wrote
+        (:class:`ReviewedEntryError`, nothing changed). ``None`` leaves the check to the caller.
+        """
+        requester = self._requester_class(origin)
         now = time.time()
-        with self._write_tx() as cursor:
+        with self._journal_protected_refusal("archive", category, key, scope, author_id, origin), self._write_tx() as cursor:
             self._fence(cursor, fencing_token, resource, holder_id)
+            row = self._fetch_row(cursor, category, key, scope)
+            if row is None:
+                return False
+            self._refuse_if_protected(row, requester, origin, "archive")
             cursor.execute(
                 """
                 UPDATE entities
                 SET archived = 1, updated_at = ?
-                WHERE category = ? AND key = ? AND scope = ? AND archived = 0
+                WHERE id = ? AND archived = 0
                 """,
-                (now, category, key, scope),
+                (now, row["id"]),
             )
             archived = cursor.rowcount > 0
             if archived:
@@ -1561,8 +1830,9 @@ class SQLiteMemoryVault(
                     scope=scope,
                     value_sha256="",
                     author_id=author_id,
+                    metadata={"origin": origin or "", "origin_class": requester},
                 )
-                self._cascade_invalidate(cursor, scope, f"{category}:{key}", author_id, now)
+                self._cascade_invalidate(cursor, scope, f"{category}:{key}", author_id, now, writer_class=requester)
             return archived
 
     @staticmethod
@@ -1657,13 +1927,26 @@ class SQLiteMemoryVault(
         resource: Optional[str] = None,
         holder_id: Optional[str] = None,
         origin: Optional[str] = "user",
+        attester: Optional[str] = None,
     ) -> MemoryEntity:
         """Store or update the dedicated user persona / preference slot.
 
-        The slot is the person's own profile, so ``origin`` defaults to ``"user"``: the write is its
-        author's attestation and the slot is ``verified`` once ``verification_quorum`` is met
-        (K-R1); below quorum it is stored as a candidate with ``verification_pending``.
+        The slot is the person's own profile, so ``origin`` defaults to ``"user"``: the write is the
+        account's attestation (see :meth:`put` for ``attester``) and the slot is ``verified`` once
+        ``verification_quorum`` is met (K-R1); below quorum it is stored as a candidate with
+        ``verification_pending``. A request from outside the principal class (``origin="model"``,
+        say) cannot replace a slot a person verified or reviewed or that a higher class wrote
+        (:class:`ReviewedEntryError`), the same check :meth:`tombstone` runs; and its write is a
+        candidate whatever it claims.
         """
+        requester = self._requester_class(origin)
+        if requester != "principal":
+            with self._journal_protected_refusal(
+                "set_persona_slot", "persona", "user_profile", scope, author_id, origin
+            ), self._write_tx() as cursor:
+                row = self._fetch_row(cursor, "persona", "user_profile", scope)
+                if row is not None:
+                    self._refuse_if_protected(row, requester, origin, "replace the persona slot of")
         meta = metadata.copy() if metadata else {}
         meta["is_persona_slot"] = True
         return self.put(
@@ -1678,6 +1961,7 @@ class SQLiteMemoryVault(
             resource=resource,
             holder_id=holder_id,
             origin=origin,
+            attester=attester,
         )
 
     def get_persona_slot(
@@ -1724,3 +2008,9 @@ class SQLiteMemoryVault(
             self._tokenizer.close()
             self._tokenizer = None
         self._conn.close()
+
+
+#: The keyword arguments :meth:`SQLiteMemoryVault.put` takes; ``put_batch`` checks dict items against it.
+_PUT_PARAMETERS = frozenset(
+    name for name in inspect.signature(SQLiteMemoryVault.put).parameters if name != "self"
+)

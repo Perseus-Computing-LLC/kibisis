@@ -47,6 +47,7 @@ def _admit(args: argparse.Namespace) -> int:
     except (ConfigError, EncryptionRequiredError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
+    print(f"vault {vault.db_path}  scope {scope!r}", file=sys.stderr)
     reviewer = account_identity()
     try:
         entity = vault.admit(
@@ -61,8 +62,10 @@ def _admit(args: argparse.Namespace) -> int:
     except AdmissionRefused as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
-    except KeyError as exc:
-        print(f"error: {exc} in {vault.db_path}", file=sys.stderr)
+    except KeyError:
+        from .review import _not_found
+
+        _not_found(vault, args.category, args.key, scope, prog="error")
         return 1
     finally:
         vault.close()
