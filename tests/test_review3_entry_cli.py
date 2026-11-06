@@ -273,6 +273,7 @@ def test_attack_open_vault_env_mapping_is_ignored_for_the_quorum(tmp_path, monke
         assert v.verification_quorum == 2  # the mapping names none: the default, not os.environ's 3
     finally:
         v.close()
+    monkeypatch.setenv("KIBISIS_PASSPHRASE", PASS)
     v = open_vault(str(tmp_path / "e3.sqlite"))  # no mapping: os.environ as before
     try:
         assert v.verification_quorum == 3

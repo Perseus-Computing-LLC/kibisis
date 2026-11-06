@@ -411,7 +411,7 @@ class SQLiteMemoryVault(
         # SQLite file is read as plain even with a passphrase (no in-place SQLCipher conversion).
         self.read_only = bool(read_only)
         if self.read_only:
-            if not on_disk or not os.path.exists(self.db_path) or os.path.getsize(self.db_path) == 0:
+            if not on_disk or not os.path.isfile(self.db_path) or os.path.getsize(self.db_path) == 0:
                 raise FileNotFoundError(f"read-only open needs an existing vault file: {self.db_path}")
             with open(self.db_path, "rb") as f:
                 plain_file = f.read(16).startswith(b"SQLite format 3")
@@ -458,7 +458,7 @@ class SQLiteMemoryVault(
             on_disk
             and passphrase
             and _sqlcipher_available()
-            and os.path.exists(self.db_path)
+            and os.path.isfile(self.db_path)
             and os.path.getsize(self.db_path) > 0
         ):
             with open(self.db_path, "rb") as f:

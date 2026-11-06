@@ -26,9 +26,12 @@ def _env(monkeypatch):
     monkeypatch.setenv("ARGUS_LEDGER_PATH", "")
 
 
+PASS = "review-a1-write-paths-test"
+
+
 @pytest.fixture
 def vault():
-    v = SQLiteMemoryVault(":memory:", auto_gate=False, verification_quorum=1)
+    v = SQLiteMemoryVault(":memory:", auto_gate=False, verification_quorum=1, passphrase=PASS)
     yield v
     v.close()
 
@@ -168,7 +171,7 @@ def test_snapshot_round_trip_must_keep_a_person_verified_entry_verified_and_prin
     caps to candidate for a non-principal writer (817-823) and stores origin 'unknown' (1111)."""
     _verified(vault)
     snap = vault.export_snapshot()
-    other = SQLiteMemoryVault(":memory:", auto_gate=False, verification_quorum=1)
+    other = SQLiteMemoryVault(":memory:", auto_gate=False, verification_quorum=1, passphrase=PASS)
     try:
         assert other.import_snapshot(snap) == 1
         e = other.get("ops", "deploy_day")
@@ -185,7 +188,7 @@ def test_after_a_snapshot_restore_an_agent_can_overwrite_and_delete_the_persons_
     tombstone through."""
     _verified(vault)
     snap = vault.export_snapshot()
-    other = SQLiteMemoryVault(":memory:", auto_gate=False, verification_quorum=1)
+    other = SQLiteMemoryVault(":memory:", auto_gate=False, verification_quorum=1, passphrase=PASS)
     try:
         other.import_snapshot(snap)
         with pytest.raises((ReviewedEntryError, OriginClassError)):

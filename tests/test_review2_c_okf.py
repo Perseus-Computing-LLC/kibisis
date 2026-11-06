@@ -97,6 +97,9 @@ def test_control_read_only_open_edge_cases(tmp_path):
     for name, content in [("empty.sqlite", b""), ("notdb.sqlite", b"not a database at all" * 200)]:
         (tmp_path / name).write_bytes(content)
     os.mkdir(tmp_path / "dir.sqlite")
+    # A directory's st_size is filesystem-specific (0 on btrfs, 4096 on ext4, 64 on APFS): the
+    # file check must not go through getsize, or a non-empty-looking directory reaches open().
+    (tmp_path / "dir.sqlite" / "child").write_bytes(b"x" * 64)
     for name in ("missing.sqlite", "empty.sqlite", "dir.sqlite"):
         with pytest.raises(FileNotFoundError):
             SQLiteMemoryVault(str(tmp_path / name), allow_plaintext=True, read_only=True)

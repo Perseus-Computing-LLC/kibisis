@@ -225,11 +225,13 @@ def test_caller_supplied_human_reviews_does_not_count_as_reviewed(caplog):
 
 
 def test_snapshot_round_trip_keeps_review_history_and_tenant(tmp_path):
-    src = SQLiteMemoryVault(":memory:", allow_plaintext=True)
+    # Review history travels only between copies of the same vault (the snapshot's trust seal must
+    # open under the importer's key); a keyless vault's snapshot is foreign to every other vault.
+    src = SQLiteMemoryVault(":memory:", passphrase="snapshot-round-trip-test")
     src.put("c", "k", "a fact", tenant_id="acme", epistemic_state="candidate")
     src.review_entity("c", "k", "verified", reviewer_id="alice")
     snap = src.export_snapshot()
-    dst = SQLiteMemoryVault(":memory:", allow_plaintext=True)
+    dst = SQLiteMemoryVault(":memory:", passphrase="snapshot-round-trip-test")
     dst.import_snapshot(snap)
     got = dst.get("c", "k")
     assert got.metadata["tenant_id"] == "acme"
