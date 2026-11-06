@@ -14,10 +14,12 @@ Entries for the parent to merge into CHANGELOG.md (no version bump here).
 - **F3** Tombstones carry `origin_class` (new column; rows from before the column are `principal`).
   A write of a higher class than a tombstone's class lifts it (journaled `tombstone_lifted`) and
   succeeds; a principal-class tombstone blocks everyone. `kibisis-review lift CATEGORY KEY
-  [--digest PREFIX]` (terminal-gated, journaled) is the only way past a principal-class tombstone.
+  [--digest PREFIX]` (terminal-gated, journaled) is the person's way past a principal-class
+  tombstone (round 2: the library method behind it takes an origin and refuses agents).
   `kibisis_forget` through MCP stays a tombstone, now model-class, so an agent cannot permanently
   deny a value a person wants to keep.
-- **F5** `canonicalize_text` also drops `Mn`/`Me`/`Mc` marks and Default_Ignorable code points
+- **F5** `canonicalize_text` also drops `Mn`/`Me` marks and Default_Ignorable code points (round 2:
+  `Mc` kept, Hangul fillers become spaces)
   (U+FE0F, U+034F, U+180B-D, Hangul fillers U+115F/U+1160/U+3164/U+FFA0, zero-width joiners) and
   folds a built-in table of Latin/Cyrillic/Greek homoglyphs (Cyrillic а е о р с у х і ј ѕ, Greek α ο ν,
   dotless ı). The Rust fold is unchanged (README says so). Paraphrase remains out of scope.
@@ -48,7 +50,8 @@ Entries for the parent to merge into CHANGELOG.md (no version bump here).
   passphrase-sealed `trust_seal` opens here) AND `manifest_sha256` is present and verifies; the
   drop is journaled and `epistemic_state` is re-derived from what survives.
 - **F11** Snapshots export `origin` and `author_id` per entity and the import passes them on, so a
-  verified principal entry restored into its own vault stays verified and principal.
+  verified principal entry restored into its own vault stays verified and principal (round 2: an
+  agent's entry a person verified too).
 - **L2** `_put` caps every non-candidate `epistemic_state` (including `revoked`) to `candidate` for
   non-principal origins, recording `trust_capped_from`.
 - **L3** `author_id`, `last_verified_at`, `supersession`, `proposed_supersedes` and `slot` are
@@ -96,3 +99,56 @@ Entries for the parent to merge into CHANGELOG.md (no version bump here).
   snapshot made by a plaintext vault has no seal and no key id, so a plaintext vault keeps trust
   facts from any plaintext snapshot with a verifying manifest (manifest is unkeyed). Treat snapshot
   files like the database file (SECURITY.md).
+
+## Round 2
+
+Second-pass findings in `review_notes/R2_A.md`; regression tests in `tests/test_review2_a_tombstones.py`
+and `tests/test_review2_a_trust.py` (the `test_attack_*` names are kept; each now asserts the fixed
+behaviour).
+
+### Fixed
+
+- **R2-A1** (high) A tombstone row's class never goes down. `_tombstone_locked` no longer writes
+  `INSERT OR REPLACE`: a request for a value that already has a row of the same or a higher class
+  leaves the row, its class and its MAC untouched and journals `tombstone_reaffirmed` (with
+  `origin_class` = the stored class, `requester_class`, `stored_class`); a higher-class request raises
+  the row's class and re-signs it (journaled `tombstone`). The `tombstone` journal event now carries
+  `origin_class` of the row as written. A person's rejection can no longer be replaced by an agent's
+  re-tombstone and then lifted by an ordinary write.
+- **R2-A7** (medium) `import_snapshot` of a vault's own snapshot (same vault, manifest verified)
+  passes `_review_verdict=True` for every entity, and `_put` no longer applies the model trust ceiling
+  under a verdict: an agent entry a person verified comes back `verified`, `origin='model'`,
+  `human_reviews` and `attestations` intact, and restoring over the live reviewed row raises no
+  `ReviewedEntryError`. The whole restore (tombstones, clearing, entities, refusal records) is one
+  transaction: an error part-way rolls everything back. A foreign snapshot restored over a live vault
+  leaves a person's reviewed / higher-class row in place (journaled `protected entry` refusal, not
+  counted) instead of aborting.
+- **R2-A2** (low-medium) `_entry_digests` matches the content, the key and the caller's own metadata
+  (`agent_metadata`) only; the vault's bookkeeping strings (`origin_class`, `act_class`, the MCP
+  server's `origin`, `attestations`, `human_reviews`, ...) are no longer digested, so one forget of
+  a word such as `agent` or `mcp` no longer refuses every later agent write in the scope.
+- **R2-A5** The Hangul fillers (U+115F, U+1160, U+3164, U+FFA0) fold to a space, not to nothing
+  (`_BLANK_CODE_POINTS`): a rejected sentence with its spaces replaced by fillers is refused.
+- **R2-A4** The canonical fold keeps spacing combining marks (`Mc`): distinct Devanagari/Tamil words
+  no longer share a digest. `Mn`/`Me` are still dropped (the evasion marks), so words that differ
+  only in a nonspacing vowel sign still fold alike; documented in the docstring and README.
+- **R2-A3** `string_leaves` yields dict keys as well as values at any depth: a tombstoned value is
+  refused as a metadata key and a stored copy filed as a key is purged with the rest.
+- **R2-A9** A principal's write of different content over an attested entry drops `attestations`,
+  `verification_pending` and `quorum_at_verification` (journaled `attestations_reset` with the
+  names), and the state is re-derived for the new content: the writer's own attestation counts
+  alone and the quorum starts over. The same content written again keeps what it has.
+- **R2-A6** `lift_tombstone()` takes `origin`; a `model`, `tool` or `unknown` origin is refused with
+  `PermissionError` (journaled `refuse`, path `lift_tombstone`) whatever class the tombstone carries.
+  `None` keeps the library contract (the caller vouches for a person; the review CLI's `lift` verb
+  after its terminal check). README/SECURITY no longer call the CLI "the only way".
+- Docs: README tombstone fold description and forget/lift paragraph, SECURITY forget paragraph, the
+  `import_snapshot` docstring, and the F3/F5/F11 lines above.
+
+### Not fixed here
+
+- **R2-A8** (`verification_quorum` outside the vault meta MAC) is R2-B4 and lands in area B
+  (`VAULT_META_BOUND_KEYS`); `test_attack_stored_quorum_is_not_under_the_vault_meta_mac` asserts the
+  fixed behaviour and is skipped until the merge. `_persist_verification_quorum` runs before the
+  signing key is derived in `__init__`, so a `_write_meta_mac` call there would be a no-op; area B's
+  open-time MAC write must cover the key instead.

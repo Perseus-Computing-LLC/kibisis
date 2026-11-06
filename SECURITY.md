@@ -147,9 +147,14 @@ also stored in plain text.
   reviewed; `tombstone(content=...)` looks the row up and runs the same check before any branch, and
   deletes nothing when the stored value does not match. A non-principal may not tombstone with
   `scope="*"`. A tombstone records the class of its maker: a person's write lifts a model-class
-  tombstone (journaled `tombstone_lifted`), a principal-class one blocks everyone until a person runs
-  `python -m kibisis.review lift`. A tombstoned value is refused as a key or a metadata string as well
-  as content; the MCP tools cap keys at 128 characters.
+  tombstone (journaled `tombstone_lifted`), a principal-class one blocks everyone until a person lifts
+  it (`python -m kibisis.review lift`, or `lift_tombstone()` with a principal or vouched origin; a
+  model, tool or unknown origin is refused). A later lower-class `tombstone()` of the same value
+  never replaces the row (journaled `tombstone_reaffirmed`). A tombstoned value is refused as a key
+  or as any string (key or value) of the caller's `agent_metadata` as well as content; the vault's
+  bookkeeping metadata is not matched. Look-alikes are the canonical fold's: case, spacing,
+  punctuation, invisible code points, Hangul fillers as blanks, a small homoglyph table; nonspacing
+  marks are dropped, spacing marks kept. The MCP tools cap keys at 128 characters.
 - The MCP server fixes the trust arguments itself: `_remember` (mcp_server.py ) always passes
   `trust_ceiling="candidate"` and `origin="model"` (mcp_server.py). A call that tries to send
   `epistemic_state`, `auto_gate`, `trust_ceiling`, `author_id`, `reviewer_id`, `tenant_id`, `principal_id`,
