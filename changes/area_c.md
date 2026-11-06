@@ -139,3 +139,25 @@ Second-pass findings R2-C-1..R2-C-5 (`review_notes/R2_C.md`), plus the "suspecte
   vault file is unchanged). On a genuinely format-1 keyed vault with no key check, a read-only open still
   cannot tell a wrong passphrase from a vault that needs the upgrade (there is nothing to check against);
   the message says to open it writable once, which is the right advice there.
+
+## Round 3 — MCP/config
+
+### Fixed
+
+- **R3-E2** (low) `_call_tool` maps `PermissionError` (`OriginClassError`, `SupersededEntryError`, any
+  subclass a tool body did not map) to the tool result `Refused: <msg>` with `isError`, no traceback on
+  the server log. The vault's own journal entry stands for an origin-class refusal; a supersession
+  refusal is journaled by the server (`path=mcp`, `reason=superseded_refused`), any other
+  `PermissionError` as `permission_refused`.
+- **R3-E3** (low) `tools/call` with `params` that is not an object answers JSON-RPC `-32602`
+  `params must be an object` from `handle_request` (no `AttributeError` for an embedder, no `-32603`
+  plus traceback over stdio).
+- `kibisis_health` reports `verification_quorum` (`accounts`, `pinned`, `note`); the stdio banner says
+  `quorum 1 — one account verifies` when the vault runs with one (R3-E1; the pinning change itself is in
+  area A).
+
+### Tests
+
+- `tests/review3_entry_mcp.py` → `tests/test_review3_entry_mcp.py`, `tests/review3_entry_aml.py` →
+  `tests/test_review3_entry_aml.py`: collected; the `test_attack_*` cases assert the fixed behaviour;
+  `test_control_health_and_ledger_do_not_leak_secrets` now expects the quorum in the health report.

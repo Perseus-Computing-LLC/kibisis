@@ -163,9 +163,24 @@ def plaintext_allowed(env: Optional[Mapping[str, str]] = None) -> bool:
 
 
 def open_vault(
-    db_path: Optional[str] = None, env: Optional[Mapping[str, str]] = None, *, read_only: bool = False
+    db_path: Optional[str] = None,
+    env: Optional[Mapping[str, str]] = None,
+    *,
+    read_only: bool = False,
+    pin_quorum: bool = False,
 ) -> SQLiteMemoryVault:
     """Open the vault the environment describes. Refuses to run without a key unless plaintext is allowed.
+
+    Every setting comes from ``env`` (default ``os.environ``): the path, the key, the plaintext opt-in
+    and ``KIBISIS_VERIFICATION_QUORUM``, which is parsed here (:func:`parse_verification_quorum`) and
+    passed to the vault explicitly, so a scrubbed mapping isolates the vault from the process
+    environment for the quorum too. A mapping that names no quorum leaves it to the vault's default
+    and the file's stored value.
+
+    ``pin_quorum=True`` lets this open store the quorum in the vault file (on first open, or when it
+    raises the stored one). Only the review verdicts and ``admit`` pass it, behind their terminal
+    check; the servers, ``review list``, the OKF commands and embedders adopt the stored quorum and
+    never pin one.
 
     ``read_only=True`` opens an existing vault without changing a byte of the vault file (no SQLCipher
     conversion, integrity upgrade or index build; every write is refused) and does not create a missing
@@ -176,6 +191,8 @@ def open_vault(
     path = db_path or default_db_path(env)
     passphrase = resolve_passphrase(env=env)
     allow_plaintext = plaintext_allowed(env)
+    named = env.get(ENV_VERIFICATION_QUORUM)
+    quorum = parse_verification_quorum(named) if named is not None and named.strip() else None
     if not passphrase and not allow_plaintext:
         raise ConfigError(
             "No key: set KIBISIS_PASSPHRASE_FILE to a key file (create one with `python -m kibisis.keys PATH`) "
@@ -185,8 +202,12 @@ def open_vault(
         if path == ":memory:" or not os.path.isfile(path):
             raise ConfigError(f"No vault at {path} (nothing to read).")
         return SQLiteMemoryVault(
-            path, passphrase=passphrase, allow_plaintext=allow_plaintext and not passphrase, read_only=True
+            path, passphrase=passphrase, allow_plaintext=allow_plaintext and not passphrase, read_only=True,
+            verification_quorum=quorum, env=env,
         )
     if path != ":memory:":
         os.makedirs(os.path.dirname(os.path.abspath(path)), mode=0o700, exist_ok=True)
-    return SQLiteMemoryVault(path, passphrase=passphrase, allow_plaintext=allow_plaintext)
+    return SQLiteMemoryVault(
+        path, passphrase=passphrase, allow_plaintext=allow_plaintext, verification_quorum=quorum, env=env,
+        pin_quorum=pin_quorum,
+    )

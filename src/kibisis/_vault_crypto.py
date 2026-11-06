@@ -494,9 +494,13 @@ class EntryIntegrityMixin:
         """Refuse a keyed vault whose meta MAC is missing or does not cover the stored values.
 
         A MAC written before ``verification_quorum`` was one of the bound values (the legacy set,
-        :data:`VAULT_META_BOUND_KEYS_V1`) is accepted once, logged, and replaced by one over the full set
-        when the vault is open writable; a read-only open accepts it as it is. Until that first
-        writable open the stored quorum is not covered.
+        :data:`VAULT_META_BOUND_KEYS_V1`) is accepted once, logged at WARNING, and replaced by one over
+        the full set when the vault is open writable; a read-only open accepts it as it is. Such a MAC
+        never covered the stored quorum, and any pre-upgrade copy of it stays valid over the legacy set,
+        so the stored quorum is not trusted while it holds (R3-AB4): a value below the default is
+        ignored (``_stored_quorum``) and dropped before the re-sign (``_drop_untrusted_stored_quorum``),
+        so the new MAC never signs a file writer's lower quorum; a value at or above the default can only
+        raise the bar and is kept.
         """
         stored = self._meta("meta_mac")
         if stored is None:
@@ -505,13 +509,23 @@ class EntryIntegrityMixin:
         if hmac.compare_digest(str(stored), vault_meta_mac(self._signing_key, fields)):
             return
         if hmac.compare_digest(str(stored), vault_meta_mac(self._signing_key, fields, VAULT_META_BOUND_KEYS_V1)):
+            self._meta_mac_legacy = True
             if getattr(self, "read_only", False):
-                logger.info("%s: the meta MAC predates the bound verification quorum; re-signed at the next writable open",
-                            self.db_path)
+                logger.warning(
+                    "%s: the meta MAC predates the bound verification quorum, so the stored quorum is not covered "
+                    "by it; re-signed at the next writable open",
+                    self.db_path,
+                )
                 return
-            logger.info("%s: re-signing the meta MAC to cover the verification quorum", self.db_path)
+            logger.warning(
+                "%s: the meta MAC predates the bound verification quorum; a stored quorum below the default is "
+                "dropped and the MAC is re-signed over the full set",
+                self.db_path,
+            )
             with self._write_tx() as cursor:
+                self._drop_untrusted_stored_quorum(cursor)
                 self._write_meta_mac(cursor)
+            self._meta_mac_legacy = False  # what is stored now is what the new MAC covers
             return
         raise VaultIntegrityError(
             f"{self.db_path}: the vault's meta MAC does not cover its integrity records (integrity format, "

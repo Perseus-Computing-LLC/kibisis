@@ -253,17 +253,24 @@ def test_e_okf_importer_writes_are_model_origin_and_drop_reserved_keys(vault):
 
 
 def test_f_quorum_is_stored_and_a_lower_open_is_refused(tmp_path):
-    """F7 fixed: the quorum is persisted in ``vault_meta`` on first open. A process asking for a LOWER
-    quorum than stored gets ``ConfigError``; a higher one is allowed and stored; a verified entry
-    records ``quorum_at_verification``."""
+    """F7 fixed: the quorum is persisted in ``vault_meta`` by a pinning open (``pin_quorum=True``, the
+    review verdicts and admit; R3-E1: a plain open never pins). A process asking for a LOWER quorum
+    than stored gets ``ConfigError``; a pinning open asking for a higher one stores it; a verified
+    entry records ``quorum_at_verification``."""
     db = str(tmp_path / "v.db")
-    strict = SQLiteMemoryVault(db, passphrase=KEY, auto_gate=False, verification_quorum=2)
+    strict = SQLiteMemoryVault(db, passphrase=KEY, auto_gate=False, verification_quorum=2, pin_quorum=True)
     strict.remember("c", "k", "fact", origin="model")
+    assert strict.verification_quorum_stored == 2
     strict.close()
     with pytest.raises(ConfigError):
         SQLiteMemoryVault(db, passphrase=KEY, auto_gate=False, verification_quorum=1)
-    higher = SQLiteMemoryVault(db, passphrase=KEY, auto_gate=False, verification_quorum=3)
-    assert higher.verification_quorum == 3
+    with pytest.raises(ConfigError):  # pinning does not help a lower ask
+        SQLiteMemoryVault(db, passphrase=KEY, auto_gate=False, verification_quorum=1, pin_quorum=True)
+    plain_higher = SQLiteMemoryVault(db, passphrase=KEY, auto_gate=False, verification_quorum=3)
+    assert plain_higher.verification_quorum == 3 and plain_higher.verification_quorum_stored == 2  # runs with 3, stores nothing
+    plain_higher.close()
+    higher = SQLiteMemoryVault(db, passphrase=KEY, auto_gate=False, verification_quorum=3, pin_quorum=True)
+    assert higher.verification_quorum == 3 and higher.verification_quorum_stored == 3
     higher.close()
     with pytest.raises(ConfigError):
         SQLiteMemoryVault(db, passphrase=KEY, auto_gate=False, verification_quorum=2)

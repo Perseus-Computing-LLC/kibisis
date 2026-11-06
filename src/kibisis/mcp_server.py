@@ -38,7 +38,7 @@ from typing import Any, Dict, List, Mapping, Optional
 from .config import ConfigError, open_vault, resolve_scope, validate_scope
 from .models import EpistemicState, MemoryEntity
 from .protocols import EncryptionRequiredError
-from .vault import ReviewedEntryError, SQLiteMemoryVault, TombstonedValueError
+from .vault import OriginClassError, ReviewedEntryError, SQLiteMemoryVault, SupersededEntryError, TombstonedValueError
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "kibisis-mcp"
@@ -167,7 +167,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     },
     {
         "name": "kibisis_health",
-        "description": "Report the vault's scope, entry counts and encryption state.",
+        "description": "Report the vault's scope, entry counts, encryption state and verification quorum.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "annotations": {
             "title": "Health",
@@ -380,6 +380,8 @@ class KibisisMCPServer:
         if method == "tools/list":
             return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOL_DEFINITIONS}}
         if method == "tools/call":
+            if not isinstance(params, dict):
+                return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": "params must be an object"}}
             return self._call_tool(req_id, params.get("name"), params.get("arguments") or {})
 
         if req_id is not None:
@@ -402,6 +404,21 @@ class KibisisMCPServer:
             return _result(req_id, f"Refused: {exc}", is_error=True)
         except TombstonedValueError as exc:
             # The vault has already journaled this refusal.
+            return _result(req_id, f"Refused: {exc}", is_error=True)
+        except PermissionError as exc:
+            # A policy refusal (OriginClassError, SupersededEntryError, ReviewedEntryError a tool body did
+            # not map, ...): tell the agent not to retry, with no traceback. The vault journals an
+            # origin-class refusal itself (``origin_class_refused``); the others are journaled here.
+            if not isinstance(exc, OriginClassError):
+                self.vault.record_refusal(
+                    path="mcp",
+                    reason="superseded_refused" if isinstance(exc, SupersededEntryError) else "permission_refused",
+                    scope=self.scope,
+                    category=str(args.get("category") or "") if isinstance(args, dict) else "",
+                    key=str(args.get("key") or "") if isinstance(args, dict) else "",
+                    author_id=MCP_AUTHOR,
+                    detail={"tool": str(name)[:64], "error": type(exc).__name__},
+                )
             return _result(req_id, f"Refused: {exc}", is_error=True)
         except (KeyError, ValueError, TypeError) as exc:
             message = exc.args[0] if isinstance(exc, KeyError) and exc.args else str(exc)
@@ -605,6 +622,8 @@ class KibisisMCPServer:
         for row in cursor.fetchall():
             by_state[row["epistemic_state"]] = int(row["n"])
             plaintext += int(row["plain"])
+        quorum = int(self.vault.verification_quorum)
+        stored = getattr(self.vault, "verification_quorum_stored", None)
         return {
             "status": "healthy",
             "scope": self.scope,
@@ -614,6 +633,14 @@ class KibisisMCPServer:
                 "whole_file": bool(getattr(self.vault, "_sqlcipher_active", False)),
                 "entry_key": bool(self.vault.passphrase),
                 "plaintext_entries": plaintext,
+            },
+            "verification_quorum": {
+                "accounts": quorum,
+                "pinned": stored is not None,
+                "note": (
+                    "quorum 1 — one account verifies" if quorum == 1
+                    else f"quorum {quorum} — {quorum} accounts verify"
+                ) + ("" if stored is not None else " (default until a verdict pins it)"),
             },
         }
 
@@ -626,6 +653,8 @@ def run_stdio_server() -> int:
         print(f"{SERVER_NAME}: {exc}", file=sys.stderr)
         return 2
     print(f"{SERVER_NAME}: serving scope {server.scope!r} from {server.vault.db_path}", file=sys.stderr)
+    if server.vault.verification_quorum == 1:
+        print(f"{SERVER_NAME}: quorum 1 — one account verifies", file=sys.stderr)
     for line in sys.stdin:
         line = line.strip()
         if not line:

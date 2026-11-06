@@ -193,7 +193,7 @@ def test_control_f7_user_writes_with_different_author_ids_are_one_attestation(tm
 
 def test_control_f7_quorum_cannot_be_lowered_and_is_adopted_when_unnamed(tmp_path, monkeypatch):
     p = str(tmp_path / "q.sqlite")
-    v = _plain(p, verification_quorum=3)
+    v = _plain(p, verification_quorum=3, pin_quorum=True)  # R3-E1: only a pinning open stores the quorum
     v.close()
     with pytest.raises(ConfigError):
         _plain(p, verification_quorum=2)

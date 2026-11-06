@@ -1,6 +1,5 @@
-"""R3 entry-point review: the AML HTTP adapter as a network client reaches it (not collected by
-default; run by path). ``test_control_*`` = secure behaviour (failing = bug); ``test_attack_*`` =
-defect demonstrated (passing = bug). Servers bind 127.0.0.1:0 and are shut down in ``finally``.
+"""R3 entry-point review: the AML HTTP adapter as a network client reaches it. Controls only
+(failing = regression). Servers bind 127.0.0.1:0 and are shut down in ``finally``.
 """
 from __future__ import annotations
 

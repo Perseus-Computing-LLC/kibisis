@@ -1,7 +1,7 @@
-"""R3 entry-point review: the MCP server as an agent uses it (not collected by default; run by path).
+"""R3 entry-point review: the MCP server as an agent uses it.
 
-``test_control_*`` asserts secure behaviour (failing = bug); ``test_attack_*`` demonstrates a defect
-(passing = bug). Nothing in ``src/`` is changed.
+``test_control_*`` asserts secure behaviour; ``test_attack_*`` is a defect found in the third pass
+(R3-E2, R3-E3), kept as a regression that asserts the fixed behaviour.
 """
 from __future__ import annotations
 
@@ -152,27 +152,32 @@ def test_control_mcp_cannot_overwrite_a_principal_candidate(server, vault):
 
 
 def test_attack_refusal_of_a_principal_candidate_overwrite_is_an_internal_error(server, vault, capsys):
-    """OriginClassError (PermissionError) is not mapped by _call_tool: the agent is told 'Internal error'
-    and a traceback goes to the server log (the vault itself journals the refusal as origin_class_refused,
-    so the audit trail is fine). Hygiene: a correct refusal reported to the agent as a server bug."""
+    """R3-E2 fixed: OriginClassError (a PermissionError) is a policy refusal, reported to the agent as
+    'Refused: ...' with no traceback in the server log; the vault's own journal entry
+    (origin_class_refused) is the one record, not duplicated by the server."""
     _person_candidate(vault)
     err, text = _call(server, "kibisis_remember", {"category": "c", "key": "pk", "content": "agent text"})
     assert err
-    assert "Internal error" in text, text  # defect: should be "Refused: ... principal-class"
-    assert "OriginClassError" in capsys.readouterr().err  # traceback printed for a routine refusal
+    assert text.startswith("Refused: ") and "Internal error" not in text, text
+    captured = capsys.readouterr().err
+    assert "OriginClassError" not in captured and "Traceback" not in captured
     assert [r.get("reason") for r in _journal(vault, "refuse")] == ["origin_class_refused"]  # journaled by the vault
 
 
 def test_attack_refusal_of_a_superseded_key_rewrite_is_an_internal_error(server, vault, capsys):
-    """SupersededEntryError (PermissionError) has the same gap: an agent that rewrites a key closed by
-    supersession gets 'Internal error' and the operator a traceback."""
+    """R3-E2 fixed: SupersededEntryError is reported as 'Refused: ...', no traceback, and journaled as
+    a refuse (the vault does not journal this one itself)."""
     _call(server, "kibisis_remember", {"category": "c", "key": "old", "content": "v1"})
     err, text = _call(server, "kibisis_remember", {"category": "c", "key": "new", "content": "v2", "supersedes_key": "old"})
     assert not err, text
     err, text = _call(server, "kibisis_remember", {"category": "c", "key": "old", "content": "v3"})
     assert err
-    assert "Internal error" in text, text
-    assert "SupersededEntryError" in capsys.readouterr().err
+    assert text.startswith("Refused: ") and "superseded" in text and "Internal error" not in text, text
+    captured = capsys.readouterr().err
+    assert "SupersededEntryError" not in captured and "Traceback" not in captured
+    refusals = [r for r in _journal(vault, "refuse") if r.get("reason") == "superseded_refused"]
+    assert len(refusals) == 1 and refusals[0].get("detail", {}).get("tool") == "kibisis_remember"
+    assert vault.get("c", "old", scope=SCOPE).content == "v1"
 
 
 def test_control_mcp_supersession_of_a_principal_candidate_is_only_a_proposal(server, vault):
@@ -212,18 +217,21 @@ def test_control_health_and_ledger_do_not_leak_secrets(server, vault):
     err, text = _call(server, "kibisis_health", {})
     assert not err
     out = json.loads(text)
-    assert PASS not in text and "passphrase" not in out and "quorum" not in text and "db_path" not in out
+    assert PASS not in text and "passphrase" not in out and "db_path" not in out
+    # R3-E1: the quorum in force is policy, not a secret, and is reported (with whether a verdict pinned it).
+    assert out["verification_quorum"] == {"accounts": 2, "pinned": False,
+                                          "note": "quorum 2 — 2 accounts verify (default until a verdict pins it)"}
     err, text = _call(server, "kibisis_verify_ledger", {})
     assert not err and json.loads(text)["valid"] is True
 
 
 def test_attack_tools_call_with_non_object_params_raises_out_of_handle_request(server):
-    """handle_request does params.get(...) on whatever arrives: a list/str/number raises AttributeError
-    instead of JSON-RPC -32602. Over stdio the outer loop turns it into -32603 'Internal error' plus a
-    traceback on stderr; an embedder calling handle_request gets the exception. Hygiene."""
-    for params in (["kibisis_health"], "kibisis_health", 1):
-        with pytest.raises(AttributeError):
-            server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params})
+    """R3-E3 fixed: tools/call with params that are not an object is JSON-RPC -32602 'Invalid params'
+    from handle_request itself (no exception for an embedder, no -32603 plus traceback over stdio)."""
+    for params in (["kibisis_health"], "kibisis_health", 1, True):
+        resp = server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params})
+        assert resp["id"] == 1 and "result" not in resp
+        assert resp["error"]["code"] == -32602 and "params must be an object" in resp["error"]["message"]
 
 
 def test_control_arguments_that_are_not_an_object_are_a_tool_error(server):
