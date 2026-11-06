@@ -412,8 +412,11 @@ class EntryIntegrityMixin:
         # one layout), so only a format 3 row is evidence.
         if self._conn.execute("SELECT 1 FROM audit_journal WHERE format >= 3 LIMIT 1").fetchone():
             found.append("a journal row in format 3")
+        # The witness is the binding string inside the envelope, whatever ``is_encrypted`` says: that column
+        # is a plain integer a file writer flips, while the binding was sealed with the key (R3-AB2). An a5
+        # vault never wrote the string at all.
         if self._conn.execute(
-            "SELECT 1 FROM entities WHERE is_encrypted = 1 AND encrypted_envelope_json LIKE ? LIMIT 1",
+            "SELECT 1 FROM entities WHERE encrypted_envelope_json LIKE ? LIMIT 1",
             (f'%"binding":"{ENTRY_BINDING}"%',),
         ).fetchone():
             found.append("an entry sealed with its binding")
@@ -594,33 +597,61 @@ class EntryIntegrityMixin:
     def _check_tombstones(self) -> None:
         """At open: every tombstone row must carry a valid MAC, and every ``tombstone`` event in the journal
         that no later ``tombstone_lifted`` event undid must still have its row (by category, key, value
-        digest and scope). A row removed or edited behind the vault's back raises
-        :class:`VaultIntegrityError`. Other journal actions are not consulted."""
+        digest and scope) at no lower a class than the event journaled (``metadata.origin_class``). A row
+        removed, edited or replaced by an older lower-class copy behind the vault's back raises
+        :class:`VaultIntegrityError`. Other journal actions are not consulted.
+
+        A ``tombstone_lifted`` event names the row it removed. Events written by earlier releases from a
+        lower-class lift (``_lift_lower_class_tombstones``) named the writer's entry instead and put the
+        row's ``category:key`` and scope in ``metadata.tombstone`` / ``tombstone_scope``; those are
+        matched through the metadata so such vaults still open (R3-AB1)."""
+        from ._vault_review import ORIGIN_CLASSES, _class_rank
+
         rows = self._conn.execute(
             "SELECT category, key, scope, value_sha256, canonical_sha256, origin_class, tombstone_mac "
             "FROM rejected_value_tombstones"
         ).fetchall()
         for row in rows:
             self._verify_tombstone_row(row)
-        present = {(r["category"], r["key"], r["value_sha256"], r["scope"]) for r in rows}
-        expected: Dict[Tuple[str, str, str, str], int] = {}
+        present = {(r["category"], r["key"], r["value_sha256"], r["scope"]): r["origin_class"] or "principal" for r in rows}
+        expected: Dict[Tuple[str, str, str, str], Tuple[int, Optional[str]]] = {}
         for ev in self._conn.execute(
-            "SELECT sequence, action, category, key, scope, value_sha256 FROM audit_journal "
+            "SELECT sequence, action, category, key, scope, value_sha256, metadata_json FROM audit_journal "
             "WHERE action IN ('tombstone', 'tombstone_lifted') ORDER BY sequence ASC"
         ).fetchall():
             ident = (ev["category"], ev["key"], ev["value_sha256"], ev["scope"])
+            try:
+                meta = json.loads(ev["metadata_json"] or "{}")
+            except ValueError:
+                meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
             if ev["action"] == "tombstone":
-                expected[ident] = ev["sequence"]
-            else:
-                expected.pop(ident, None)
+                klass = meta.get("origin_class")
+                expected[ident] = (ev["sequence"], klass if klass in ORIGIN_CLASSES else None)
+                continue
+            expected.pop(ident, None)
+            named = meta.get("tombstone")
+            if isinstance(named, str) and ":" in named and named != f"{ev['category']}:{ev['key']}":
+                row_scope = meta.get("tombstone_scope") or ev["scope"]
+                for cut in (i for i, ch in enumerate(named) if ch == ":"):
+                    expected.pop((named[:cut], named[cut + 1:], ev["value_sha256"], row_scope), None)
         missing = [ident for ident in expected if ident not in present]
         if missing:
             category, key, _, scope = missing[0]
             raise VaultIntegrityError(
                 f"{self.db_path}: {len(missing)} journaled tombstone(s) have no row, first '{category}:{key}' "
-                f"[scope={scope}] (journal sequence {expected[missing[0]]}): the tombstone table was changed outside "
+                f"[scope={scope}] (journal sequence {expected[missing[0]][0]}): the tombstone table was changed outside "
                 "kibisis"
             )
+        for ident, (sequence, klass) in expected.items():
+            if klass is not None and _class_rank(present[ident]) < _class_rank(klass):
+                category, key, _, scope = ident
+                raise VaultIntegrityError(
+                    f"{self.db_path}: tombstone '{category}:{key}' [scope={scope}] is of class {present[ident]} but "
+                    f"the journal records it as {klass} (sequence {sequence}): an older copy of the row was put back "
+                    "outside kibisis"
+                )
 
     def _migrate_integrity(self) -> Optional[Dict[str, Any]]:
         """Upgrade a vault written by Kibisis 0.1.0a5 or earlier to integrity format 2, in one transaction.
@@ -670,6 +701,33 @@ class EntryIntegrityMixin:
             # Otherwise decide every entry before changing anything, and stop under a wrong passphrase: an
             # upgrade under the wrong key would re-key the tombstones and the journal beyond repair.
             was_keyed = self._was_keyed or any(r["is_encrypted"] == 1 for r in rows)
+            # R3-AB2: what a genuine 0.1.0a5 file cannot look like. A row that says it is plaintext but
+            # carries an envelope had its ``is_encrypted`` flag edited (a5 wrote the two together); and a
+            # keyed vault whose journal says entries were put and never purged, while the table is empty,
+            # had its entries deleted. Either is a reset of a later-format vault, not a legacy file.
+            inconsistent = [r for r in rows if r["is_encrypted"] != 1 and r["encrypted_envelope_json"]]
+            if inconsistent:
+                r = inconsistent[0]
+                raise VaultIntegrityError(
+                    f"{self.db_path}: {len(inconsistent)} entries are marked plaintext but carry a sealed envelope, "
+                    f"first '{r['category']}:{r['key']}' [scope={r['scope']}]; the entity table was edited. Refusing "
+                    "to migrate; restore the rows before opening."
+                )
+            if self._was_keyed and not rows:
+                live: set = set()
+                for ev in events:
+                    ident = (ev["category"], ev["key"], ev["scope"])
+                    if ev["action"] in ("put", "update"):
+                        live.add(ident)
+                    elif ev["action"] in ("purge", "tombstone"):
+                        live.discard(ident)
+                if live:
+                    category, key, scope = sorted(live)[0]
+                    raise VaultIntegrityError(
+                        f"{self.db_path}: the vault is keyed (kdf_salt present) and its journal records {len(live)} "
+                        f"entries that were never purged, first '{category}:{key}' [scope={scope}], but the entity "
+                        "table is empty; the entries were deleted outside kibisis. Refusing to migrate."
+                    )
             if not was_keyed:
                 counts["entries_adopted_from_keyless_vault"] = 0
             reseal: List[Tuple[Any, str]] = []
@@ -727,12 +785,16 @@ class EntryIntegrityMixin:
 
             old_head = events[-1]["event_hash"] if events else "0" * 64
             # The format 1 journal head was signed under the legacy key: the passphrase's for a vault that had
-            # one, the path's for a vault opened without. Verify under whichever this vault used before.
+            # one, the path's for a vault opened without. A vault that carries a salt was keyed, so its chain
+            # must verify under the passphrase's key alone: the path's key is one a file writer computes
+            # (R3-AB2). Only a vault with no salt is tried under the path's key.
             chain_was_valid = False
             current_key = self._signing_key
+            candidates = [self._legacy_signing_key]
+            if not self._was_keyed:
+                candidates.append(hashlib.sha256(f"kibisis-tenant-sig:{self.db_path}".encode("utf-8")).digest())
             try:
-                for candidate in (self._legacy_signing_key,
-                                  hashlib.sha256(f"kibisis-tenant-sig:{self.db_path}".encode("utf-8")).digest()):
+                for candidate in candidates:
                     self._signing_key = candidate
                     if self.verify_audit_chain():
                         chain_was_valid = True

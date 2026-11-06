@@ -143,10 +143,10 @@ class SnapshotMixin:
             "tombstones": tombstones_data,
             "audit_events": events_data,
         }
-        # Trust seal: the entities' digest, sealed under the passphrase (the envelope carries its own
-        # salt, so a vault with the same passphrase but another file can open it). A restore keeps
-        # attestations and reviews only when it can open this seal or the digest key id is its own.
-        snapshot["trust_seal"] = self._seal_trust(entities_data)
+        # Trust seal: the digest of the entities and tombstones, sealed under the passphrase (the envelope
+        # carries its own salt, so a vault with the same passphrase but another file can open it). A
+        # restore keeps attestations, reviews and tombstone classes only when it can open this seal.
+        snapshot["trust_seal"] = self._seal_trust(entities_data, tombstones_data)
 
         canonical_bytes = json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")
         manifest_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
@@ -177,20 +177,29 @@ class SnapshotMixin:
     def _entities_digest(entities: Any) -> str:
         return hashlib.sha256(json.dumps(entities, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
-    def _seal_trust(self, entities: Any) -> Optional[str]:
+    @staticmethod
+    def _trust_digest(entities: Any, tombstones: Any) -> str:
+        """Digest the trust seal names: the entities and the tombstones of the export together, so a seal
+        lifted from a genuine export cannot be re-used over an edited tombstone list."""
+        body = {"entities": entities, "tombstones": tombstones}
+        return "v2:" + hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    def _seal_trust(self, entities: Any, tombstones: Any = ()) -> Optional[str]:
         if not self._keyed or self.crypto_provider is None or not self.passphrase:
             return None
         envelope = self.crypto_provider.encrypt(
-            self._entities_digest(entities).encode("ascii"), self.passphrase, aad=_TRUST_SEAL_AAD
+            self._trust_digest(entities, list(tombstones)).encode("ascii"), self.passphrase, aad=_TRUST_SEAL_AAD
         )
         return envelope.model_dump_json()
 
-    def _trust_seal_opens(self, data: Dict[str, Any]) -> bool:
-        """True when the snapshot's ``trust_seal`` opens under this vault's passphrase and names the
-        digest of the entities it carries."""
+    def _trust_seal_level(self, data: Dict[str, Any]) -> Optional[str]:
+        """How far the snapshot's ``trust_seal`` vouches for it under this vault's passphrase: ``"full"``
+        when it names the digest of the entities and tombstones it carries, ``"entities"`` when it names
+        the entities only (a seal written before tombstones were covered), ``None`` when it is absent or
+        does not open. A vault without a passphrase has no seal and gets ``None`` for every file."""
         sealed = data.get("trust_seal")
         if not sealed or self.crypto_provider is None or not self.passphrase:
-            return False
+            return None
         try:
             from .models import EncryptedEnvelope
 
@@ -198,10 +207,20 @@ class SnapshotMixin:
             # The seal was made by another vault's provider under its own salt; open it the way a
             # carried-over tombstone is opened (one envelope, iteration count capped).
             opener = getattr(self.crypto_provider, "decrypt_foreign", self.crypto_provider.decrypt)
-            plain = opener(envelope, self.passphrase, aad=_TRUST_SEAL_AAD)
+            plain = opener(envelope, self.passphrase, aad=_TRUST_SEAL_AAD).decode("ascii", "replace")
         except Exception:
-            return False
-        return hmac.compare_digest(plain.decode("ascii", "replace"), self._entities_digest(data.get("entities", [])))
+            return None
+        entities = data.get("entities", [])
+        if hmac.compare_digest(plain, self._trust_digest(entities, data.get("tombstones", []))):
+            return "full"
+        if hmac.compare_digest(plain, self._entities_digest(entities)):
+            return "entities"
+        return None
+
+    def _trust_seal_opens(self, data: Dict[str, Any]) -> bool:
+        """True when the snapshot's ``trust_seal`` opens under this vault's passphrase and names the
+        entities it carries (see :meth:`_trust_seal_level`)."""
+        return self._trust_seal_level(data) is not None
 
     def import_snapshot(
         self,
@@ -211,6 +230,7 @@ class SnapshotMixin:
         fencing_token: Optional[int] = None,
         resource: Optional[str] = None,
         holder_id: Optional[str] = None,
+        origin: Optional[str] = None,
     ) -> int:
         """Import a snapshot into the vault.
 
@@ -222,19 +242,28 @@ class SnapshotMixin:
 
         Trust facts travel only between vaults that share a passphrase: an entity's ``attestations``,
         ``verification_pending``, ``human_reviews`` and ``quorum_at_verification`` are kept only when
-        the snapshot is this vault's or a same-passphrase vault's (its ``digest_key_id`` is this
-        vault's, or its ``trust_seal`` opens under this passphrase and names the entities it carries;
-        a vault without a passphrase has neither key nor seal, so its snapshots match any other
-        plaintext vault) and its ``manifest_sha256`` is present and verifies. Otherwise they are dropped, the ``epistemic_state`` is re-derived from what
-        survives (``verified`` and ``disputed`` become ``candidate``; ``revoked`` stays) and the
-        drop is journaled. An entity's ``origin`` and ``author_id`` are restored as exported, so an
-        entry a person verified, whoever wrote it (a person's own, or an agent's entry a person
-        approved), stays verified with its reviews and attestations when the trust facts are kept.
+        the snapshot's ``trust_seal`` opens under this vault's passphrase and names the entities it
+        carries, and its ``manifest_sha256`` is present and verifies. The ``digest_key_id`` is a public
+        label that only routes the keyed digests; it proves nothing (R3-AB3). A vault without a
+        passphrase has no seal and never keeps trust facts from a file. Otherwise they are dropped, the
+        ``epistemic_state`` is re-derived from what survives (``verified`` and ``disputed`` become
+        ``candidate``; ``revoked`` stays) and the drop is journaled. An entity's ``origin`` and
+        ``author_id`` are restored as exported, so an entry a person verified, whoever wrote it (a
+        person's own, or an agent's entry a person approved), stays verified with its reviews and
+        attestations when the trust facts are kept.
+
+        A tombstone's ``origin_class`` is likewise taken from the file only when the seal opens and
+        covers the tombstones; otherwise it is capped at the importer's class (``origin``, as on
+        :meth:`put`; ``None`` means the caller vouches for a person), so a file cannot plant a
+        rejection of a higher class than whoever imports it.
 
         The restore is one transaction: it applies whole or, on an error, not at all. Restoring over a
         live vault without ``clear_existing`` leaves a live entry a person reviewed, or one of a
         higher class than the snapshot's, in place when the snapshot is not this vault's (journaled as
-        a ``protected entry`` refusal, not counted); this vault's own snapshot restores over it.
+        a ``protected entry`` refusal, not counted); this vault's own snapshot restores over it. That
+        restore is a point-in-time replay of the reviews too: an older own snapshot puts back the
+        verdict and attestations as they stood when it was taken, over any review made since (a later
+        rejection still wins, because tombstones are never removed).
 
         Returns the number of restored entities.
         """
@@ -245,7 +274,10 @@ class SnapshotMixin:
             data = snapshot_or_path
         else:
             raise TypeError("Expected snapshot dict or path")
+        from ._vault_review import _class_rank
         from .vault import OriginClassError, ReviewedEntryError  # vault.py imports this module
+
+        importer_class = self._requester_class(origin)
 
         manifest_sha = data.get("manifest_sha256")
         manifest_verified = False
@@ -259,15 +291,19 @@ class SnapshotMixin:
 
         imported_count = 0
         foreign_tombstones = 0
+        capped_tombstones = 0
         scheme = data.get("digest_scheme", "sha256")
         same_key = (
             scheme == "hmac-sha256" and self._digest_key is not None and data.get("digest_key_id") == self._digest_key_id()
         )
         # Attestations and reviews are facts this vault's people established. They are taken from a
-        # snapshot only when it came from this vault (its digest key id: per file when keyed, absent
-        # for a vault without a passphrase) and is whole (manifest present and verified).
-        same_vault = data.get("digest_key_id") == self._digest_key_id() or self._trust_seal_opens(data)
+        # snapshot only when its trust seal opens under this passphrase (so it was written by this vault
+        # or one sharing the passphrase) and it is whole (manifest present and verified). The digest key
+        # id is written in clear into every export and is no proof of anything (R3-AB3).
+        seal_level = self._trust_seal_level(data)
+        same_vault = seal_level is not None
         keep_trust_facts = same_vault and manifest_verified
+        keep_tombstone_classes = seal_level == "full" and manifest_verified
         stripped_trust_facts = 0
         protected_rows = 0
         # One transaction for the whole restore (R2-A7): tombstones, the clearing, every entity and
@@ -290,6 +326,14 @@ class SnapshotMixin:
                         continue
                     exact, canonical = self._stored_digests(*plain)
                     sealed = self._seal_digests(t_scope, t_category, t_key, *plain)
+                # A tombstone keeps its class when the seal vouches for the file's tombstones; one
+                # without a class is as old as the column and was made by a vouching caller. Otherwise
+                # the file's word on who rejected the value is worth no more than the importer's own
+                # class (R3-AB3).
+                t_class = ts.get("origin_class") or "principal"
+                if not keep_tombstone_classes and _class_rank(t_class) > _class_rank(importer_class):
+                    t_class = importer_class
+                    capped_tombstones += 1
                 cursor.execute(
                     """
                     INSERT OR IGNORE INTO rejected_value_tombstones (
@@ -308,10 +352,8 @@ class SnapshotMixin:
                         ts.get("created_at", time.time()),
                         t_scope,
                         sealed,
-                        # A tombstone from elsewhere keeps its class when it is known; one without a
-                        # class is as old as the column and was made by a vouching caller.
-                        ts.get("origin_class") or "principal",
-                        self._tombstone_mac(t_scope, t_category, t_key, exact, canonical, ts.get("origin_class") or "principal"),
+                        t_class,
+                        self._tombstone_mac(t_scope, t_category, t_key, exact, canonical, t_class),
                     ),
                 )
                 if cursor.rowcount:
@@ -327,7 +369,8 @@ class SnapshotMixin:
                         author_id=ts.get("author_id"),
                         metadata={
                             "reason": ts.get("reason", "imported"), "canonical_sha256": canonical,
-                            "path": "import_snapshot", "origin_class": ts.get("origin_class") or "principal",
+                            "path": "import_snapshot", "origin_class": t_class,
+                            "snapshot_class": ts.get("origin_class") or "principal",
                         },
                     )
             if clear_existing:
@@ -447,13 +490,22 @@ class SnapshotMixin:
             if stripped_trust_facts:
                 self.record_refusal(
                     path="import_snapshot",
-                    reason="trust facts dropped: snapshot is not from this vault's key or has no verified manifest",
+                    reason="trust facts dropped: snapshot's trust seal does not open under this vault's passphrase "
+                    "or it has no verified manifest",
                     scope="*",
                     detail={
                         "entities": stripped_trust_facts,
                         "same_vault": "yes" if same_vault else "no",
                         "manifest_verified": "yes" if manifest_verified else "no",
                     },
+                )
+            if capped_tombstones:
+                self.record_refusal(
+                    path="import_snapshot",
+                    reason="tombstone classes capped at the importer's class: snapshot's trust seal does not cover "
+                    "its tombstones",
+                    scope="*",
+                    detail={"tombstones": capped_tombstones, "importer_class": importer_class},
                 )
         if protected_rows:
             logger.warning("import_snapshot: %d entities were not restored over a person's live entries", protected_rows)

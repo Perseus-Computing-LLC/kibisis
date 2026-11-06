@@ -560,20 +560,28 @@ class TombstoneMixin:
         author_id: Optional[str],
     ) -> None:
         """Remove tombstones of a lower class than ``writer_class`` on the way to a write that overrides
-        them (the caller checked none of them outranks the writer); journal each as ``tombstone_lifted``."""
+        them (the caller checked none of them outranks the writer); journal each as ``tombstone_lifted``.
+
+        The event names the **row** (its category, key, scope and digest), as :meth:`_lift_tombstone_locked`
+        does, because the open-time reconciliation (``_check_tombstones``) matches ``tombstone_lifted``
+        events to ``tombstone`` events by that identity. A row is found by value in its scope under any
+        key, so the writer's entry (``category:key``) may differ from the row's; it goes in the metadata
+        (R3-AB1: an event under the writer's identity left the row's expectation standing and the next open
+        refused the vault)."""
         for tomb in tombs:
             cursor.execute("DELETE FROM rejected_value_tombstones WHERE id = ?", (tomb["id"],))
             self._record_audit_event(
                 cursor=cursor,
                 action="tombstone_lifted",
-                category=category,
-                key=key,
-                scope=scope,
+                category=tomb["category"],
+                key=tomb["key"],
+                scope=tomb["scope"],
                 value_sha256=tomb["value_sha256"],
                 author_id=author_id,
                 metadata={
                     "tombstone": f"{tomb['category']}:{tomb['key']}", "tombstone_scope": tomb["scope"],
                     "tombstone_class": tomb["origin_class"], "lifted_by": f"{writer_class}-class write",
+                    "entry": f"{category}:{key}", "entry_scope": scope,
                     "reason": tomb["reason"],
                 },
             )

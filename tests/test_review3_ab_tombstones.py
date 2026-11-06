@@ -1,6 +1,6 @@
 """Review 3, area A+B seams: tombstone rows / classes / MAC / journal reconciliation after the merge
-(R2-A1, R2-A4, R2-A5, R2-A6, R2-B3). Not collected by default; run by path. ``test_control_*`` = secure
-behaviour (failing = bug); ``test_attack_*`` = defect demo (passing = bug).
+(R2-A1, R2-A4, R2-A5, R2-A6, R2-B3; R3-AB1, R3-AB5 fixed on fix/round3-ab). ``test_control_*`` = secure
+behaviour; ``test_attack_*`` = the round-3 defect scenario, asserting the FIXED behaviour.
 """
 
 import sqlite3
@@ -78,11 +78,10 @@ def test_control_r2a1_snapshot_import_of_lower_class_row_does_not_downgrade(tmp_
 
 
 def test_attack_file_writer_replays_an_older_agent_class_row_over_a_persons_raised_row(tmp_path):
-    """``_check_tombstones`` reconciles row *presence* only. A row's class is under its MAC, but a
-    file writer holding a copy of the row as it stood before a person raised its class (external class +
-    its then-valid MAC: a backup, or the agent's own earlier read of the plain file) puts that copy
-    back. The open accepts it (the latest journal event says ``principal``, the row says ``external``) and
-    the agent's next write lifts it as a routine lower-class tombstone."""
+    """R3-AB5 fixed. A row's class is under its MAC, but a file writer holding a copy of the row as it
+    stood before a person raised its class (external class + its then-valid MAC) puts that copy back.
+    ``_check_tombstones`` now carries the latest ``tombstone`` event's ``origin_class`` per identity and
+    refuses a row whose class is lower, writable and read-only."""
     p = tmp_path / "v.sqlite"
     v = _open(p)
     v.remember("decision", "k", "deploy on fridays", origin="tool")
@@ -98,30 +97,42 @@ def test_attack_file_writer_replays_an_older_agent_class_row_over_a_persons_rais
     assert [r["origin_class"] for r in v.list_tombstones(category="decision")] == ["principal"]
     assert _events(v, "tombstone")[-1].metadata["origin_class"] == "principal"
     v.close()
+    _open(p).close()  # control half: the raised row reconciles with its journal
     c = _conn(p)
     c.execute("UPDATE rejected_value_tombstones SET origin_class = ?, tombstone_mac = ?",
               (old["origin_class"], old["tombstone_mac"]))
     c.commit()
     c.close()
-    v = _open(p)  # must raise VaultIntegrityError: row class != journaled class
-    try:
-        assert [r["origin_class"] for r in v.list_tombstones(category="decision")] == ["external"]
-        v.remember("decision", "k", "deploy on fridays", origin="model")  # lifts the person's rejection
-        assert v.get("decision", "k").content == "deploy on fridays"
-        assert _events(v, "tombstone_lifted")[-1].metadata["lifted_by"] == "agent-class write"
-    finally:
-        v.close()
+    for read_only in (False, True):
+        with pytest.raises(vault_module.VaultIntegrityError, match="journal records it as principal"):
+            _open(p, read_only=read_only)
 
 
-# --- journal reconciliation: the lifted event names the writer's entry, not the row ------------------
+def test_control_r3ab5_reaffirmed_and_lifted_rows_reconcile_by_class(tmp_path):
+    """The class check follows the latest ``tombstone`` event: a lower-class re-request (journaled
+    ``tombstone_reaffirmed``) leaves the expectation at principal, and a lift clears it."""
+    p = tmp_path / "v.sqlite"
+    v = _open(p)
+    v.remember("decision", "k", "deploy on fridays", origin="model")
+    v.tombstone("decision", "k", reason="no", author_id="alice", origin="user")
+    v.tombstone("decision", "k", content="deploy on fridays", reason="agent too", origin="model")
+    v.close()
+    _open(p).close()
+    v = _open(p)
+    assert v.lift_tombstone("decision", "k", origin="user") == 1
+    v.close()
+    _open(p).close()
+    _open(p, read_only=True).close()
+
+
+# --- R3-AB1: the lifted event names the row, not the writer's entry ---------------------------------
 
 
 def test_attack_lift_by_a_write_under_another_key_wedges_the_next_open(tmp_path):
-    """``_lift_lower_class_tombstones`` journals ``tombstone_lifted`` with the *writer's* category/key/
-    scope, while ``_check_tombstones`` pops the expectation by the event's (category, key, digest,
-    scope). An agent's forget of ``c:k1`` (value V) followed by a person's ordinary write of V under
-    ``c:k2`` lifts the row (correct) but the journal still expects the ``c:k1`` row: the next open,
-    writable or read-only, raises ``VaultIntegrityError`` and nothing in the CLIs can repair it."""
+    """R3-AB1 fixed. An agent's forget of ``c:k1`` (value V) followed by a person's ordinary write of V
+    under ``c:k2`` lifts the row; ``_lift_lower_class_tombstones`` now journals ``tombstone_lifted``
+    under the ROW's identity (the writer's entry goes in the metadata), so the next open, writable or
+    read-only, reconciles and the chain verifies."""
     p = tmp_path / "v.sqlite"
     v = _open(p)
     v.remember("decision", "k1", "deploy on fridays", origin="model")
@@ -129,23 +140,27 @@ def test_attack_lift_by_a_write_under_another_key_wedges_the_next_open(tmp_path)
     v.remember("decision", "k2", "deploy on fridays", origin="user", author_id="alice")  # lifts it
     assert v.list_tombstones(category="decision") == []
     ev = _events(v, "tombstone_lifted")[-1]
-    assert (ev.category, ev.key) == ("decision", "k2") and ev.metadata["tombstone"] == "decision:k1"
+    assert (ev.category, ev.key, ev.scope) == ("decision", "k1", "default")
+    assert ev.metadata["tombstone"] == "decision:k1" and ev.metadata["entry"] == "decision:k2"
+    assert ev.metadata["lifted_by"] == "principal-class write"
     assert v.verify_audit_chain() is True
     v.close()
     for read_only in (False, True):
-        with pytest.raises(vault_module.VaultIntegrityError, match="journaled tombstone"):
-            _open(p, read_only=read_only)
+        v = _open(p, read_only=read_only)
+        assert v.verify_audit_chain() is True
+        assert v.list_tombstones(category="decision") == []
+        v.close()
+    v = _open(p)
+    assert v.get("decision", "k2").content == "deploy on fridays"
+    v.close()
 
 
 def test_attack_lift_by_a_write_in_another_scope_wedges_the_next_open(tmp_path):
-    """Same gap through the scope: a tool-class tombstone at ``scope='*'`` lifted by a person's write
-    in ``default`` (if '*' is allowed for the tool class) or an agent row lifted from another scope."""
+    """R3-AB1 fixed, through a non-default scope and a different key."""
     p = tmp_path / "v.sqlite"
     v = _open(p)
     v.remember("decision", "k", "deploy on fridays", origin="model", scope="team")
     v.tombstone("decision", "k", reason="agent forgot", origin="model", scope="team")
-    # A person's write of the same value in the same scope but through a different key, plus
-    # a wildcard-scope principal check for comparison (principal rows are never lifted by writes).
     v.remember("decision", "k", "deploy on fridays", origin="user", author_id="alice", scope="team")
     assert v.list_tombstones(category="decision") == []
     v.close()
@@ -154,9 +169,45 @@ def test_attack_lift_by_a_write_in_another_scope_wedges_the_next_open(tmp_path):
     v.remember("notes", "n", "deploy on tuesdays", origin="model", scope="team")
     v.tombstone("notes", "n", reason="agent forgot", origin="model", scope="team")
     v.remember("notes", "m", "deploy on tuesdays", origin="user", author_id="alice", scope="team")
+    ev = _events(v, "tombstone_lifted")[-1]
+    assert (ev.category, ev.key, ev.scope) == ("notes", "n", "team") and ev.metadata["entry_scope"] == "team"
     v.close()
-    with pytest.raises(vault_module.VaultIntegrityError, match="journaled tombstone"):
-        _open(p)
+    for read_only in (False, True):
+        v = _open(p, read_only=read_only)
+        assert v.verify_audit_chain() is True
+        v.close()
+
+
+def test_control_r3ab1_vault_holding_a_pre_fix_lifted_event_still_opens(tmp_path):
+    """A vault whose journal already holds a ``tombstone_lifted`` under the writer's identity (written
+    before the fix, row named only in ``metadata.tombstone``/``tombstone_scope``) opens: the
+    reconciliation matches the row through the metadata."""
+    p = tmp_path / "v.sqlite"
+    v = _open(p)
+    v.remember("decision", "k1", "deploy on fridays", origin="model")
+    v.tombstone("decision", "k1", reason="agent forgot", origin="model")
+    v.close()
+    # Rewrite the lift the way the pre-fix code journaled it: event under the writer's entry.
+    v = _open(p)
+    real = v._record_audit_event
+
+    def pre_fix(cursor, action, category, key, scope, value_sha256, author_id=None, metadata=None, **kw):
+        if action == "tombstone_lifted":
+            category, key, scope = "decision", "k2", metadata["entry_scope"]
+            metadata = {k: val for k, val in metadata.items() if k not in ("entry", "entry_scope")}
+        return real(cursor=cursor, action=action, category=category, key=key, scope=scope,
+                    value_sha256=value_sha256, author_id=author_id, metadata=metadata, **kw)
+
+    v._record_audit_event = pre_fix
+    v.remember("decision", "k2", "deploy on fridays", origin="user", author_id="alice")
+    ev = _events(v, "tombstone_lifted")[-1]
+    assert (ev.category, ev.key) == ("decision", "k2") and ev.metadata["tombstone"] == "decision:k1"
+    assert "entry" not in ev.metadata
+    v.close()
+    for read_only in (False, True):
+        v = _open(p, read_only=read_only)
+        assert v.verify_audit_chain() is True
+        v.close()
 
 
 # --- R2-A6: lift gating ----------------------------------------------------------------------------

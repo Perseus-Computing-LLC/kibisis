@@ -48,7 +48,8 @@ Entries for the parent to merge into CHANGELOG.md (no version bump here).
   (exit 2) instead of a traceback. `import_snapshot` drops `attestations`, `verification_pending`
   and `human_reviews` unless the snapshot is this vault's (same `digest_key_id`, or its new
   passphrase-sealed `trust_seal` opens here) AND `manifest_sha256` is present and verifies; the
-  drop is journaled and `epistemic_state` is re-derived from what survives.
+  drop is journaled and `epistemic_state` is re-derived from what survives (round 3: the seal alone
+  proves it; `digest_key_id` is a public label).
 - **F11** Snapshots export `origin` and `author_id` per entity and the import passes them on, so a
   verified principal entry restored into its own vault stays verified and principal (round 2: an
   agent's entry a person verified too).
@@ -152,3 +153,48 @@ behaviour).
   fixed behaviour and is skipped until the merge. `_persist_verification_quorum` runs before the
   signing key is derived in `__init__`, so a `_write_meta_mac` call there would be a no-op; area B's
   open-time MAC write must cover the key instead.
+
+## Round 3
+
+Third-pass A+B seam findings in `review_notes/R3_AB.md`; regression tests in
+`tests/test_review3_ab_tombstones.py` and `tests/test_review3_ab_snapshot.py` (the `test_attack_*` names
+are kept; each now asserts the fixed behaviour).
+
+### Fixed
+
+- **R3-AB1** (high) `_lift_lower_class_tombstones` journals `tombstone_lifted` under the **row's**
+  category, key, scope and digest (as `_lift_tombstone_locked` does); the writer's entry goes in
+  `metadata.entry` / `entry_scope` (`metadata.tombstone` / `tombstone_scope` are kept). An agent's forget
+  of `c:k1` followed by a person's write of the same value under `c:k2`, or under another key in another
+  scope, no longer leaves a `tombstone` expectation the next open cannot reconcile; writable and
+  read-only opens succeed and the chain verifies. `_check_tombstones` also matches a `tombstone_lifted`
+  event written before the fix through `metadata.tombstone` / `tombstone_scope`, so a vault already
+  holding the mismatched events opens.
+- **R3-AB3** (medium) `import_snapshot`: `same_vault` is the trust seal alone (`_trust_seal_level`);
+  `digest_key_id` only routes the keyed digests. A vault without a passphrase has no seal and never keeps
+  trust facts from a file, its own exports included. The seal now names the entities **and** the
+  tombstones of the export; a seal that names the entities only (written before this round) still
+  vouches for the entities' trust facts but not for tombstone classes. A tombstone's `origin_class` is
+  taken from the file only under a full seal; otherwise it is capped at the importer's class (new
+  `origin` keyword, as on `put`; `None` = the caller vouches for a person), journaled as a
+  `tombstone classes capped` refusal. The `trust facts dropped` refusal reason now names the seal.
+- **R3-AB5** (low–medium) `_check_tombstones` carries the latest `tombstone` event's
+  `metadata.origin_class` per row identity and refuses (`VaultIntegrityError`, writable and read-only)
+  a row whose stored class is lower: a file writer's replay of an older agent-class copy of a row over a
+  person's raised one is caught at open instead of being lifted by the agent's next write.
+- **R3-AB6** (docs) `import_snapshot` docstring and SECURITY.md say that an own-snapshot restore is a
+  point-in-time replay of the reviews too (an older own snapshot puts back older verdicts; a later
+  rejection still wins).
+- Docs: SECURITY.md's tombstone-reconciliation and snapshot paragraphs rewritten (what a snapshot can and
+  cannot carry).
+
+### Changed behaviour callers may notice
+
+- `import_snapshot(..., origin=None)`: new keyword. A keyless vault's own export now restores `verified`
+  / `disputed` entries as `candidate` (`trust_capped_from`); `tests/test_review2_a_trust.py` gives its
+  in-memory fixture a passphrase for the round-trip tests and adds the keyless case.
+- The `tombstone_lifted` event from a write names the row, not the writer's entry (`metadata.entry`).
+
+### Not fixed
+
+- Nothing in this area. R3-AB4 (V1 meta MAC re-sign) is area B's entry-point branch.

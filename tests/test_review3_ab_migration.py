@@ -1,9 +1,9 @@
-"""Review 3, area A+B seams: format-1 migration discriminator (R2-B1), plain-file auth (R2-B2),
-salt removal (R2-B5), meta MAC re-sign paths (R2-B4). Not collected by default; run by path.
+"""Review 3, area A+B seams: format-1 migration discriminator (R2-B1, R3-AB2), plain-file auth (R2-B2),
+salt removal (R2-B5), meta MAC re-sign paths (R2-B4, R3-AB4).
 
-Convention: ``test_control_*`` = secure behaviour (failing = bug); ``test_attack_*`` = defect demo
-(passing = bug). Vaults opened WITHOUT SQLCipher, with a passphrase (allow_plaintext) = SECURITY.md's
-file-writer model.
+Convention: ``test_control_*`` = secure behaviour; ``test_attack_*`` = the round-3 defect scenario,
+asserting the FIXED behaviour (R3-AB4 is fixed on fix/round3-entry and skipped here until the merge).
+Vaults opened WITHOUT SQLCipher, with a passphrase (allow_plaintext) = SECURITY.md's file-writer model.
 """
 
 import shutil
@@ -83,48 +83,87 @@ def test_control_r2b1_full_reset_with_sealed_entries_is_refused(tmp_path):
 
 
 def test_attack_r2b1_discriminator_is_defeated_by_flipping_is_encrypted_to_0(tmp_path):
-    """The 'entry sealed with its binding' witness is queried as ``is_encrypted = 1 AND envelope LIKE
-    binding``. A file writer flips ``is_encrypted`` to 0 on every row (envelope untouched): the witness
-    disappears, the file passes for a5, the migration runs (rows are 'left unsigned' = the same cost
-    R2-B1 already paid), the tombstone is laundered out and the value is readmitted; a fresh head, key
-    check and meta MAC are signed over the forged state."""
+    """R3-AB2 fixed. The 'entry sealed with its binding' witness used to be queried as ``is_encrypted =
+    1 AND envelope LIKE binding``; a file writer flipped ``is_encrypted`` to 0 (envelope untouched) and
+    the file passed for a5. The witness now reads the envelope alone: the open is refused and nothing
+    is written (no head, no key check, no meta MAC, tombstone-free journal not re-signed)."""
     p = _seeded(tmp_path / "v.sqlite")
     c = _conn(p)
     _scrub_everything_but_entries(c)
     c.execute("UPDATE entities SET is_encrypted = 0")
     c.commit()
     c.close()
-    v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)  # must raise VaultIntegrityError
-    try:
-        assert v.verify_audit_chain() is True
-        assert v.is_tombstoned("decision", "bad", "deploy on fridays") is False
-        v.remember("decision", "bad", "deploy on fridays", origin="model")  # readmitted
-        assert v.get("decision", "bad").content == "deploy on fridays"
-        c = _conn(p)
-        assert c.execute("SELECT count(*) FROM audit_head").fetchone()[0] == 1
-        assert c.execute("SELECT count(*) FROM vault_meta WHERE key IN ('key_check','meta_mac')").fetchone()[0] == 2
-        c.close()
-    finally:
-        v.close()
+    before = p.read_bytes()
+    with pytest.raises(vault_module.VaultIntegrityError, match="sealed with its binding"):
+        SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
+    assert p.read_bytes() == before
+    c = _conn(p)
+    assert c.execute("SELECT count(*) FROM audit_head").fetchone()[0] == 0
+    assert c.execute("SELECT count(*) FROM vault_meta WHERE key IN ('key_check','meta_mac')").fetchone()[0] == 0
+    c.close()
+
+
+def test_control_r3ab2_plaintext_row_with_an_envelope_is_refused_by_the_migration(tmp_path):
+    """The migration itself refuses a row marked plaintext that carries an envelope, whatever the
+    discriminator saw (here the binding is scrubbed from the envelope text too, so only the row
+    inconsistency is left to notice)."""
+    p = _seeded(tmp_path / "v.sqlite")
+    c = _conn(p)
+    _scrub_everything_but_entries(c)
+    c.execute("UPDATE entities SET is_encrypted = 0, encrypted_envelope_json = "
+              "replace(encrypted_envelope_json, 'binding', 'bndng')")
+    c.commit()
+    c.close()
+    with pytest.raises(vault_module.VaultIntegrityError, match="marked plaintext but carry a sealed envelope"):
+        SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
 
 
 def test_attack_r2b1_discriminator_is_defeated_by_deleting_every_entry(tmp_path):
-    """Same reset plus ``DELETE FROM entities``: no witness left, the vault is taken for a5 and the
-    laundered journal/tombstone state is re-signed. Loud (all entries gone) but the journal then
-    carries a signed, verifying history with no trace of the tombstone."""
+    """R3-AB2 fixed. Same reset plus ``DELETE FROM entities``: no entry witness is left, but the
+    journal of a keyed vault records entries that were put and never purged while the table is empty,
+    which no genuine a5 file looks like: refused, nothing re-signed."""
     p = _seeded(tmp_path / "v.sqlite")
     c = _conn(p)
     _scrub_everything_but_entries(c)
     c.execute("DELETE FROM entities")
     c.commit()
     c.close()
-    v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)  # must raise VaultIntegrityError
-    try:
-        assert v.verify_audit_chain() is True
-        assert any(e.action == "migrate" for e in v.list_audit_events(limit=50))
-        assert v.is_tombstoned("decision", "bad", "deploy on fridays") is False
-    finally:
-        v.close()
+    with pytest.raises(vault_module.VaultIntegrityError, match="entity table is empty"):
+        SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
+    c = _conn(p)
+    assert c.execute("SELECT count(*) FROM audit_head").fetchone()[0] == 0
+    assert c.execute("SELECT count(*) FROM audit_journal WHERE action = 'migrate'").fetchone()[0] == 0
+    c.close()
+
+
+def test_control_r3ab2_keyed_format1_chain_is_not_accepted_under_the_path_key(tmp_path, monkeypatch):
+    """A vault with a salt had its format-1 head signed under the passphrase's legacy key; a head that
+    verifies only under the path-derived key (one a file writer computes) is refused by the migration
+    itself. The head is a format-2 artefact the discriminator already refuses, so the discriminator is
+    stubbed out here to exercise the migration's own check (defence in depth)."""
+    monkeypatch.setattr(vault_module.SQLiteMemoryVault, "_format_2_artefacts", lambda self: [])
+    import hashlib
+
+    from kibisis._vault_audit import _head_mac
+
+    p = tmp_path / "v.sqlite"
+    v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
+    v.remember("decision", "k", "fact", origin="user", author_id="alice")
+    v.close()
+    c = _conn(p)
+    c.execute("DELETE FROM vault_meta WHERE key IN ('key_check', 'meta_mac', 'integrity_format', "
+              "'journal_format_floor', 'journal_anchored')")
+    c.execute("UPDATE entities SET tenant_sig = NULL")
+    _legacy_rechain(c)
+    last = c.execute("SELECT sequence, event_hash FROM audit_journal ORDER BY sequence DESC LIMIT 1").fetchone()
+    path_key = hashlib.sha256(f"kibisis-tenant-sig:{p}".encode("utf-8")).digest()
+    mac = _head_mac(path_key, int(last["sequence"]), last["event_hash"])
+    c.execute("INSERT INTO audit_head (id, sequence, event_hash, mac) VALUES (1, ?, ?, ?)",
+              (last["sequence"], last["event_hash"], mac))
+    c.commit()
+    c.close()
+    with pytest.raises(vault_module.VaultIntegrityError, match="audit journal does not verify"):
+        SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
 
 
 # --- R2-B2: plain file authenticated before conversion ----------------------------------------------
@@ -149,6 +188,7 @@ def _bound(c):
     return {r["key"]: r["value"] for r in c.execute("SELECT key, value FROM vault_meta").fetchall()}
 
 
+@pytest.mark.skip(reason="R3-AB4: fixed on fix/round3-entry; unskip at merge")
 def test_attack_r2b4_legacy_v1_meta_mac_re_signs_an_attacker_quorum(tmp_path):
     """A meta MAC over the legacy key set (``VAULT_META_BOUND_KEYS_V1``) is accepted once and re-signed
     over the FULL set *as stored*. The V1 MAC never covered ``verification_quorum``, so any copy of a

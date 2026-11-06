@@ -76,8 +76,11 @@ a guarantee beyond what the named code does.
   Each tombstone row
   carries an HMAC under the signing key (`crypto.tombstone_mac`), checked at open and on every hit, so an
   edited or planted row is refused rather than honoured; and at open every `tombstone` event in the journal
-  (not undone by a `tombstone_lifted` event) must still have its row, so a deleted row refuses the open
-  (`VaultIntegrityError`) instead of readmitting the value. A tombstone imported from a snapshot is
+  (not undone by a `tombstone_lifted` event) must still have its row at no lower a class than the event
+  journaled, so a deleted row, or an older lower-class copy of a row put back over a person's raised one,
+  refuses the open (`VaultIntegrityError`) instead of readmitting the value. Every lift is journaled under
+  the row's own identity, whichever entry's write lifted it, so a lift by a person's write under another
+  key or scope reconciles at the next open. A tombstone imported from a snapshot is
   journaled in the import's transaction (`metadata.path = "import_snapshot"`), so it is reconciled too.
 - *Editing the integrity record.* `vault_meta.integrity_format`, `kdf_salt`, `key_check`, the journal format
   floor and anchoring, `term_index_format` and `verification_quorum` are bound under one HMAC (`meta_mac`,
@@ -85,9 +88,15 @@ a guarantee beyond what the named code does.
   missing, refuses to open: a vault with a `kdf_salt` is keyed whatever `integrity_format` says, and the
   format 1 migration (which re-signs the journal and re-keys tombstone digests) runs only for a genuine
   0.1.0a5 file, one that holds nothing integrity format 2 and later write (no meta MAC, floor or
-  anchoring flag, no signed journal head, no tombstone MAC, no format 3 journal row, no entry sealed with
-  its scope, category and key bound to the ciphertext). A migration whose previous chain does not verify
-  refuses instead of re-signing it. The key check (or, for a 0.1.0a5 file, one of its sealed entries) is
+  anchoring flag, no signed journal head, no tombstone MAC, no format 3 journal row, no entry whose
+  envelope text carries the binding of its scope, category and key, whatever the row's `is_encrypted`
+  flag says). The migration itself also refuses a row marked plaintext that carries an envelope, a keyed
+  vault whose journal records entries put and never purged while the entity table is empty, and a
+  keyed vault's format 1 chain head that verifies only under the path-derived key (one a file writer
+  computes) rather than the passphrase's. A migration whose previous chain does not verify refuses
+  instead of re-signing it. What the migration cannot tell from a genuine a5 file is a reset that also
+  rewrites the journal headless and empties the vault, which is the file writer deleting the vault (out
+  of scope, SECURITY.md threat model). The key check (or, for a 0.1.0a5 file, one of its sealed entries) is
   compared against the file before any migration or SQLCipher conversion, and a converted copy replaces
   the plain file only after it has opened, authenticated and upgraded. Removing `kdf_salt` while a key
   check, meta MAC or integrity format of 2 or more remains is refused by both the read-only and the
@@ -212,14 +221,25 @@ from any caller-supplied metadata unless the caller is one of the vault's own pr
 under the rule below); the public `put()` has no way to ask for that.
 
 `import_snapshot` keeps a snapshot's `attestations`, `verification_pending` and `human_reviews` only when
-the snapshot is this vault's (its `digest_key_id`, or a `trust_seal` that opens under this passphrase and
-names the entities it carries) and its `manifest_sha256` is present and verifies; otherwise they are
-dropped, the drop is journaled, and the `epistemic_state` is re-derived from what survives (a `verified`
-claim with no attestations becomes `candidate`). Each entity's `origin` and `author_id` are exported and
+the snapshot's `trust_seal` opens under this vault's passphrase and names the entities it carries, and its
+`manifest_sha256` is present and verifies; otherwise they are dropped, the drop is journaled, and the
+`epistemic_state` is re-derived from what survives (a `verified` claim with no attestations becomes
+`candidate`). `digest_key_id` is a public label written in clear into every export; it routes the keyed
+digests and proves nothing. A vault without a passphrase writes no seal and opens none, so it never keeps
+trust facts from a file, its own exports included. Each entity's `origin` and `author_id` are exported and
 restored, so a person's verified entry round-trips as verified and principal within the vault that made
-it. **Out of scope:** a snapshot's content is still a trusted input: `manifest_sha256` is a plain SHA-256,
-and a forged snapshot can carry any content and any candidate. Treat snapshot files like the database
-file.
+it (or any vault under the same passphrase). A tombstone's `origin_class` is taken from the file only when
+the seal also covers the file's tombstones (seals written since this rule name both); otherwise it is
+capped at the importer's class (`origin`, as on `put`; no origin = the caller vouches for a person).
+
+What a snapshot can and cannot carry: the manifest is a plain SHA-256 anyone computes, so a snapshot file
+is a trusted input for **content**: it can carry any entity text and metadata, any `candidate`, any
+tombstone (a rejection the importer then owns at its own class), and a replay of older content over
+newer. Without a seal that opens here it cannot carry a `verified` or `disputed` state, attestations, a
+review record, or a tombstone class above the importer's. A restore of the vault's own snapshot is a
+point-in-time replay of the reviews too: an older own snapshot puts back verdicts and attestations as
+they stood when it was taken, over any review made since (a later rejection still wins, because
+tombstones are never removed). Treat snapshot files like the database file.
 
 ### `aml-serve` network client
 

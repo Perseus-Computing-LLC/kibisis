@@ -17,6 +17,7 @@ from kibisis.config import ConfigError
 from kibisis.vault import OriginClassError, ReviewedEntryError, TombstonedValueError
 
 VALUE = "Deploys go out on Tuesdays."
+TRUST_PASS = "review2-a trust passphrase (test only)"
 PY = sys.executable
 
 
@@ -36,6 +37,15 @@ def _plain(path, **kw):
 
 @pytest.fixture
 def vault():
+    # Keyed: a snapshot's trust facts round-trip only through the trust seal, which a vault without a
+    # passphrase cannot write or open (R3-AB3).
+    v = SQLiteMemoryVault(":memory:", passphrase=TRUST_PASS, auto_gate=False, verification_quorum=1)
+    yield v
+    v.close()
+
+
+@pytest.fixture
+def keyless_vault():
     v = SQLiteMemoryVault(":memory:", auto_gate=False, verification_quorum=1)
     yield v
     v.close()
@@ -64,6 +74,17 @@ def test_control_f11_user_verified_entry_round_trips_verified_and_principal(vaul
     vault.import_snapshot(snap, clear_existing=True)
     e = vault.get("c", "k")
     assert (e.origin, e.metadata.get("origin_class"), e.epistemic_state.value) == ("user", "principal", "verified")
+
+
+def test_control_f11_keyless_vault_drops_trust_facts_even_from_its_own_snapshot(keyless_vault):
+    """R3-AB3: a vault without a passphrase has no trust seal, and ``digest_key_id`` (absent here, a
+    public label when present) proves nothing, so its own export comes back as candidate."""
+    keyless_vault.put("c", "k", VALUE, origin="user", epistemic_state="verified")
+    snap = keyless_vault.export_snapshot()
+    assert snap.get("trust_seal") is None
+    assert keyless_vault.import_snapshot(snap, clear_existing=True) == 1
+    e = keyless_vault.get("c", "k")
+    assert e.epistemic_state.value == "candidate" and e.metadata.get("trust_capped_from") == "verified"
 
 
 def test_control_f7d_foreign_snapshot_attestations_are_dropped(tmp_path):

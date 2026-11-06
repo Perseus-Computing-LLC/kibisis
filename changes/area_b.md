@@ -83,7 +83,8 @@ Entries for CHANGELOG.md, to be merged by the parent. No version bump.
   whatever `integrity_format` says (edited to 1 or deleted). With the key check gone it is refused
   (`VaultIntegrityError`) unless it is a genuine 0.1.0a5 file: one holding none of what integrity format 2
   and later write (`_format_2_artefacts`: `meta_mac`, `journal_format_floor`, `journal_anchored`, a signed
-  journal head, a tombstone MAC, a format 3 journal row, an entry sealed with its binding). The journal
+  journal head, a tombstone MAC, a format 3 journal row, an entry sealed with its binding; round 3: the
+  binding is read from the envelope text whatever `is_encrypted` says). The journal
   floor and anchoring are read whenever the vault is keyed, not only at integrity format 3, so a reset
   file is still held to the floor it recorded. Resetting `vault_meta`, blanking signatures, deleting the
   tombstone and re-chaining the journal as format 1 no longer launders through a re-migration.
@@ -122,6 +123,31 @@ Entries for CHANGELOG.md, to be merged by the parent. No version bump.
 
 - `tests/review2_b_*.py` became `tests/test_review2_b_*.py` asserting the fixed behaviour; the
   fixture-based test opens `vault-0.1.0a5-fallback.sqlite` with a wrong passphrase and checks the bytes.
+
+## Round 3
+
+Third-pass A+B seam findings in `review_notes/R3_AB.md`; regression tests in
+`tests/test_review3_ab_migration.py` (the `test_attack_*` names are kept; each now asserts the fixed
+behaviour; the R3-AB4 one is skipped until `fix/round3-entry` merges).
+
+### Security
+
+- **R3-AB2 (high): the a5 discriminator's entry witness no longer depends on `is_encrypted`.**
+  `_format_2_artefacts` tests `encrypted_envelope_json LIKE '%"binding":…%'` on every row, so flipping
+  the integer column to 0 (envelope untouched) no longer removes the witness; the R2-B1 reset is refused
+  and nothing is written (no head, key check or meta MAC). `_migrate_integrity` itself also refuses
+  (`VaultIntegrityError`): any row marked plaintext that carries an envelope (an a5 file wrote the two
+  together); a keyed vault (salt present) whose journal records entries put and never purged / tombstoned
+  while the entity table is empty (the `DELETE FROM entities` variant); and, when a salt is present, a
+  format 1 chain head that verifies only under the path-derived key (the passphrase's legacy key alone is
+  tried; the path key stays for a vault that never had a passphrase). The genuine a5 fixture still
+  migrates, read-only and writable, idempotently.
+
+### Not fixed
+
+- A reset that also rewrites the journal headless **and** removes every entry and every `put` row is
+  indistinguishable from an empty a5 file; that is the file writer deleting the vault (out of scope).
+- **R3-AB4** is fixed on `fix/round3-entry` (`_verify_meta_mac`, `_persist_verification_quorum`).
 
 ## Not fixed
 
