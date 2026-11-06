@@ -1,9 +1,10 @@
-"""Review 2, area B: signed tombstone table (F4 second pass) and read-only open integrity.
+"""Review 2, area B: signed tombstone table (R2-B3; F4 second pass) and read-only open integrity (R2-B5).
 
-Vault opened WITHOUT SQLCipher, with a passphrase (allow_plaintext). Not collected by default.
-``test_control_*`` = secure behaviour (failing = bug); ``test_attack_*`` = defect demo (passing = bug).
+Vault opened WITHOUT SQLCipher, with a passphrase (allow_plaintext). Regression tests converted from the
+review's repro file: ``test_attack_*`` assert the fixed behaviour.
 """
 
+import json
 import sqlite3
 
 import pytest
@@ -56,14 +57,17 @@ def test_control_imported_tombstone_is_enforced_and_signed(tmp_path):
     c = _conn(p)
     row = c.execute("SELECT tombstone_mac FROM rejected_value_tombstones").fetchone()
     assert row and row[0]
-    assert c.execute("SELECT count(*) FROM audit_journal WHERE action='tombstone'").fetchone()[0] == 0  # <- not journaled
+    ev = c.execute("SELECT metadata_json FROM audit_journal WHERE action='tombstone'").fetchall()
+    assert len(ev) == 1  # journaled in the import's transaction
+    meta = json.loads(ev[0][0])
+    assert meta["path"] == "import_snapshot" and meta["origin_class"] == "principal"
     c.close()
 
 
-def test_attack_snapshot_imported_tombstone_row_deletion_readmits_value_unnoticed(tmp_path):
-    """F4 residual: import_snapshot inserts tombstone rows (with a MAC) but records no ``tombstone``
-    journal event, so _check_tombstones has nothing to reconcile against. A file writer deletes the
-    row; the next open succeeds, verify_audit_chain() is True, and the value is accepted. Passing = bug."""
+def test_attack_snapshot_imported_tombstone_row_deletion_is_caught(tmp_path):
+    """R2-B3: import_snapshot records a ``tombstone`` journal event for every row it inserts, so a row a
+    file writer deletes is missed by _check_tombstones at the next open (VaultIntegrityError) instead of
+    readmitting the value unnoticed."""
     p = tmp_path / "v.sqlite"
     v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
     v.import_snapshot(_plain_snapshot_with_tombstone("the rejected value"))
@@ -71,13 +75,25 @@ def test_attack_snapshot_imported_tombstone_row_deletion_readmits_value_unnotice
     c = _conn(p)
     c.execute("DELETE FROM rejected_value_tombstones")
     c.commit(); c.close()
-    v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)  # no VaultIntegrityError
+    with pytest.raises(vault_module.VaultIntegrityError, match="journaled tombstone"):
+        SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
+
+
+def test_control_importing_the_same_tombstone_twice_journals_it_once(tmp_path):
+    p = tmp_path / "v.sqlite"
+    v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
     try:
+        v.import_snapshot(_plain_snapshot_with_tombstone("the rejected value"))
+        v.import_snapshot(_plain_snapshot_with_tombstone("the rejected value"))
         assert v.verify_audit_chain() is True, v.last_chain_error
-        v.remember("decision", "k", "the rejected value", origin="user", author_id="person")  # readmitted
-        assert v.get("decision", "k").content == "the rejected value"
     finally:
         v.close()
+    c = _conn(p)
+    assert c.execute("SELECT count(*) FROM rejected_value_tombstones").fetchone()[0] == 1
+    assert c.execute("SELECT count(*) FROM audit_journal WHERE action='tombstone'").fetchone()[0] == 1
+    c.close()
+    v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)  # reconciles
+    v.close()
 
 
 def test_control_native_tombstone_row_deletion_is_caught(tmp_path):
@@ -93,12 +109,10 @@ def test_control_native_tombstone_row_deletion_is_caught(tmp_path):
         SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
 
 
-def test_attack_read_only_open_treats_keyed_vault_with_salt_removed_as_plaintext(tmp_path):
-    """Read-only open block: when ``kdf_salt`` is gone, ``_open_read_only`` takes the 'plain file never
-    opened with a passphrase' branch: no key check, no meta MAC, no tombstone reconciliation, path-derived
-    signing key, floor 1. A file writer deletes the salt, deletes the tombstone row + event, re-chains the
-    journal as format 1 and drops the head: the read-only open (okf-export) reports a verified journal
-    and no integrity error. The writable open fails closed on the same file. Passing = bug."""
+def test_attack_read_only_open_refuses_keyed_vault_with_salt_removed(tmp_path):
+    """R2-B5: a keyed vault whose ``kdf_salt`` is gone but whose key check, meta MAC or integrity format
+    remain is refused by the read-only open (VaultIntegrityError) instead of being read as a plaintext
+    vault with a path-derived signing key; the writable open refuses too, and writes no fresh salt."""
     p = tmp_path / "v.sqlite"
     v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
     v.remember("decision", "k", "the rejected value", origin="user", author_id="person")
@@ -116,16 +130,41 @@ def test_attack_read_only_open_treats_keyed_vault_with_salt_removed_as_plaintext
         prev = h
     c.execute("DELETE FROM audit_head")
     c.commit(); c.close()
-    v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False, read_only=True)  # no error
-    try:
-        assert v.verify_audit_chain() is True, v.last_chain_error
-        assert v._keyed is False and v.passphrase is None
-    finally:
-        v.close()
-    # The writable open fails closed on the same file (key check under a freshly generated salt), but note
-    # that it writes that new salt into vault_meta before failing.
-    with pytest.raises((vault_module.VaultIntegrityError, ValueError)):
+    with pytest.raises(vault_module.VaultIntegrityError, match="no kdf_salt"):
+        SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False, read_only=True)
+    with pytest.raises(vault_module.VaultIntegrityError, match="no kdf_salt"):
+        SQLiteMemoryVault(str(p), passphrase=None, auto_gate=False, read_only=True, allow_plaintext=True)
+    with pytest.raises(vault_module.VaultIntegrityError, match="no kdf_salt"):
         SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
     c = _conn(p)
-    assert c.execute("SELECT count(*) FROM vault_meta WHERE key='kdf_salt'").fetchone()[0] == 1
+    assert c.execute("SELECT count(*) FROM vault_meta WHERE key='kdf_salt'").fetchone()[0] == 0  # no new salt
     c.close()
+
+
+@pytest.mark.parametrize("keep", ["key_check", "meta_mac", "integrity_format"])
+def test_read_only_open_refuses_each_keyed_record_without_salt(tmp_path, keep):
+    p = tmp_path / "v.sqlite"
+    v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
+    v.remember("decision", "k", "value", origin="user", author_id="person")
+    v.close()
+    c = _conn(p)
+    c.execute("DELETE FROM vault_meta WHERE key IN ('kdf_salt', 'key_check', 'meta_mac', 'integrity_format') AND key != ?",
+              (keep,))
+    c.commit(); c.close()
+    with pytest.raises(vault_module.VaultIntegrityError, match="no kdf_salt"):
+        SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False, read_only=True)
+    with pytest.raises(vault_module.VaultIntegrityError, match="no kdf_salt"):
+        SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
+
+
+def test_control_plain_vault_never_keyed_still_opens_read_only(tmp_path, monkeypatch):
+    monkeypatch.delenv("KIBISIS_ALLOW_PLAINTEXT", raising=False)
+    p = tmp_path / "v.sqlite"
+    v = SQLiteMemoryVault(str(p), passphrase=None, auto_gate=False, allow_plaintext=True)
+    v.remember("decision", "k", "value", origin="user", author_id="person")
+    v.close()
+    v = SQLiteMemoryVault(str(p), passphrase=None, auto_gate=False, read_only=True, allow_plaintext=True)
+    try:
+        assert v.get("decision", "k").content == "value"
+    finally:
+        v.close()

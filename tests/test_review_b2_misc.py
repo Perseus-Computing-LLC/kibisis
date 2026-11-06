@@ -77,9 +77,13 @@ def test_attack_bad_signature_row_is_dropped_loudly_from_search_and_list(no_sqlc
     assert ("decision", "b") in failures["recent"]
     assert len(failures["recent"]) <= 10
 
-    # strict=True: the first bad row met raises, here at open while the term index is built ...
+    # strict=True: the open never raises for an entry (R2-B7); the bad row met while the term index is
+    # built is counted and left queued, and the first read through the index raises for it ...
+    strict = SQLiteMemoryVault(str(tampered("w.sqlite")), passphrase=PASS, auto_gate=False, strict=True)
+    assert strict.integrity_failures["count"] == 1
     with pytest.raises(EntryIntegrityError):
-        SQLiteMemoryVault(str(tampered("w.sqlite")), passphrase=PASS, auto_gate=False, strict=True)
+        strict.search("widgets", include_unverified=True, limit=10)
+    strict.close()
     # ... and on the already indexed file, in list and export.
     strict = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False, strict=True)
     with pytest.raises(EntryIntegrityError):

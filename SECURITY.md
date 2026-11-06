@@ -57,12 +57,17 @@ a guarantee beyond what the named code does.
   the previous one (`_record_audit_event`, _vault_audit.py) and re-signs the chain head with an HMAC under the
   signing key (`_write_audit_head`, _vault_audit.py; `_head_mac`, _vault_audit.py). `verify_audit_chain` (_vault_audit.py) recomputes every
   row (streaming, so any journal size verifies), then requires a head with a valid MAC that names the last
-  row; a deleted tail, a deleted head with rows still present, or rows removed under a head fails. The rules
-  are those of `kibisis::journal::verify_chain` in the crate (`kibisis_native.verify_chain` gives the same
-  verdict on the same rows). A keyed vault pins the lowest journal format it holds and whether its journal
-  has ever held a row in `vault_meta` (`journal_format_floor`, `journal_anchored`), under the meta MAC
-  below, so rows rewritten in an older, unkeyed hash layout are refused and deleting every row together
-  with the head is caught too.
+  row; a deleted tail, a deleted head with rows still present, or rows removed under a head fails, and so
+  does a row labelled with a journal format this version does not know, or whose metadata is not JSON
+  (`verify_audit_chain` returns False with `last_chain_error` set; it does not raise). The rules
+  are those of `kibisis::journal::verify_chain` in the crate: `kibisis_native.verify_chain` gives the same
+  verdict on the same rows when the rows are what the crate's types hold (whole-second timestamps,
+  compact canonical metadata JSON); a Python vault's journal is verified by the Python verifier, which
+  hashes through the crate. A vault that has ever been keyed (`kdf_salt` present) pins the lowest
+  journal format it holds and whether its journal has ever held a row in `vault_meta`
+  (`journal_format_floor`, `journal_anchored`), under the meta MAC below, so rows rewritten in an older,
+  unkeyed hash layout are refused and deleting every row together with the head is caught too, whatever
+  `integrity_format` was edited to say.
 - *Re-inserting a forgotten value.* Tombstones keep keyed digests of forgotten values
   (`crypto.keyed_value_digest`, crypto.py; `_seal_digests`, _vault_crypto.py), and `put`, restore and
   `import_snapshot` refuse a value whose digest matches, as content, key or a metadata string
@@ -72,12 +77,21 @@ a guarantee beyond what the named code does.
   carries an HMAC under the signing key (`crypto.tombstone_mac`), checked at open and on every hit, so an
   edited or planted row is refused rather than honoured; and at open every `tombstone` event in the journal
   (not undone by a `tombstone_lifted` event) must still have its row, so a deleted row refuses the open
-  (`VaultIntegrityError`) instead of readmitting the value.
+  (`VaultIntegrityError`) instead of readmitting the value. A tombstone imported from a snapshot is
+  journaled in the import's transaction (`metadata.path = "import_snapshot"`), so it is reconciled too.
 - *Editing the integrity record.* `vault_meta.integrity_format`, `kdf_salt`, `key_check`, the journal format
-  floor and anchoring, and `term_index_format` are bound under one HMAC (`meta_mac`, `crypto.vault_meta_mac`).
-  A keyed vault whose MAC is missing or does not verify, or whose `key_check` is missing, refuses to open;
-  the key check is compared before any migration or file conversion, and a migration whose previous chain
-  does not verify refuses instead of re-signing it.
+  floor and anchoring, `term_index_format` and `verification_quorum` are bound under one HMAC (`meta_mac`,
+  `crypto.vault_meta_mac`). A keyed vault whose MAC is missing or does not verify, or whose `key_check` is
+  missing, refuses to open: a vault with a `kdf_salt` is keyed whatever `integrity_format` says, and the
+  format 1 migration (which re-signs the journal and re-keys tombstone digests) runs only for a genuine
+  0.1.0a5 file, one that holds nothing integrity format 2 and later write (no meta MAC, floor or
+  anchoring flag, no signed journal head, no tombstone MAC, no format 3 journal row, no entry sealed with
+  its scope, category and key bound to the ciphertext). A migration whose previous chain does not verify
+  refuses instead of re-signing it. The key check (or, for a 0.1.0a5 file, one of its sealed entries) is
+  compared against the file before any migration or SQLCipher conversion, and a converted copy replaces
+  the plain file only after it has opened, authenticated and upgraded. Removing `kdf_salt` while a key
+  check, meta MAC or integrity format of 2 or more remains is refused by both the read-only and the
+  writable open; no fresh salt is written over it.
 - *Stalling reads with an absurd KDF cost.* A provider bound to a vault derives keys from the vault's own
   salt at the fixed iteration count only; the salt and count written in an envelope are not used, and a
   foreign salt is refused before any derivation (`AESGCMCryptoEnvelopeProvider.decrypt`, crypto.py). The cap
