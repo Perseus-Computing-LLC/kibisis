@@ -185,26 +185,7 @@ def test_control_f7_quorum_cannot_be_lowered_and_is_adopted_when_unnamed(tmp_pat
     v.close()
 
 
-@pytest.mark.skip(reason="R2-A8 == R2-B4: verification_quorum goes under the vault meta MAC in area B "
-                         "(VAULT_META_BOUND_KEYS); unskip at merge")
-def test_attack_stored_quorum_is_not_under_the_vault_meta_mac(tmp_path):
-    """R2-A8 (area B). ``verification_quorum`` is persisted in ``vault_meta``; once it is in
-    ``VAULT_META_BOUND_KEYS`` a file writer that lowers it to 1 on a plain-file vault is caught at
-    the next keyed open (``VaultIntegrityError``), and one attestation cannot mint ``verified``."""
-    from kibisis.crypto import VAULT_META_BOUND_KEYS
-
-    assert "verification_quorum" in VAULT_META_BOUND_KEYS
-    p = str(tmp_path / "q.sqlite")
-    v = _plain(p, verification_quorum=2)
-    v.close()
-    con = sqlite3.connect(p)
-    con.execute("UPDATE vault_meta SET value = ? WHERE key = 'verification_quorum'", (b"1",))
-    con.commit()
-    con.close()
-    v = _plain(p)
-    e = v.put("c", "k", VALUE, origin="user", epistemic_state="verified")
-    assert e.epistemic_state.value != "verified"
-    v.close()
+# R2-A8 == R2-B4: covered by tests/test_review2_b_journal.py (verification_quorum under the meta MAC).
 
 
 def test_attack_attestations_carry_over_a_content_change(tmp_path):
