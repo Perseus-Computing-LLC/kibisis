@@ -11,7 +11,9 @@ cannot remove what a person vouched for or what a higher class wrote.
 A tombstone carries the origin class of the request that made it (``origin_class`` column, ``principal``
 for rows written before the column existed). A later write of the value by a HIGHER class lifts a
 lower-class tombstone (journaled as ``tombstone_lifted``); a principal-class tombstone blocks every
-later write until a person lifts it (``kibisis-review lift``, :meth:`TombstoneMixin.lift_tombstone`).
+later write until a person lifts it (``kibisis-review lift``, which calls
+:meth:`TombstoneMixin.lift_tombstone` with a vouched origin). A row's class never goes down: a later
+request of a lower class for the same value leaves the row as it is (journaled ``tombstone_reaffirmed``).
 """
 
 from __future__ import annotations
@@ -57,15 +59,27 @@ def protected_reason(row: Any, requester: str) -> Optional[str]:
 
 
 def string_leaves(value: Any) -> Iterable[str]:
-    """Every string held anywhere inside a JSON-like value (dict values, list items, nested)."""
+    """Every string held anywhere inside a JSON-like value: dict keys and values, list items, nested.
+    Keys are included because a value filed as a metadata key is as readable as one filed as a value."""
     if isinstance(value, str):
         yield value
     elif isinstance(value, dict):
-        for v in value.values():
+        for k, v in value.items():
+            if isinstance(k, str):
+                yield k
             yield from string_leaves(v)
     elif isinstance(value, (list, tuple)):
         for v in value:
             yield from string_leaves(v)
+
+
+#: The one metadata field whose strings are matched against tombstones: everything a caller (an agent
+#: through the MCP server, a library caller's free fields moved there) supplied. The vault's own
+#: bookkeeping at the top level (``origin_class``, ``act_class``, ``trust_capped_from``,
+#: ``attestations``, ``human_reviews``, the MCP server's ``origin``, ...) is never a place a value is
+#: filed, and matching it let one rejection of a word such as ``agent`` refuse every later agent write
+#: in the scope (R2-A2).
+CALLER_METADATA_KEY = "agent_metadata"
 
 
 class TombstoneMixin:
@@ -203,11 +217,14 @@ class TombstoneMixin:
         return [found[i] for i in sorted(found)]
 
     def _entry_digests(self, key: str, content: str, meta: Optional[Dict[str, Any]]) -> List[Tuple[str, str]]:
-        """Digests of every place a value can sit in an entry: its content, its key, and each string
-        leaf of its metadata. A tombstoned value is refused wherever it is put."""
+        """Digests of every place a caller can file a value in an entry: its content, its key, and each
+        string (key or value, at any depth) of the caller's own metadata (``agent_metadata``). A
+        tombstoned value is refused wherever it is put. The vault's bookkeeping fields at the top level
+        of the metadata are not matched (:data:`CALLER_METADATA_KEY`)."""
         seen: Set[Tuple[str, str]] = set()
         out: List[Tuple[str, str]] = []
-        for text in [content, key, *string_leaves(meta or {})]:
+        caller_meta = (meta or {}).get(CALLER_METADATA_KEY)
+        for text in [content, key, *string_leaves(caller_meta if caller_meta is not None else {})]:
             if not text:
                 continue
             pair = self._digests(text)
@@ -348,6 +365,7 @@ class TombstoneMixin:
         requester: str,
     ) -> str:
         """Body of :meth:`tombstone`: one write transaction from lookup to tombstone row."""
+        from ._vault_review import _class_rank
         from .vault import ReviewedEntryError  # vault.py imports this module
 
         now = time.time()
@@ -388,35 +406,66 @@ class TombstoneMixin:
                             "review CLI."
                         )
 
+            # The row's identity is (category, key, value, scope); its class is the highest class that
+            # ever asked. A request never lowers the class a stored row carries: a person's rejection
+            # stays principal when an agent later names the same value (R2-A1), and the MAC (which
+            # covers the class) is recomputed only when the class actually rises.
             cursor.execute(
-                """
-                INSERT OR REPLACE INTO rejected_value_tombstones (
-                    category, key, value_sha256, canonical_sha256, reason, author_id, created_at, scope,
-                    sealed_digests, origin_class, tombstone_mac
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    category, key, val_hash, can_hash, reason, author_id, now, scope,
-                    self._seal_digests(scope, category, key, plain_exact, plain_canonical), requester,
-                    self._tombstone_mac(scope, category, key, val_hash, can_hash, requester),
-                ),
+                "SELECT id, origin_class FROM rejected_value_tombstones "
+                "WHERE category = ? AND key = ? AND value_sha256 = ? AND scope = ?",
+                (category, key, val_hash, scope),
             )
+            stored_row = cursor.fetchone()
+            stored_class: Optional[str] = stored_row["origin_class"] if stored_row is not None else None
+            if stored_row is None:
+                cursor.execute(
+                    """
+                    INSERT INTO rejected_value_tombstones (
+                        category, key, value_sha256, canonical_sha256, reason, author_id, created_at, scope,
+                        sealed_digests, origin_class, tombstone_mac
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        category, key, val_hash, can_hash, reason, author_id, now, scope,
+                        self._seal_digests(scope, category, key, plain_exact, plain_canonical), requester,
+                        self._tombstone_mac(scope, category, key, val_hash, can_hash, requester),
+                    ),
+                )
+                row_class = requester
+                row_written = True
+            elif _class_rank(requester) > _class_rank(stored_class or "principal"):
+                cursor.execute(
+                    "UPDATE rejected_value_tombstones SET reason = ?, author_id = ?, created_at = ?, "
+                    "origin_class = ?, tombstone_mac = ? WHERE id = ?",
+                    (
+                        reason, author_id, now, requester,
+                        self._tombstone_mac(scope, category, key, val_hash, can_hash, requester), stored_row["id"],
+                    ),
+                )
+                row_class = requester
+                row_written = True
+            else:
+                row_class = stored_class or "principal"  # the stored row, class and MAC stay as they are
+                row_written = False
             # Physical purge of the entity when it holds the value (the FTS index follows through triggers).
             if target is not None and target_matches:
                 cursor.execute("DELETE FROM entities WHERE id = ?", (target["id"],))
 
-            # Record hash-chained mutation audit event
+            # Record hash-chained mutation audit event. A request that found a row of its own class or
+            # above is journaled as ``tombstone_reaffirmed`` (the row is unchanged), so the open-time
+            # row/journal reconciliation keeps counting one ``tombstone`` event per row.
             self._record_audit_event(
                 cursor=cursor,
-                action="tombstone",
+                action="tombstone" if row_written else "tombstone_reaffirmed",
                 category=category,
                 key=key,
                 scope=scope,
                 value_sha256=val_hash,
                 author_id=author_id,
                 metadata={
-                    "reason": reason, "canonical_sha256": can_hash, "origin": origin or "", "origin_class": requester,
+                    "reason": reason, "canonical_sha256": can_hash, "origin": origin or "", "origin_class": row_class,
+                    "requester_class": requester, "stored_class": stored_class or "",
                     "entry_deleted": bool(target is not None and target_matches),
                 },
             )
@@ -433,14 +482,42 @@ class TombstoneMixin:
         fencing_token: Optional[int] = None,
         resource: Optional[str] = None,
         holder_id: Optional[str] = None,
+        origin: Optional[str] = None,
     ) -> int:
         """Remove the tombstones recorded under ``category:key`` in ``scope`` and journal each as
         ``tombstone_lifted``. ``digest`` (the stored exact digest, or a hex prefix of it) narrows the
         lift to one value. Returns how many were removed.
 
-        This is a person's act: the review CLI's ``lift`` verb calls it after its terminal check. The
-        value is admitted again afterwards; the entry itself is not restored.
+        This is a person's act. ``origin`` names who asked, as on :meth:`put`: a request from outside
+        the principal class (``model``, ``tool`` or ``unknown``) is refused with ``PermissionError``
+        and journaled, whatever class the tombstones carry. ``None`` means the caller vouches for a
+        person, as the review CLI's ``lift`` verb does after its terminal check; library code that
+        relays an agent must pass the agent's origin (or not expose this method). The value is
+        admitted again afterwards; the entry itself is not restored.
         """
+        requester = self._requester_class(origin)
+        with self._journal_protected_refusal("lift_tombstone", category, key, scope, author_id, origin):
+            if requester != "principal":
+                raise PermissionError(
+                    f"a {origin} request cannot lift a tombstone ('{category}:{key}' [scope={scope}]); lifting is a "
+                    "person's act (kibisis-review lift)"
+                )
+            return self._lift_tombstone_locked(
+                category, key, scope, digest, author_id, fencing_token, resource, holder_id
+            )
+
+    def _lift_tombstone_locked(
+        self,
+        category: str,
+        key: str,
+        scope: str,
+        digest: Optional[str],
+        author_id: Optional[str],
+        fencing_token: Optional[int],
+        resource: Optional[str],
+        holder_id: Optional[str],
+    ) -> int:
+        """Body of :meth:`lift_tombstone`, after the origin check."""
         sql = (
             "SELECT id, value_sha256, canonical_sha256, reason, origin_class FROM rejected_value_tombstones "
             "WHERE category = ? AND key = ? AND scope = ?"

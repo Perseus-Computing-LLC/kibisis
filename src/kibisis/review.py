@@ -175,7 +175,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         reviewer = account_identity()
         if args.command == "lift":
-            lifted = vault.lift_tombstone(args.category, args.key, scope=scope, digest=args.digest, author_id=reviewer)
+            lifted = vault.lift_tombstone(
+                args.category, args.key, scope=scope, digest=args.digest, author_id=reviewer, origin="user"
+            )
             if not lifted:
                 print(f"kibisis-review: no tombstone under {args.category}:{args.key} in scope {scope!r}.", file=sys.stderr)
                 return 1
