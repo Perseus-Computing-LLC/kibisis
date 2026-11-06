@@ -143,9 +143,16 @@ def test_search_list_and_put_report_the_same_provenance_as_get(tmp_path, passphr
     assert _provenance(hits[0].entity) == _provenance(got)
     listed = v.list_entities()
     assert len(listed) == 1 and _provenance(listed[0]) == _provenance(got)
-    # A re-write that gives no provenance keeps the stored one on every path.
+    # A re-write that gives no provenance keeps the stored one. Its content changed, so the stored
+    # attestation no longer applies (R2-A9): an origin-less write attests nothing, the entry waits for
+    # the person; the person's own re-write attests the new content and the quorum of one verifies it.
     rewritten = v.put("c", "k", "tabs for indentation, always", epistemic_state="verified")
     assert _provenance(rewritten) == ("user", "ticket-7", 0.9)
+    assert rewritten.epistemic_state == EpistemicState.CANDIDATE
+    assert rewritten.metadata.get("verification_pending") == {"have": 0, "need": 1}
+    rewritten = v.put("c", "k", "tabs for indentation, always", origin="user", epistemic_state="verified")
+    assert _provenance(rewritten) == ("user", "ticket-7", 0.9)
+    assert rewritten.epistemic_state == EpistemicState.VERIFIED
     assert _provenance(v.search("indentation")[0].entity) == ("user", "ticket-7", 0.9)
     assert _provenance(v.list_entities()[0]) == ("user", "ticket-7", 0.9)
     v.close()

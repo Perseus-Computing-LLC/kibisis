@@ -1080,6 +1080,15 @@ class SQLiteMemoryVault(
             **kwargs,
         )
 
+    def _content_changed(self, existing: Any, content: str) -> bool:
+        """True when ``content`` differs from what the stored row ``existing`` (a row with the
+        ``_ROW_COLUMNS`` of :mod:`._vault_tombstone`) holds. A row that cannot be opened counts as
+        changed: nothing attested can be shown to be the same."""
+        try:
+            return self._open_entry(existing) != content
+        except PermissionError:
+            return True
+
     def _put(
         self,
         category: str,
@@ -1115,8 +1124,9 @@ class SQLiteMemoryVault(
     ) -> MemoryEntity:
         """Write path behind :meth:`put`, which journals the tombstone refusals this raises.
 
-        ``_review_verdict`` is set by :meth:`_write_review` only: the state it passes was decided
-        under the quorum rule in ``review_entity``, with ``attestations`` already in ``metadata``.
+        ``_review_verdict`` is set by :meth:`_write_review` and by a same-vault ``import_snapshot``
+        only: the state it passes was decided under the quorum rule in ``review_entity``, with
+        ``attestations`` already in ``metadata`` (or restored from this vault's own snapshot).
 
         ``_trusted_metadata`` is set only by internal callers whose ``metadata`` the vault itself
         produced; a caller's reserved keys (:data:`RESERVED_METADATA_KEYS`) are dropped otherwise.
@@ -1132,8 +1142,10 @@ class SQLiteMemoryVault(
             raise ValueError("confidence must be within [0, 1]")
         if act_class is not None and act_class not in ACT_CLASSES:
             raise ValueError(f"act_class must be one of {ACT_CLASSES}, got {act_class!r}")
-        if origin == "model":
-            # Trust comes from where the write came from, not from what it says about itself.
+        if origin == "model" and not _review_verdict:
+            # Trust comes from where the write came from, not from what it says about itself. A state
+            # a person decided (review_entity, or this vault's own snapshot restoring that review) is
+            # not re-capped by the origin of the entry it was decided for.
             trust_ceiling = EpistemicState.CANDIDATE.value
         now = time.time()
         meta = dict(metadata or {})
@@ -1234,7 +1246,8 @@ class SQLiteMemoryVault(
         with self._write_tx() as cursor:
             self._fence(cursor, fencing_token, resource, holder_id)
             cursor.execute(
-                "SELECT epistemic_state, metadata_json, origin, superseded_by, valid_until, version "
+                "SELECT id, category, key, scope, content, is_encrypted, encrypted_envelope_json, tenant_sig, "
+                "epistemic_state, metadata_json, origin, superseded_by, valid_until, version "
                 "FROM entities WHERE category = ? AND key = ? AND scope = ?",
                 (category, key, scope),
             )
@@ -1345,6 +1358,19 @@ class SQLiteMemoryVault(
                     except (TypeError, ValueError):
                         prior_meta = {}
                 attested = list(prior_meta.get("attestations") or []) if existing is not None else []
+                if attested and existing is not None and self._content_changed(existing, content):
+                    # The stored attestations were given for the stored content. A different content
+                    # is a new claim nobody has attested yet (R2-A9): the names are journaled, the
+                    # quorum starts over and the state is settled against it below.
+                    self._record_audit_event(
+                        cursor=cursor, action="attestations_reset", category=category, key=key, scope=scope,
+                        value_sha256=val_hash, author_id=author_id,
+                        metadata={"reason": "content changed", "attestations": attested, "origin": origin or ""},
+                    )
+                    attested = []
+                    meta.pop("attestations", None)
+                    meta.pop("verification_pending", None)
+                    meta.pop("quorum_at_verification", None)
                 if requested_verified and entry_class == "principal" and _attest:
                     signer = self._resolve_attester(origin, attester)
                     if signer is not None and signer not in attested:

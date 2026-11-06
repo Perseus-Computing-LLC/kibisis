@@ -227,8 +227,14 @@ class SnapshotMixin:
         a vault without a passphrase has neither key nor seal, so its snapshots match any other
         plaintext vault) and its ``manifest_sha256`` is present and verifies. Otherwise they are dropped, the ``epistemic_state`` is re-derived from what
         survives (``verified`` and ``disputed`` become ``candidate``; ``revoked`` stays) and the
-        drop is journaled. An entity's ``origin`` and ``author_id`` are restored as exported, so a
-        person's verified entry stays verified and principal when the trust facts are kept.
+        drop is journaled. An entity's ``origin`` and ``author_id`` are restored as exported, so an
+        entry a person verified, whoever wrote it (a person's own, or an agent's entry a person
+        approved), stays verified with its reviews and attestations when the trust facts are kept.
+
+        The restore is one transaction: it applies whole or, on an error, not at all. Restoring over a
+        live vault without ``clear_existing`` leaves a live entry a person reviewed, or one of a
+        higher class than the snapshot's, in place when the snapshot is not this vault's (journaled as
+        a ``protected entry`` refusal, not counted); this vault's own snapshot restores over it.
 
         Returns the number of restored entities.
         """
@@ -239,6 +245,7 @@ class SnapshotMixin:
             data = snapshot_or_path
         else:
             raise TypeError("Expected snapshot dict or path")
+        from .vault import OriginClassError, ReviewedEntryError  # vault.py imports this module
 
         manifest_sha = data.get("manifest_sha256")
         manifest_verified = False
@@ -262,6 +269,10 @@ class SnapshotMixin:
         same_vault = data.get("digest_key_id") == self._digest_key_id() or self._trust_seal_opens(data)
         keep_trust_facts = same_vault and manifest_verified
         stripped_trust_facts = 0
+        protected_rows = 0
+        # One transaction for the whole restore (R2-A7): tombstones, the clearing, every entity and
+        # every refusal record commit together or not at all, so an error part-way leaves the vault as
+        # it was. Nested writes below join this transaction (see ``_write_tx``).
         with self._write_tx() as cursor:
             self._fence(cursor, fencing_token, resource, holder_id)
             for ts in data.get("tombstones", []):
@@ -320,95 +331,114 @@ class SnapshotMixin:
                 # from the (now empty) content table rather than deleting index rows directly.
                 cursor.execute("INSERT INTO entities_fts(entities_fts) VALUES('rebuild')")
 
-        if foreign_tombstones:
-            logger.warning(
-                "import_snapshot: %d tombstones come from a vault with another passphrase and cannot apply here",
-                foreign_tombstones,
-            )
-            self.record_refusal(
-                path="import_snapshot",
-                reason="tombstones from a vault with another passphrase",
-                scope="*",
-                detail={"tombstones": foreign_tombstones},
-            )
-
-        for ent_data in data.get("entities", []):
-            scope = ent_data.get("scope", "default")
-            category, key = ent_data["category"], ent_data["key"]
-            metadata = dict(ent_data.get("metadata") or {})
-            state = ent_data.get("epistemic_state", "verified")
-            origin = ent_data.get("origin") or None
-            if origin is not None and origin not in VALID_ORIGINS:
-                origin = None
-            val_hash, can_hash = self._digests(ent_data["content"])
-            tomb = self._find_tombstone(self._conn.cursor(), scope, val_hash, can_hash)
-            if tomb is None:
-                tombs = self._tombstones_matching(
-                    self._conn.cursor(), scope, self._entry_digests(key, ent_data["content"], metadata)
+            if foreign_tombstones:
+                logger.warning(
+                    "import_snapshot: %d tombstones come from a vault with another passphrase and cannot apply here",
+                    foreign_tombstones,
                 )
-                tomb = tombs[0] if tombs else None
-            if tomb is not None:
                 self.record_refusal(
                     path="import_snapshot",
-                    reason="tombstoned value",
-                    scope=scope,
-                    category=category,
-                    key=key,
-                    detail={"value_digest_prefix": val_hash[:12]},
+                    reason="tombstones from a vault with another passphrase",
+                    scope="*",
+                    detail={"tombstones": foreign_tombstones},
                 )
-                continue
-            if not keep_trust_facts:
-                dropped = [k for k in _TRUST_FACT_KEYS if k in metadata]
-                for k in dropped:
-                    metadata.pop(k)
-                if dropped:
-                    stripped_trust_facts += 1
-                    metadata["trust_facts_dropped_on_import"] = sorted(dropped)
-                if state in (EpistemicState.VERIFIED.value, EpistemicState.DISPUTED.value):
-                    # Those states are the outcome of attestations or reviews, which did not survive.
-                    metadata["trust_capped_from"] = state
-                    state = EpistemicState.CANDIDATE.value
-            self._put_journaled(
-                category=category,
-                key=key,
-                content=ent_data["content"],
-                metadata=metadata,
-                epistemic_state=state,
-                valid_from=ent_data.get("valid_from"),
-                valid_until=ent_data.get("valid_until"),
-                scope=scope,
-                origin=origin,
-                author_id=ent_data.get("author_id"),
-                fencing_token=fencing_token,
-                resource=resource,
-                holder_id=holder_id,
-                # A restore keeps the exported review history (when it is this vault's, see above) and
-                # tenant bounds; the state passed is the one the facts that survived support, and the
-                # vault still caps a non-principal origin to candidate. Nothing attests on a restore.
-                _trusted_metadata=True,
-                _review_verdict=keep_trust_facts and state != EpistemicState.CANDIDATE.value,
-                _attest=False,
-            )
-            if ent_data.get("archived"):
-                self.archive(
-                    category=ent_data["category"],
-                    key=ent_data["key"],
-                    scope=scope,
-                    fencing_token=fencing_token,
-                    resource=resource,
-                    holder_id=holder_id,
-                )
-            imported_count += 1
 
-        if stripped_trust_facts:
-            self.record_refusal(
-                path="import_snapshot",
-                reason="trust facts dropped: snapshot is not from this vault's key or has no verified manifest",
-                scope="*",
-                detail={
-                    "entities": stripped_trust_facts,
-                    "same_vault": "yes" if same_vault else "no",
-                    "manifest_verified": "yes" if manifest_verified else "no",
-                },
-            )
+            for ent_data in data.get("entities", []):
+                scope = ent_data.get("scope", "default")
+                category, key = ent_data["category"], ent_data["key"]
+                metadata = dict(ent_data.get("metadata") or {})
+                state = ent_data.get("epistemic_state", "verified")
+                origin = ent_data.get("origin") or None
+                if origin is not None and origin not in VALID_ORIGINS:
+                    origin = None
+                val_hash, can_hash = self._digests(ent_data["content"])
+                tomb = self._find_tombstone(cursor, scope, val_hash, can_hash)
+                if tomb is None:
+                    tombs = self._tombstones_matching(
+                        cursor, scope, self._entry_digests(key, ent_data["content"], metadata)
+                    )
+                    tomb = tombs[0] if tombs else None
+                if tomb is not None:
+                    self.record_refusal(
+                        path="import_snapshot",
+                        reason="tombstoned value",
+                        scope=scope,
+                        category=category,
+                        key=key,
+                        detail={"value_digest_prefix": val_hash[:12]},
+                    )
+                    continue
+                if not keep_trust_facts:
+                    dropped = [k for k in _TRUST_FACT_KEYS if k in metadata]
+                    for k in dropped:
+                        metadata.pop(k)
+                    if dropped:
+                        stripped_trust_facts += 1
+                        metadata["trust_facts_dropped_on_import"] = sorted(dropped)
+                    if state in (EpistemicState.VERIFIED.value, EpistemicState.DISPUTED.value):
+                        # Those states are the outcome of attestations or reviews, which did not survive.
+                        metadata["trust_capped_from"] = state
+                        state = EpistemicState.CANDIDATE.value
+                try:
+                    self._put_journaled(
+                        category=category,
+                        key=key,
+                        content=ent_data["content"],
+                        metadata=metadata,
+                        epistemic_state=state,
+                        valid_from=ent_data.get("valid_from"),
+                        valid_until=ent_data.get("valid_until"),
+                        scope=scope,
+                        origin=origin,
+                        author_id=ent_data.get("author_id"),
+                        fencing_token=fencing_token,
+                        resource=resource,
+                        holder_id=holder_id,
+                        # A restore keeps the exported review history and tenant bounds when the
+                        # snapshot is this vault's (see above); then the state and trust facts are
+                        # taken as this vault's people decided them, whatever the entry's origin (a
+                        # person's approval of an agent's entry restores verified). Otherwise the
+                        # state passed is the one the facts that survived support, and the vault
+                        # caps a non-principal origin to candidate. Nothing attests on a restore.
+                        _trusted_metadata=True,
+                        _review_verdict=keep_trust_facts,
+                        _attest=False,
+                    )
+                except (ReviewedEntryError, OriginClassError) as exc:
+                    # The live row is a person's (reviewed, or of a higher class than the snapshot's
+                    # entry) and the snapshot is not this vault's: the row stays, the rest is restored.
+                    protected_rows += 1
+                    self.record_refusal(
+                        path="import_snapshot",
+                        reason="protected entry",
+                        scope=scope,
+                        category=category,
+                        key=key,
+                        detail={"error": str(exc)[:200]},
+                    )
+                    continue
+                if ent_data.get("archived"):
+                    self.archive(
+                        category=ent_data["category"],
+                        key=ent_data["key"],
+                        scope=scope,
+                        fencing_token=fencing_token,
+                        resource=resource,
+                        holder_id=holder_id,
+                    )
+                imported_count += 1
+
+            if stripped_trust_facts:
+                self.record_refusal(
+                    path="import_snapshot",
+                    reason="trust facts dropped: snapshot is not from this vault's key or has no verified manifest",
+                    scope="*",
+                    detail={
+                        "entities": stripped_trust_facts,
+                        "same_vault": "yes" if same_vault else "no",
+                        "manifest_verified": "yes" if manifest_verified else "no",
+                    },
+                )
+        if protected_rows:
+            logger.warning("import_snapshot: %d entities were not restored over a person's live entries", protected_rows)
         return imported_count
