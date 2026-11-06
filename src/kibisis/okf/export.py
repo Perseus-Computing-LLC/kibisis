@@ -852,10 +852,12 @@ def export_bundle(
         )
 
 
-def command_gate(cmd: str, timeout: float = 900.0) -> BundleGate:
+def command_gate(cmd: str, timeout: float = 900.0, *, verbose: bool = False) -> BundleGate:
     """A bundle gate that runs ``cmd`` (split like a shell, no shell) with every staged file path
     appended. Exit status 0 passes; anything else, a timeout or a launch failure refuses the bundle.
-    The command's output goes to stderr (outbound_gate.py prints file:line:label, never the match)."""
+    The command's output is summarised on stderr (exit status, line count): a gate may quote the
+    content it matched, and the files are candidates for publication, not published. ``verbose=True``
+    copies the output to stderr as it is."""
     argv = shlex.split(cmd)
     if not argv:
         raise ExportError("--gate-cmd is empty")
@@ -865,10 +867,16 @@ def command_gate(cmd: str, timeout: float = 900.0) -> BundleGate:
             proc = subprocess.run(argv + list(paths), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                   timeout=timeout, check=False)
         except (OSError, subprocess.SubprocessError) as exc:
-            sys.stderr.write("gate: %s\n" % exc)
+            sys.stderr.write("gate: %s\n" % type(exc).__name__)
             return False
-        if proc.stdout:
+        lines = proc.stdout.count(b"\n") + (1 if proc.stdout and not proc.stdout.endswith(b"\n") else 0)
+        verdict = "passed" if proc.returncode == 0 else "refused"
+        sys.stderr.write("gate: %s (exit %d, %d files, %d lines of output%s)\n"
+                         % (verdict, proc.returncode, len(paths), lines, "" if verbose else "; --gate-verbose shows them"))
+        if verbose and proc.stdout:
             sys.stderr.write(proc.stdout.decode("utf-8", "replace"))
+            if not proc.stdout.endswith(b"\n"):
+                sys.stderr.write("\n")
         return proc.returncode == 0
 
     return gate
