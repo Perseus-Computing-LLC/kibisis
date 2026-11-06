@@ -75,3 +75,67 @@ Unreleased. To be folded into CHANGELOG.md by the merge; no version bump.
 
 - Nothing in area C is left open. `S-4` reads the encryption state from the config until area B's
   `encrypted_at_rest` property lands; swap `_encrypted_at_rest(config)` for the property at merge.
+
+## Round 2
+
+Second-pass findings R2-C-1..R2-C-5 (`review_notes/R2_C.md`), plus the "suspected" and "overstates" lists.
+
+### Fixed
+
+- **R2-C-1** input-driven `500`s, the class and the three instances. `_timestamp_ms` bounds a JSON integer
+  against `MS_CEILING` before `float()` (a 400-digit integer is `422`, not `OverflowError`); `top_k` as a
+  string must be 1–9 ASCII digits before `int()` (a 5000-digit string, or `"²"`, which `isdigit` accepts and
+  `int` refuses, is `422`); `parse_json_body` catches `RecursionError` (`400`). The class: the field-reading
+  halves of Add and Search (`_read_add`, `_read_search`) and the handler's body read + parse run under
+  `_validating(...)`, which turns any exception other than `ContractError` and the socket's own errors into
+  `422` (fields) or `400` (body) with a stable message, logging the exception type and the traceback frames
+  once — never the exception's text, which could quote the request. The `500` branch is now reserved for
+  the storage side.
+- **R2-C-2** retention and the S-4 warning in the no-`sqlcipher3` fallback. `VaultPool.encrypted_at_rest`
+  (passphrase set *and* driver loaded) is what `purge_idle` passes to `is_vault_file`, so plain-SQLite
+  vaults written under a passphrase without the driver are recognised and deleted when idle. `storage_mode`
+  (called by `run_server` before binding) raises `EncryptionRequiredError` for a passphrase without
+  `sqlcipher3` and without `KIBISIS_ALLOW_PLAINTEXT`: `aml-serve` exits 2 with the reason instead of
+  answering `500` to everything. The warning for the opted-in fallback now says what is in the clear and
+  that retention treats the files as plaintext vaults. `_encrypted_at_rest` is kept as an alias.
+- **R2-C-3** documented, not changed: SECURITY.md §OKF bundle author, the `__main__` docstring and
+  `config.open_vault` now say a read-only open may create and leave an empty `-wal` and a `-shm` beside a
+  WAL-mode vault (the vault file's bytes are unchanged; the next writable open removes them). `immutable=1`
+  was not used: it disables locking against a concurrent writer.
+- **R2-C-4** `AMLHandler.handle_expect_100` checks the credential and the route before answering
+  `Expect: 100-continue`: an unauthenticated `POST` gets `401`, an unknown path with the key gets `404`,
+  neither sends `100` nor drains (no body was invited), and the connection closes. Authorised requests on a
+  real route keep the stdlib behaviour.
+- **R2-C-5** `vault.py:_open_read_only` runs the key check and the edited-down `integrity_format` test
+  before the upgrade refusal (the writable open's order): an edited record is refused as "the integrity
+  record was edited" (`VaultIntegrityError`) instead of "open it writable once first", and a wrong passphrase
+  on a vault that carries a key check is a key failure.
+- Suspected list: `AMLConfig` rejects `max_body_bytes < 1` and `retry_after_s < 0`; `is_vault_file` now runs
+  under the pool lock in `purge_idle`, so the file checked is the file unlinked; the error branches of
+  `do_POST` reply through `_reply`, which swallows an `OSError` from a client that is already gone (no
+  `socketserver.handle_error` traceback on stderr). The chunked-body drain note moved into
+  `deploy/aml/README.md`.
+- Overstates table: SECURITY.md no longer says `okf-check` opens a vault; the `aml-serve` section says
+  unexpected failures while reading a request are `4xx` and that `Expect: 100-continue` is answered after
+  the credential check; `deploy/aml/README.md` says `Content-Length` bodies are drained and chunked bodies
+  are not, that markers written before the payload digest existed accept any payload under their id, and
+  what happens without `sqlcipher3`.
+
+### Tests
+
+- `tests/review2_c_aml.py` → `tests/test_review2_c_aml.py`, `tests/review2_c_okf.py` →
+  `tests/test_review2_c_okf.py`; every `test_attack_*` is now `test_fixed_*` asserting the fixed behaviour;
+  controls kept. The connection-permit control produces its `500`s from a patched storage call, since the
+  input shape it used is `422` now. New: unexpected validation errors are `422` and logged once without the
+  request's text (`caplog`); a patched parser raising `RecursionError` is `400` and keep-alive survives;
+  `AMLConfig` bounds; `storage_mode` refuses / `run_server` raises before binding; the no-driver fallback's
+  retention deletes an idle vault; `Expect: 100-continue` → `401`/`404`/`100` by case; read-only open leaves
+  the vault file's bytes and mtime unchanged and at most an empty `-wal`, which the next writable open
+  removes; the plain-file keyed fallback reports a wrong passphrase as such. Every test < 2.1 s.
+
+### Not fixed
+
+- Nothing from R2-C is left open. R2-C-3 is settled by documentation (the sidecars are SQLite's, and the
+  vault file is unchanged). On a genuinely format-1 keyed vault with no key check, a read-only open still
+  cannot tell a wrong passphrase from a vault that needs the upgrade (there is nothing to check against);
+  the message says to open it writable once, which is the right advice there.

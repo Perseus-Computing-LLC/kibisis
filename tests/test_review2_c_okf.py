@@ -1,7 +1,6 @@
-"""Second-pass review (R2) of the area C fixes: OKF / CLI vault paths and read-only opens.
-
-Not collected by default (no ``test_`` prefix); run by explicit path. ``test_control_*`` asserts the correct
-behaviour (failing = bug); ``test_attack_*`` demonstrates a defect (passing = bug).
+"""Second-pass review (R2) of the area C fixes: OKF / CLI vault paths and read-only opens, as regression
+tests. ``test_control_*`` asserts behaviour that was already correct; ``test_fixed_*`` (formerly
+``test_attack_*``) asserts the behaviour after the R2-C fixes.
 """
 
 from __future__ import annotations
@@ -49,11 +48,11 @@ def _make(db: Path, **kw) -> None:
 
 
 @pytest.mark.parametrize("kw", [dict(allow_plaintext=True), dict(passphrase=PASSPHRASE)], ids=["plain", "keyed"])
-def test_attack_read_only_open_leaves_wal_and_shm_sidecars_behind(tmp_path, kw):
-    """The vault is in WAL mode, so ``mode=ro`` still creates ``-wal`` (empty) and ``-shm`` (32 KiB) next to
-    the file and leaves them there after close. The main file's bytes and mtime are unchanged (control
-    below), but SECURITY.md's "changes none of its bytes" / "never changes it" does not cover two new
-    files in the vault directory. Low. Passing = bug."""
+def test_fixed_read_only_open_leaves_the_vault_file_untouched_and_only_empty_sidecars(tmp_path, kw):
+    """R2-C-3, settled by documenting it: a read-only open of a WAL-mode vault needs SQLite's shared-memory
+    index, so it may create and leave ``-wal`` (empty) and ``-shm`` beside the file. The vault file's bytes
+    and mtime are unchanged, any ``-wal`` left behind is empty (no frames: nothing was written), and the next
+    writable open removes both; SECURITY.md, ``__main__`` and ``config.open_vault`` now say exactly that."""
     db = tmp_path / "v.sqlite"
     _make(db, **kw)
     assert _sidecars(db) == {"-wal": False, "-shm": False}
@@ -63,8 +62,13 @@ def test_attack_read_only_open_leaves_wal_and_shm_sidecars_behind(tmp_path, kw):
         assert [r.key for r in ro.list_entities(scope="*", include_unverified=True)] == ["a", "b"]
     finally:
         ro.close()
-    assert (_sha(db), db.stat().st_mtime_ns) == before  # control: the vault file itself is untouched
-    assert _sidecars(db) == {"-wal": True, "-shm": True}
+    assert (_sha(db), db.stat().st_mtime_ns) == before  # the vault file itself is untouched
+    wal = Path(str(db) + "-wal")
+    assert not wal.exists() or wal.stat().st_size == 0
+    writer = SQLiteMemoryVault(str(db), auto_gate=False, verification_quorum=1, **kw)
+    writer.close()
+    assert _sidecars(db) == {"-wal": False, "-shm": False}  # the next writable open cleans up
+    assert _sha(db) == before[0]
 
 
 def test_control_read_only_refuses_every_write_path_and_reads_a_live_writer(tmp_path):
@@ -120,11 +124,10 @@ def test_control_read_only_open_edge_cases(tmp_path):
         SQLiteMemoryVault(str(enc), passphrase="wrong-passphrase-0123456789", read_only=True)
 
 
-def test_attack_read_only_refusal_of_an_edited_down_integrity_format_tells_the_operator_to_open_writable(tmp_path):
-    """Area B refuses a keyed vault whose ``integrity_format`` was edited below the key check / meta MAC it
-    carries (F13). The read-only path checks the format before the key check and reports it as "needs an
-    integrity upgrade: open it writable once first": correct refusal, misleading advice (the writable open
-    refuses too, with the real reason). Message-only. Passing = bug."""
+def test_fixed_read_only_refusal_of_an_edited_down_integrity_format_names_the_edit(tmp_path):
+    """R2-C-5: a keyed vault whose ``integrity_format`` was edited to 1 (F13) is refused read-only with the
+    same reason the writable open gives (the record was edited), not with "open it writable once first";
+    and a wrong passphrase on a vault that carries a key check is a key failure, not an upgrade notice."""
     import sqlcipher3
 
     enc = tmp_path / "enc.sqlite"
@@ -134,10 +137,33 @@ def test_attack_read_only_refusal_of_an_edited_down_integrity_format_tells_the_o
     conn.execute("UPDATE vault_meta SET value = '1' WHERE key = 'integrity_format'")
     conn.commit()
     conn.close()
-    with pytest.raises(ValueError, match="open it writable once first"):
+    with pytest.raises(VaultIntegrityError, match="edited") as exc:
         SQLiteMemoryVault(str(enc), passphrase=PASSPHRASE, read_only=True)
+    assert "writable" not in str(exc.value)
     with pytest.raises(VaultIntegrityError, match="edited"):
         SQLiteMemoryVault(str(enc), passphrase=PASSPHRASE)
+    # the plain-file keyed fallback (no sqlcipher3) is where a wrong passphrase used to read as "needs an
+    # upgrade"; with a key check present it is reported as the key failure it is
+    import kibisis.vault as kv
+
+    plain = tmp_path / "plain.sqlite"
+    _make(plain, allow_plaintext=True)
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setenv("KIBISIS_ALLOW_PLAINTEXT", "1")
+        monkey.setattr(kv, "sqlcipher3", __import__("sqlite3"))
+        keyed = SQLiteMemoryVault(str(plain), passphrase=PASSPHRASE, auto_gate=False)  # keys the plain file
+        keyed.close()
+        with pytest.raises(ValueError, match="authenticate"):
+            SQLiteMemoryVault(str(plain), passphrase="wrong-passphrase-0123456789", read_only=True)
+        ro = SQLiteMemoryVault(str(plain), passphrase=PASSPHRASE, read_only=True, auto_gate=False)
+        try:
+            row = ro.get("decision", "a", scope="default")
+            assert row is not None and row.content == "Alpha."
+        finally:
+            ro.close()
+    finally:
+        monkey.undo()
 
 
 # ---------------------------------------------------------------- F17 / C-5 / C-11: one vault path, same rules

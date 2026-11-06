@@ -2,8 +2,10 @@
 
 ``admit`` needs a person at the keyboard. ``okf-export`` and ``okf-check`` (P13.1) project the
 vault into an OKF v0.2 bundle and check one; ``okf-export`` opens the vault read-only (no
-conversion, upgrade or index build) and never changes it. ``okf-import`` (P13.2) diffs a bundle
-into the vault as model-origin candidates; ``--dry-run`` opens it read-only and writes nothing.
+conversion, upgrade or index build) and never changes the vault file's bytes, though SQLite may leave
+an empty ``-wal`` and a ``-shm`` beside a WAL-mode vault; ``okf-check`` opens no vault. ``okf-import``
+(P13.2) diffs a bundle into the vault as model-origin candidates; ``--dry-run`` opens it read-only and
+writes nothing.
 Every subcommand resolves the vault the same way: ``--db``, else ``KIBISIS_DB_PATH``, else the
 per-user data directory (``kibisis.config.default_db_path``).
 """
@@ -224,7 +226,11 @@ def _aml_serve(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"aml-serve: {exc}", file=sys.stderr)
         return 2
-    run_server(config, host=args.host, port=args.port)
+    try:
+        run_server(config, host=args.host, port=args.port)
+    except EncryptionRequiredError as exc:  # a vault key without sqlcipher3 and without the plaintext opt-in
+        print(f"aml-serve: {exc}", file=sys.stderr)
+        return 2
     return 0
 
 

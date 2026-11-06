@@ -1,7 +1,7 @@
-"""Second-pass review (R2) of the area C fixes: AML adapter.
+"""Second-pass review (R2) of the area C fixes: AML adapter, as regression tests.
 
-Not collected by default (no ``test_`` prefix); run by explicit path. Convention: ``test_control_*`` asserts
-the correct behaviour (failing = bug), ``test_attack_*`` demonstrates a defect (passing = bug). Servers bind
+Convention kept from the review: ``test_control_*`` asserts behaviour that was already correct;
+``test_fixed_*`` (formerly ``test_attack_*``) asserts the behaviour after the R2-C fixes. Servers bind
 127.0.0.1 on an ephemeral port and are shut down in a finally block; parser-level cases use BytesIO readers.
 """
 
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import socket
 import sqlite3
@@ -26,10 +27,13 @@ from kibisis.aml_adapter import (
     AMLHandler,
     AMLService,
     ContractError,
+    VaultPool,
     key_digest,
     parse_json_body,
     run_server,
+    storage_mode,
 )
+from kibisis.protocols import EncryptionRequiredError
 
 KEY = "review2-c-throwaway-key-0123456789"
 PASSPHRASE = "review2-c-passphrase-not-secret"
@@ -123,32 +127,78 @@ def _add(rid="r1", user="u", text="hello", ts=T0, **over):
 # ---------------------------------------------------------------- C-1 / C-7 / C-8: input-driven 500s
 
 
-def test_attack_integer_timestamp_too_large_for_float_is_500(svc):
-    """A JSON integer with more digits than a float can hold (``10**400``: 401 digits, under the 4300-digit
-    JSON limit) reaches ``float(value)`` in ``_timestamp_ms`` and raises OverflowError, which do_POST turns
-    into a 500. The same class as C-1 (an input-driven 500), one layer deeper. Passing = bug."""
-    with pytest.raises(OverflowError):
-        svc.add(_add(ts=10**400))
+def test_fixed_integer_timestamp_too_large_for_float_is_422(svc):
+    """R2-C-1(a): a JSON integer with more digits than a float can hold (``10**400``) is bounded before
+    ``float()`` and refused with 422, not an OverflowError -> 500."""
+    for ts in (10**400, -(10**400), MS_CEILING + 1):
+        with pytest.raises(ContractError) as exc:
+            svc.add(_add(rid=f"big{len(str(ts))}{ts > 0}", ts=ts))
+        assert exc.value.status == 422
+    assert svc.add(_add(rid="ceil", ts=MS_CEILING))["success"]
 
 
-def test_attack_integer_timestamp_too_large_for_float_is_500_over_http(http_server):
+def test_fixed_integer_timestamp_too_large_for_float_is_422_over_http(http_server):
     out = _raw(http_server, _post("/add", _add(ts=10**400)))
-    assert _statuses(out) == [500] and b"internal error" in out
+    assert _statuses(out) == [422] and b"internal error" not in out
 
 
-def test_attack_top_k_digit_string_over_4300_digits_is_500(svc):
-    """``top_k`` as a digit string is accepted and converted with ``int()``; a string of more than 4300
-    digits trips CPython's int-conversion limit (ValueError, not ContractError) -> 500. Passing = bug."""
+def test_fixed_top_k_digit_string_over_4300_digits_is_422(svc):
+    """R2-C-1(b): a digit string past CPython's int/str limit (and a non-ASCII digit ``isdigit`` accepts
+    but ``int`` rejects) is 422, not ValueError -> 500."""
     svc.add(_add())
-    with pytest.raises(ValueError, match="Exceeds the limit"):
-        svc.search({"user_id": "u", "query": "hello", "top_k": "9" * 5000})
+    for top_k in ("9" * 5000, "\u00b2", "1" * 10, " 0 "):
+        with pytest.raises(ContractError) as exc:
+            svc.search({"user_id": "u", "query": "hello", "top_k": top_k})
+        assert exc.value.status == 422
+    assert svc.search({"user_id": "u", "query": "hello", "top_k": " 3 "})["data"]
 
 
-def test_attack_deeply_nested_json_is_500():
-    """``json.loads`` raises RecursionError (an Exception, not a ValueError) on deep nesting; parse_json_body
-    only catches ValueError, so do_POST answers 500 for a ~200 KB body well under the 64 MiB cap."""
-    with pytest.raises(RecursionError):
+def test_fixed_deeply_nested_json_is_400():
+    """R2-C-1(c): ``json.loads`` raises RecursionError on deep nesting; it is now a 400 like any other
+    unparsable body."""
+    with pytest.raises(ContractError) as exc:
         parse_json_body(b"[" * 100_000 + b"]" * 100_000)
+    assert exc.value.status == 400
+
+
+def test_fixed_unexpected_validation_errors_are_4xx_and_logged_once(svc, caplog):
+    """The class, not the instances: any exception raised while a request's fields are read is the
+    client's (422), the traceback frames are logged once and the exception's text is not."""
+
+    def boom(body):
+        raise KeyError(body["request_id"])  # the exception's text carries the request; the frames do not
+
+    svc._read_add = boom
+    with caplog.at_level(logging.ERROR, logger="kibisis.aml"):
+        with pytest.raises(ContractError) as exc:
+            svc.add(_add(rid="secret-looking-input"))
+    assert exc.value.status == 422 and "could not be read" in exc.value.message
+    records = [r for r in caplog.records if "unexpected KeyError" in r.getMessage()]
+    assert len(records) == 1 and "secret-looking-input" not in records[0].getMessage()
+    assert "boom" in records[0].getMessage()  # the frames are there
+
+
+def test_fixed_unexpected_body_errors_are_400_over_http(http_server, monkeypatch):
+    """Over HTTP: a body the parser cannot handle for a reason nobody listed (anything but ContractError
+    and the socket's own errors) is 400, not 500, the connection stays usable and the server keeps serving."""
+    import kibisis.aml_adapter as adapter
+
+    def boom(raw):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(adapter, "parse_json_body", boom)
+    good = _post("/search", {"user_id": "u", "query": "x"})
+    out = _raw(http_server, good.replace(b"Connection: close\r\n", b"") + good)
+    assert _statuses(out) == [400, 400], out  # keep-alive survives the refusal: the body was fully read
+    monkeypatch.undo()
+    assert _statuses(_raw(http_server, good)) == [200]
+
+
+def test_fixed_config_rejects_impossible_body_cap_and_retry_after(tmp_path):
+    for bad in (dict(max_body_bytes=0), dict(max_body_bytes=-1), dict(retry_after_s=-1)):
+        with pytest.raises(ValueError):
+            _config(tmp_path, **bad)
+    assert _config(tmp_path, max_body_bytes=1, retry_after_s=0).retry_after_s == 0
 
 
 def test_control_ordinary_bad_inputs_are_4xx(svc):
@@ -225,13 +275,36 @@ def test_control_duplicate_and_conflicting_length_headers_do_not_500(http_server
     assert _statuses(_raw(http_server, nolen)) == [411]
 
 
-def test_attack_expect_100_continue_is_honoured_before_the_credential_check(http_server):
-    """http.server answers ``Expect: 100-continue`` in parse_request, before do_POST runs, so an
-    unauthenticated client is invited to send its body (then 401 + a 2 s drain). L8 said "an
-    unauthenticated client learns nothing"; it learns the server accepts bodies. Low. Passing = bug."""
+def test_fixed_expect_100_continue_is_answered_after_the_credential_check(http_server):
+    """R2-C-4: an unauthenticated ``POST`` with ``Expect: 100-continue`` gets ``401`` (and an unknown path
+    with the key gets ``404``) instead of ``100 Continue``; nothing is drained, so the reply is prompt."""
     head = b"POST /search HTTP/1.1\r\nHost: x\r\nConnection: close\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n"
+    started = time.monotonic()
     out = _raw(http_server, head, read_timeout=3.5)
-    assert _statuses(out)[:2] == [100, 401], out
+    assert _statuses(out) == [401] and b"Connection: close" in out and b"<TIMEOUT>" not in out, out
+    assert time.monotonic() - started < 1.5
+    head = (f"POST /nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n{AUTH}Expect: 100-continue\r\n"
+            "Content-Length: 5\r\n\r\n").encode()
+    assert _statuses(_raw(http_server, head)) == [404]
+    # with the key and a real route the stdlib behaviour stays: 100, then the body is read and answered
+    body = json.dumps({"user_id": "u", "query": "x"}).encode()
+    head = (f"POST /search HTTP/1.1\r\nHost: x\r\nConnection: close\r\n{AUTH}Expect: 100-continue\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n").encode()
+    s = socket.create_connection(("127.0.0.1", http_server.server_address[1]))
+    s.settimeout(3)
+    try:
+        s.sendall(head)
+        assert s.recv(200).startswith(b"HTTP/1.1 100")
+        s.sendall(body)
+        out = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            out += chunk
+    finally:
+        s.close()
+    assert _statuses(out) == [200]
 
 
 def test_control_unauthenticated_requests_are_401_and_other_methods_do_not_route(http_server):
@@ -267,8 +340,17 @@ def test_control_request_id_reuse_rules(svc):
 
 def test_control_connection_permits_are_returned_after_500_and_idle_close(http_server):
     cap = http_server.config.max_connections
-    for _ in range(cap + 1):
-        assert _statuses(_raw(http_server, _post("/add", _add(ts=10**400)))) == [500]
+    original = http_server.service.add
+
+    def broken(body):  # a storage-side failure (the input shapes that used to 500 are 4xx now)
+        raise RuntimeError("storage")
+
+    http_server.service.add = broken
+    try:
+        for _ in range(cap + 1):
+            assert _statuses(_raw(http_server, _post("/add", _add()))) == [500]
+    finally:
+        http_server.service.add = original
     idle = [socket.create_connection(("127.0.0.1", http_server.server_address[1])) for _ in range(cap)]
     try:
         time.sleep(0.2)
@@ -321,11 +403,10 @@ def test_control_retention_edge_cases(svc):
     assert svc.pool.path_for("held").exists()
 
 
-def test_attack_retention_never_deletes_in_the_no_sqlcipher_fallback(tmp_path, monkeypatch):
-    """With a passphrase but no sqlcipher3 (the mode S-4's startup warning describes, reachable with
-    KIBISIS_ALLOW_PLAINTEXT=1), vault files are plain SQLite, but ``is_vault_file`` is called with
-    ``encrypted=self.passphrase is not None`` and so rejects every file: retention silently deletes
-    nothing and ``--retention-days`` is a dead letter. Passing = bug."""
+def test_fixed_retention_works_in_the_no_sqlcipher_fallback(tmp_path, monkeypatch):
+    """R2-C-2: with a passphrase but no sqlcipher3 (``KIBISIS_ALLOW_PLAINTEXT=1``), vault files are plain
+    SQLite; ``purge_idle`` now asks the pool's ``encrypted_at_rest`` (passphrase *and* driver) instead of
+    ``passphrase is not None``, so idle vaults are deleted and ``--retention-days`` means what it says."""
     import kibisis.vault as kv
 
     monkeypatch.setattr(kv, "sqlcipher3", sqlite3)  # what a host without the driver sees
@@ -333,35 +414,43 @@ def test_attack_retention_never_deletes_in_the_no_sqlcipher_fallback(tmp_path, m
     monkeypatch.delenv("KIBISIS_PASSPHRASE_FILE", raising=False)
     monkeypatch.setenv("KIBISIS_ALLOW_PLAINTEXT", "1")
     assert not kv._sqlcipher_available()
-    service = AMLService(_config(tmp_path, retention_days=1))
+    config = _config(tmp_path, retention_days=1)
+    assert storage_mode(config) is False  # the mode run_server logs: plain files, server up
+    service = AMLService(config)
     try:
+        assert service.pool.encrypted_at_rest is False
         assert service.add(_add())["success"]
         path = service.pool.path_for("u")
         service.pool.close_all()
         assert path.read_bytes().startswith(b"SQLite format 3")
+        assert VaultPool.is_vault_file(path, service.pool.encrypted_at_rest)
+        assert service.pool.purge_idle(86400) == 0 and path.exists()  # fresh: kept
         _age(path, 10 * 86400)
-        assert service.pool.purge_idle(86400) == 0 and path.exists()
+        assert service.pool.purge_idle(86400) == 1 and not path.exists()
     finally:
         service.pool.close_all()
 
 
-def test_attack_no_sqlcipher_without_opt_in_makes_every_request_500(tmp_path, monkeypatch):
-    """Same host, without KIBISIS_ALLOW_PLAINTEXT: the vault constructor refuses (area B), so every Add
-    is an EncryptionRequiredError -> 500, while the startup warning says the server runs with sealed
-    content and plain metadata. The warning text overstates; the server is down, not degraded."""
+def test_fixed_no_sqlcipher_without_opt_in_refuses_to_start(tmp_path, monkeypatch):
+    """R2-C-2: same host, without KIBISIS_ALLOW_PLAINTEXT: the vault constructor would refuse every open
+    (area B's EncryptionRequiredError), so ``run_server`` refuses to start with that reason instead of
+    serving 500s under a warning that describes a degraded server."""
     import kibisis.vault as kv
-    from kibisis.protocols import EncryptionRequiredError
 
     monkeypatch.setattr(kv, "sqlcipher3", sqlite3)
     monkeypatch.delenv("KIBISIS_PASSPHRASE", raising=False)
     monkeypatch.delenv("KIBISIS_PASSPHRASE_FILE", raising=False)
     monkeypatch.delenv("KIBISIS_ALLOW_PLAINTEXT", raising=False)
-    service = AMLService(_config(tmp_path))
-    try:
-        with pytest.raises(EncryptionRequiredError):
-            service.add(_add())
-    finally:
-        service.pool.close_all()
+    config = _config(tmp_path)
+    with pytest.raises(EncryptionRequiredError, match="every request would fail"):
+        storage_mode(config)
+    with pytest.raises(EncryptionRequiredError):
+        run_server(config, host="127.0.0.1", port=0)
+    assert not any(tmp_path.glob("vaults/*.kib"))
+    # the control: --plaintext (no passphrase) and a passphrase with the driver both start
+    assert storage_mode(_config(tmp_path, passphrase=None)) is False
+    monkeypatch.setattr(kv, "sqlcipher3", pytest.importorskip("sqlcipher3"))
+    assert storage_mode(config) is True
 
 
 # ---------------------------------------------------------------- regressions: ordinary flows

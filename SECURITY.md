@@ -209,8 +209,12 @@ The adapter (`kibisis.aml_adapter`) accepts connections only from the bind addre
 on every path, so routes are not enumerable without the key. Bodies are bounded (`max_body_bytes`, checked
 before every chunk of a chunked body; malformed chunk sizes are `400` and close the connection); JSON is
 parsed without `NaN`/`Infinity` and refused when it holds a lone surrogate; timestamps must convert to a
-datetime at Add, so a stored row can never make a later Search fail. Stalled connections are closed after
+datetime at Add, so a stored row can never make a later Search fail. Any other exception raised while a
+request's body or fields are read is answered `400`/`422` (its traceback is logged once, without the
+request's text), so a client's input never produces a `500`. Stalled connections are closed after
 `--socket-timeout`, open connections are capped by `--max-connections`, and processing by `--max-inflight`.
+An unauthenticated `POST` with `Expect: 100-continue` gets the `401` instead of `100 Continue`, so no body
+is invited and nothing is drained.
 A reused `request_id` with a different payload is `409`. Retention deletes only regular files that are
 vaults of this server, under the pool lock, and never one with a request inside it.
 
@@ -223,9 +227,12 @@ in front of the adapter.
 `okf-import` reads a directory of Markdown files written by someone else. Every imported row is a
 model-origin candidate; `human_reviews` and other reserved metadata in a bundle's frontmatter are dropped by
 `_put` like any caller-supplied metadata, so a bundle cannot forge a review or a verified state. Bodies are
-stored as text and never executed. `okf-export`, `okf-check` and `okf-import --dry-run` open the vault
-read-only (`SQLiteMemoryVault(read_only=True)`: `mode=ro`, no migration, no integrity upgrade, no index
-build), so running them against a vault changes none of its bytes.
+stored as text and never executed. `okf-export` and `okf-import --dry-run` open the vault read-only
+(`SQLiteMemoryVault(read_only=True)`: `mode=ro`, no migration, no integrity upgrade, no index build), so
+running them against a vault changes none of the vault file's bytes; `okf-check` reads only the bundle and
+opens no vault. A read-only open of a WAL-mode vault still needs SQLite's shared-memory index, so it may
+create and leave an empty `<vault>-wal` and a `<vault>-shm` (32 KiB) beside the file when none existed; the
+next writable open removes them.
 
 ### Passphrase handling
 
