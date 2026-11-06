@@ -149,18 +149,25 @@ def _bound(c):
     return {r["key"]: r["value"] for r in c.execute("SELECT key, value FROM vault_meta").fetchall()}
 
 
-def test_attack_r2b4_legacy_v1_meta_mac_re_signs_an_attacker_quorum(tmp_path):
-    """A meta MAC over the legacy key set (``VAULT_META_BOUND_KEYS_V1``) is accepted once and re-signed
-    over the FULL set *as stored*. The V1 MAC never covered ``verification_quorum``, so any copy of a
-    pre-R2-B4 file's ``meta_mac`` (a backup, a snapshot of the file before the upgrade) is a permanent
-    token: a file writer restores it, sets ``verification_quorum`` to 1, and the next writable open
-    adopts the quorum and signs it under the V2 set. The vault was created with quorum 2."""
+def test_attack_r2b4_legacy_v1_meta_mac_re_signs_an_attacker_quorum(tmp_path, caplog):
+    """R3-AB4 fixed. A meta MAC over the legacy key set (``VAULT_META_BOUND_KEYS_V1``) never covered
+    ``verification_quorum``, so a pre-R2-B4 copy of a file's ``meta_mac`` (a backup; the signing key
+    stands in for it here) plus ``verification_quorum = 1`` used to be adopted and re-signed under the
+    full set. Now the stored quorum is not trusted while only the V1 MAC verifies: a value below the
+    default is ignored (the process runs with the default 2), dropped before the re-sign, and logged
+    at WARNING; the next open sees a full-set MAC over a file with no stored quorum. The vault was
+    created with quorum 2 pinned."""
+    import logging
+
+    from kibisis.crypto import VAULT_META_BOUND_KEYS
+
     p = tmp_path / "v.sqlite"
-    v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False, verification_quorum=2)
+    v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False, verification_quorum=2, pin_quorum=True)
     v.remember("decision", "d", "ship it", origin="user", author_id="alice", epistemic_state="verified")
     assert v.get("decision", "d").epistemic_state == "candidate"  # 1 of 2
     # The MAC such a file carried before R2-B4 (the signing key only stands in for the backup copy).
     v1_mac = vault_meta_mac(v._signing_key, v._meta_mac_fields(), VAULT_META_BOUND_KEYS_V1)
+    signing_key = v._signing_key
     v.close()
     c = _conn(p)
     assert c.execute("SELECT value FROM vault_meta WHERE key='verification_quorum'").fetchone()[0] == "2"
@@ -168,27 +175,41 @@ def test_attack_r2b4_legacy_v1_meta_mac_re_signs_an_attacker_quorum(tmp_path):
     c.execute("UPDATE vault_meta SET value = '1' WHERE key = 'verification_quorum'")
     c.commit()
     c.close()
-    v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)  # names no quorum -> adopts stored
+    with caplog.at_level(logging.WARNING, logger="kibisis"):
+        v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)  # names no quorum
+    assert any("predates the bound verification quorum" in r.getMessage() and r.levelno == logging.WARNING
+               for r in caplog.records), [r.getMessage() for r in caplog.records]
+    assert any("below the default" in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
     try:
-        assert v.verification_quorum == 1  # must stay 2 (or the open must refuse)
-        v.remember("decision", "e", "single attestation mints verified", origin="user", author_id="bob",
+        assert v.verification_quorum == 2 and v.verification_quorum_stored is None  # the forged 1 was ignored
+        v.remember("decision", "e", "single attestation does not mint verified", origin="user", author_id="bob",
                    epistemic_state="verified")
-        assert v.get("decision", "e").epistemic_state == "verified"
+        assert v.get("decision", "e").epistemic_state == "candidate"
     finally:
         v.close()
     c = _conn(p)
     fields = _bound(c)
     c.close()
-    # The forged quorum is now under a fresh full-set MAC: the downgrade is permanent and verifies.
-    assert fields["meta_mac"] == vault_meta_mac(v._signing_key, {k: fields.get(k) for k in fields})
+    # The forged quorum is gone, and the re-signed MAC is a full-set MAC over the file as it now stands.
+    assert "verification_quorum" not in fields
+    assert fields["meta_mac"] == vault_meta_mac(signing_key, {k: fields.get(k) for k in VAULT_META_BOUND_KEYS})
     v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
-    assert v.verification_quorum == 1
-    v.close()
+    try:
+        assert v.verification_quorum == 2 and v.verification_quorum_stored is None
+    finally:
+        v.close()
+    # Restoring the forged row under the new MAC is an integrity failure, as for any bound value.
+    c = _conn(p)
+    c.execute("INSERT INTO vault_meta (key, value) VALUES ('verification_quorum', '1')")
+    c.commit()
+    c.close()
+    with pytest.raises(vault_module.VaultIntegrityError, match="meta MAC"):
+        SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
 
 
 def test_control_r2b4_quorum_edit_under_a_full_set_mac_is_refused(tmp_path):
     p = tmp_path / "v.sqlite"
-    v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False, verification_quorum=2)
+    v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False, verification_quorum=2, pin_quorum=True)  # R3-E1: a plain open no longer stores it
     v.close()
     c = _conn(p)
     c.execute("UPDATE vault_meta SET value = '1' WHERE key = 'verification_quorum'")

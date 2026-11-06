@@ -27,11 +27,21 @@ value lifts it on its own.
 Approving a candidate that proposed to supersede a verified entry retires that entry; ``list`` says so
 beside the candidate and ``approve`` repeats it.
 
-Approving records one account's approval. The entry becomes verified once ``KIBISIS_VERIFICATION_QUORUM``
-distinct accounts have approved it (two unless set; a person who wrote the entry as verified counts as
-one), and any supersession it proposed is applied then. Until then it stays a candidate, and a second
+Approving records one account's approval. The entry becomes verified once the vault's verification
+quorum of distinct accounts have approved it (a person who wrote the entry as verified counts as one),
+and any supersession it proposed is applied then. Until then it stays a candidate, and a second
 approval from the same account changes nothing. Rejecting deletes the entry and records a tombstone, so
 the same value cannot be written, restored or imported again in that scope.
+
+The quorum is two accounts by default, and that is only a default until a person's first verdict (or
+``kibisis admit``) pins it in the vault file: the verdict commands store the quorum they run with
+(``KIBISIS_VERIFICATION_QUORUM``, else 2), and may raise it later but never lower it. ``list``, the
+servers and library opens never pin; they adopt the pinned value, and refuse to adopt one below the
+default unless their own ``KIBISIS_VERIFICATION_QUORUM`` names it. Every run prints the quorum in
+force (``quorum 1 — one account verifies``) beside the vault path.
+
+``list`` opens the vault read-only: it creates, converts, upgrades and pins nothing, and says so when
+the vault needs a writable open first (a verdict or the server does that).
 
 ``list`` also shows the agent's requests to forget an entry a person reviewed. The MCP server refuses
 those and journals the request; a person carries one out by rejecting the entry, and reviewing the entry
@@ -44,12 +54,13 @@ The vault, key and scope come from the same environment variables as the MCP ser
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from datetime import datetime, timezone
 from typing import Any, List, Optional
 
 from ._operator import NotInteractive, account_identity, require_terminal
-from .config import ConfigError, default_db_path, open_vault, resolve_scope
+from .config import ENV_VERIFICATION_QUORUM, ConfigError, default_db_path, open_vault, parse_verification_quorum, resolve_scope
 from .models import EpistemicState
 from .protocols import EncryptionRequiredError
 
@@ -151,6 +162,16 @@ def _list(vault: Any, scope: str, category: Optional[str]) -> int:
     return 0
 
 
+def _quorum_line(vault: Any) -> str:
+    """One line saying how many accounts verify an entry in this vault, and whether that is pinned."""
+    quorum = vault.verification_quorum
+    stored = getattr(vault, "verification_quorum_stored", None)
+    who = "one account verifies" if quorum == 1 else f"{quorum} accounts verify"
+    if stored is None:
+        return f"quorum {quorum} — {who} (default until a verdict pins it)"
+    return f"quorum {quorum} — {who} (pinned in the vault)"
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parser().parse_args(argv)
     if args.command != "list":
@@ -163,11 +184,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         scope = resolve_scope()
         db_path = default_db_path()
-        vault = open_vault(db_path)
+        if args.command == "list":
+            # A read: open the file as it is. Nothing here may create, convert, upgrade or re-sign the
+            # vault, and in particular nothing here may pin its quorum; that is a verdict's job.
+            parse_verification_quorum(os.environ.get(ENV_VERIFICATION_QUORUM))  # a bad value is a refusal even with no vault
+            if db_path == ":memory:" or not os.path.isfile(db_path):
+                print(f"vault {db_path}  scope {scope!r}", file=sys.stderr)
+                print(f"No vault at {db_path} yet; nothing to review.")
+                return 0
+            vault = open_vault(db_path, read_only=True)
+        else:
+            vault = open_vault(db_path, pin_quorum=True)
     except (ConfigError, EncryptionRequiredError) as exc:
         print(f"kibisis-review: {exc}", file=sys.stderr)
         return 2
+    except (ValueError, PermissionError) as exc:  # wrong passphrase, not a vault, needs a writable open first
+        print(f"kibisis-review: {exc}", file=sys.stderr)
+        return 2
     print(f"vault {db_path}  scope {scope!r}", file=sys.stderr)
+    print(_quorum_line(vault), file=sys.stderr)
 
     try:
         if args.command == "list":
@@ -216,7 +251,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             if notice:
                 print(f"    ! {notice} once the quorum is met")
         else:
-            print(f"{args.category}:{args.key} is now {_state(entity)} (account {reviewer}{label}).")
+            loud = f"; quorum {vault.verification_quorum} — one account verifies" if vault.verification_quorum == 1 else ""
+            print(f"{args.category}:{args.key} is now {_state(entity)} (account {reviewer}{label}{loud}).")
             if notice:
                 print(f"    ! {notice.replace('approving retires', 'this approval retired')}")
         return 0

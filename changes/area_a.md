@@ -152,3 +152,55 @@ behaviour).
   fixed behaviour and is skipped until the merge. `_persist_verification_quorum` runs before the
   signing key is derived in `__init__`, so a `_write_meta_mac` call there would be a no-op; area B's
   open-time MAC write must cover the key instead.
+
+## Round 3 — quorum pinning
+
+### Fixed
+
+- **R3-E1** (high) The stored `verification_quorum` was written by whichever process opened the file
+  first, `review list` (no terminal needed, writable open) included, so a same-uid shell running
+  `KIBISIS_VERIFICATION_QUORUM=1 python -m kibisis.review list` before the operator's first open pinned
+  the vault at one account, every later open adopted it in silence, and one pty-driven approve minted
+  `verified`. Now only a pinning open stores the quorum: `SQLiteMemoryVault(pin_quorum=True)` /
+  `open_vault(pin_quorum=True)`, passed by the review verdicts and `admit` behind their terminal
+  check. Every other open (`review list`, the MCP and AML servers, the OKF commands, a plain library
+  open) adopts the stored quorum or runs with its own and writes nothing; a stored quorum below the
+  default (2) is adopted only by a process whose own argument or `KIBISIS_VERIFICATION_QUORUM` names
+  it, otherwise `ConfigError` saying so (`pinned at 1 ... set KIBISIS_VERIFICATION_QUORUM=1 to accept
+  that`). `review list` opens the vault read-only (nothing created, converted, re-signed or pinned; a
+  missing vault is "nothing to review"). `verification_quorum_stored` (None until pinned) is the
+  file's value; `review list`, every verdict, `admit`, the MCP server banner and `kibisis_health`
+  (`verification_quorum: {accounts, pinned, note}`) say the quorum in force, `quorum 1 — one account
+  verifies` when it is one. The default of two is documented as a default until a person's first
+  verdict pins it (README, SECURITY.md, `review.py` help, `SQLiteMemoryVault` docstring).
+- **R3-AB4** (medium) When only the V1 meta MAC verified (the legacy key set, which never covered the
+  quorum) the stored `verification_quorum` was adopted as it stood and re-signed under the full set,
+  so a pre-R2-B4 `meta_mac` plus `verification_quorum = 1` became a signed downgrade. Under a legacy
+  MAC the stored quorum is now not trusted: a value below the default is ignored (the process runs
+  with its own / the default), deleted before the re-sign, and logged at WARNING; a value at or above
+  the default can only raise the bar and is kept and covered. `_verify_meta_mac` logs the legacy MAC at
+  WARNING in both read-only and writable opens.
+- **R3-E4** (low) `open_vault(env=...)` reads `KIBISIS_VERIFICATION_QUORUM` from its mapping
+  (`parse_verification_quorum`) and passes `verification_quorum=` explicitly, like the path, key and
+  plaintext opt-in; a mapping that names none isolates the vault from `os.environ`'s value.
+
+### Tests
+
+- `tests/review3_entry_cli.py` → `tests/test_review3_entry_cli.py`, `tests/review3_entry_r2closed.py`
+  → `tests/test_review3_entry_r2closed.py`: collected; the `test_attack_*` cases assert the fixed
+  behaviour; new `test_control_a_pinned_quorum_of_one_is_not_adopted_in_silence`.
+- `tests/review3_ab_migration.py::test_attack_r2b4_legacy_v1_meta_mac_re_signs_an_attacker_quorum`
+  rewritten in place to the fixed behaviour (the forged 1 is ignored, dropped, and the re-signed MAC
+  covers a file with no stored quorum); `test_control_r2b4_quorum_edit_under_a_full_set_mac_is_refused`
+  there now pins (`pin_quorum=True`) so it has a stored quorum to edit — one-token change in area B's
+  file, for the merge. `test_control_r3ab4_legacy_meta_mac_keeps_a_stored_quorum_at_or_above_the_default`
+  (test_review2_b_journal.py) covers the other half.
+- Existing tests that relied on a plain open pinning the quorum now pin explicitly
+  (`test_review_a2_quorum.py`, `test_review2_a_trust.py`, `test_review2_b_journal.py::_seeded`).
+
+### Changed behaviour callers may notice
+
+- A library open never stores the quorum; an embedder that wants the file to remember one passes
+  `pin_quorum=True` from a path it trusts as a person's act.
+- A vault pinned at 1 refuses every open that does not name 1 itself (`ConfigError`); run with
+  `KIBISIS_VERIFICATION_QUORUM=1`, or raise it with a verdict under `KIBISIS_VERIFICATION_QUORUM=2`.

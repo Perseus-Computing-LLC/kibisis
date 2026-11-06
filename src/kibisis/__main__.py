@@ -56,11 +56,13 @@ def _admit(args: argparse.Namespace) -> int:
     # entry the agent wrote, not a namesake in another file or scope.
     try:
         scope = validate_scope(args.scope) if args.scope is not None else resolve_scope()
-        vault = open_vault(args.db)
+        vault = open_vault(args.db, pin_quorum=True)  # a person at a terminal: the one open that may pin the quorum
     except (ConfigError, EncryptionRequiredError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
     print(f"vault {vault.db_path}  scope {scope!r}", file=sys.stderr)
+    if vault.verification_quorum == 1:
+        print("quorum 1 — one account verifies", file=sys.stderr)
     reviewer = account_identity()
     try:
         entity = vault.admit(

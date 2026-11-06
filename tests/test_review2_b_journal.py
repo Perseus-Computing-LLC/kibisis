@@ -26,7 +26,9 @@ def _no_sqlcipher(monkeypatch):
 
 
 def _seeded(path):
-    v = SQLiteMemoryVault(str(path), passphrase=PASS, auto_gate=False)
+    # pin_quorum=True: the stored-quorum tests below need the file to carry one, as a person's first
+    # verdict would leave it (R3-E1: a plain open no longer pins).
+    v = SQLiteMemoryVault(str(path), passphrase=PASS, auto_gate=False, pin_quorum=True)
     for i in range(4):
         v.remember("decision", f"k{i}", f"fact number {i}", origin="user", author_id=f"author{i}")
     v.tombstone("decision", "k3", reason="wrong", author_id="reviewer", scope="default")
@@ -201,7 +203,7 @@ def test_attack_verification_quorum_in_vault_meta_is_under_the_meta_mac(tmp_path
 def test_control_raising_the_quorum_re_signs_the_meta_mac(tmp_path, monkeypatch):
     monkeypatch.delenv("KIBISIS_VERIFICATION_QUORUM", raising=False)
     p = _seeded(tmp_path / "v.sqlite")
-    v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False, verification_quorum=5)
+    v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False, verification_quorum=5, pin_quorum=True)
     v.close()
     v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
     try:
@@ -227,6 +229,38 @@ def test_control_meta_mac_written_before_the_quorum_was_bound_is_re_signed_once(
     v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)  # re-signed
     v.close()
     c = _conn(p)
+    assert c.execute("SELECT value FROM vault_meta WHERE key='meta_mac'").fetchone()[0] != legacy
+    c.execute("UPDATE vault_meta SET value = '1' WHERE key='verification_quorum'")
+    c.commit(); c.close()
+    with pytest.raises(vault_module.VaultIntegrityError, match="meta MAC"):
+        SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
+
+
+def test_control_r3ab4_legacy_meta_mac_keeps_a_stored_quorum_at_or_above_the_default(tmp_path, monkeypatch):
+    """R3-AB4: under a legacy (V1) meta MAC the stored quorum is not trusted. A value at or above the
+    default can only raise the bar, so it is kept, adopted and covered by the re-signed MAC; one below
+    the default is ignored and dropped (``tests/review3_ab_migration.py`` covers that half)."""
+    from kibisis.crypto import VAULT_META_BOUND_KEYS_V1, vault_meta_mac
+    monkeypatch.delenv("KIBISIS_VERIFICATION_QUORUM", raising=False)
+    p = tmp_path / "v.sqlite"
+    v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False, verification_quorum=3, pin_quorum=True)
+    legacy = vault_meta_mac(v._signing_key, v._meta_mac_fields(), VAULT_META_BOUND_KEYS_V1)
+    v.close()
+    c = _conn(p)
+    c.execute("UPDATE vault_meta SET value = ? WHERE key='meta_mac'", (legacy,))
+    c.commit(); c.close()
+    v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False, read_only=True)
+    try:
+        assert v.verification_quorum == 3 and v.verification_quorum_stored == 3
+    finally:
+        v.close()
+    v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)  # re-signed over the kept 3
+    try:
+        assert v.verification_quorum == 3 and v.verification_quorum_stored == 3
+    finally:
+        v.close()
+    c = _conn(p)
+    assert c.execute("SELECT value FROM vault_meta WHERE key='verification_quorum'").fetchone()[0] == "3"
     assert c.execute("SELECT value FROM vault_meta WHERE key='meta_mac'").fetchone()[0] != legacy
     c.execute("UPDATE vault_meta SET value = '1' WHERE key='verification_quorum'")
     c.commit(); c.close()

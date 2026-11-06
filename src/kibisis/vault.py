@@ -21,7 +21,7 @@ import threading
 import time
 from pathlib import Path
 from collections import deque
-from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 from .admission import AdmissionDecision, FactDisposition, MemoryAdmissionGate
 from .crypto import (
     ENTRY_BINDING,
@@ -255,6 +255,8 @@ class SQLiteMemoryVault(
         trust_caller_identity: bool = False,
         strict: bool = False,
         read_only: bool = False,
+        pin_quorum: bool = False,
+        env: Optional[Mapping[str, str]] = None,
     ) -> None:
         """Open a vault. Entry content is encrypted by default.
 
@@ -268,10 +270,19 @@ class SQLiteMemoryVault(
         ``verification_quorum`` (K-R1) is how many distinct principals must attest to an entry before
         it is stored as ``verified``: the author of a ``origin="user"`` write that asked for
         ``verified`` counts as one, each person reviewing it as ``verified`` counts as one more. It
-        defaults to ``KIBISIS_VERIFICATION_QUORUM`` or :data:`DEFAULT_VERIFICATION_QUORUM`. The vault
-        file remembers the quorum it was opened with (``vault_meta`` ``verification_quorum``): a later
-        open asking for a LOWER quorum raises :class:`~kibisis.config.ConfigError`, a higher one is
-        stored, so a process cannot lower the bar for the entries other processes verified.
+        defaults to ``KIBISIS_VERIFICATION_QUORUM`` (read from ``env``, default ``os.environ``) or
+        :data:`DEFAULT_VERIFICATION_QUORUM`. The vault file remembers a quorum (``vault_meta``
+        ``verification_quorum``) only once a process opened with ``pin_quorum=True`` stored it: the
+        review verdicts and ``admit``, which a person runs at a terminal. Every other open (``review
+        list``, the MCP and AML servers, the OKF commands, a plain library open) adopts the stored
+        quorum, or runs with the process's own when none is stored, and never writes one. A stored
+        quorum is a floor: an open that asks for LESS raises :class:`~kibisis.config.ConfigError`; a
+        pinning open that asks for MORE stores the new value, a non-pinning one runs with it. A stored
+        quorum below :data:`DEFAULT_VERIFICATION_QUORUM` is adopted only by a process whose own
+        ``verification_quorum`` argument or ``KIBISIS_VERIFICATION_QUORUM`` names it; otherwise the
+        open is refused with :class:`~kibisis.config.ConfigError`, so a pinned ``1`` is never taken
+        up in silence. :attr:`verification_quorum_stored` is the file's value (``None`` until a
+        verdict pins one).
 
         ``trust_caller_identity`` is for embedders only. By default the attester of a ``user``-origin
         write or review is the operating-system account running the process
@@ -335,15 +346,18 @@ class SQLiteMemoryVault(
         self.auto_gate = auto_gate
         # A quorum named by the caller or the environment is a demand; one that is neither is the
         # default, and an existing file's stored quorum takes its place (see _persist_verification_quorum).
-        self._quorum_requested = verification_quorum is not None or bool(
-            (os.environ.get("KIBISIS_VERIFICATION_QUORUM") or "").strip()
-        )
+        # Only a pinning open (the review verdicts, admit) ever stores one.
+        quorum_env = os.environ if env is None else env
+        env_quorum = quorum_env.get("KIBISIS_VERIFICATION_QUORUM")
+        self._quorum_requested = verification_quorum is not None or bool((env_quorum or "").strip())
+        self._pin_quorum = bool(pin_quorum)
+        #: The quorum the vault file remembers, or None until a verdict pinned one (then the default applies).
+        self.verification_quorum_stored: Optional[int] = None
+        self._meta_mac_legacy = False  # True while the meta MAC verifies only over the pre-quorum key set
         if verification_quorum is None:
             from .config import parse_verification_quorum  # config imports this module
 
-            verification_quorum = parse_verification_quorum(
-                os.environ.get("KIBISIS_VERIFICATION_QUORUM"), DEFAULT_VERIFICATION_QUORUM
-            )
+            verification_quorum = parse_verification_quorum(env_quorum, DEFAULT_VERIFICATION_QUORUM)
         if not isinstance(verification_quorum, int) or isinstance(verification_quorum, bool) or verification_quorum < 1:
             raise ValueError("verification_quorum must be a positive integer")
         self.verification_quorum = int(verification_quorum)
@@ -713,6 +727,9 @@ class SQLiteMemoryVault(
                 self._signing_key = self._legacy_signing_key
                 if plain_file and _sqlcipher_available():
                     logger.warning("kibisis: %s is a plaintext vault; read-only open leaves it as it is", self.db_path)
+            # Adopt (or refuse) the stored quorum exactly as a writable open would; a read-only open never
+            # stores one. After the meta MAC check, since the stored quorum is one of the values it covers.
+            self._persist_verification_quorum()
         except BaseException:
             self._conn.close()
             raise
@@ -1088,25 +1105,67 @@ class SQLiteMemoryVault(
     def _set_meta(cursor: Any, key: str, value: Any) -> None:
         cursor.execute("INSERT OR REPLACE INTO vault_meta (key, value) VALUES (?, ?)", (key, value))
 
+    def _stored_quorum(self) -> Optional[int]:
+        """The quorum ``vault_meta`` holds, or None when there is none (or it is not a positive integer).
+
+        While the meta MAC verifies only over the legacy key set (:attr:`_meta_mac_legacy`) the stored
+        value was never signed, so one below :data:`DEFAULT_VERIFICATION_QUORUM` is not evidence of
+        anything and is reported as None (R3-AB4); a higher one can only raise the bar and is kept.
+        """
+        try:
+            stored_raw = self._meta("verification_quorum")
+        except sqlcipher3.OperationalError:
+            return None  # no vault_meta table (a read-only open of a file no passphrase ever touched)
+        if stored_raw is None:
+            return None
+        try:
+            stored = int(bytes(stored_raw).decode("ascii") if isinstance(stored_raw, (bytes, memoryview)) else stored_raw)
+        except (TypeError, ValueError):
+            return None
+        if stored < 1:
+            return None
+        if self._meta_mac_legacy and stored < DEFAULT_VERIFICATION_QUORUM:
+            logger.warning(
+                "%s: the stored verification quorum %d is below the default %d and the meta MAC that would cover "
+                "it predates the bound quorum; the stored value is ignored",
+                self.db_path, stored, DEFAULT_VERIFICATION_QUORUM,
+            )
+            return None
+        return stored
+
+    def _drop_untrusted_stored_quorum(self, cursor: Any) -> None:
+        """Before a legacy (pre-quorum) meta MAC is re-signed: remove a stored quorum the MAC never covered
+        and that a process would otherwise refuse (below the default), so the re-signed MAC does not turn
+        a file writer's value into a signed one. Called by ``_verify_meta_mac`` under ``_meta_mac_legacy``."""
+        if self._stored_quorum() is None and self._meta("verification_quorum") is not None:
+            cursor.execute("DELETE FROM vault_meta WHERE key = 'verification_quorum'")
+
     def _persist_verification_quorum(self) -> None:
-        """Store the quorum on first open; refuse an open that asks for less than the file remembers.
+        """Adopt the stored quorum, compare it with the process's, and store it only from a pinning open.
 
         A verified entry means "``verification_quorum`` distinct accounts attested". A process opening
         the same file with a smaller quorum would mint ``verified`` on fewer attestations, so it is
-        refused (:class:`~kibisis.config.ConfigError`). A larger quorum is allowed and becomes the
-        file's: raising the bar never un-verifies anything on its own. A process that names no quorum
-        (no argument, no ``KIBISIS_VERIFICATION_QUORUM``) adopts the file's.
+        refused (:class:`~kibisis.config.ConfigError`). A larger quorum is allowed: a pinning open
+        (``pin_quorum=True``: the review verdicts and ``admit``, behind the terminal check) stores it
+        and it becomes the file's; any other open runs with it and writes nothing. A process that
+        names no quorum (no argument, no ``KIBISIS_VERIFICATION_QUORUM``) adopts the file's, unless the
+        file's is below :data:`DEFAULT_VERIFICATION_QUORUM`: a quorum of one account is taken up only by
+        a process that names it itself. With nothing stored, a pinning open stores the process's
+        quorum (the default, unless named) and every other open simply runs with it.
         """
         from .config import ConfigError  # config imports this module
 
-        stored_raw = self._meta("verification_quorum")
-        stored: Optional[int] = None
-        if stored_raw is not None:
-            try:
-                stored = int(bytes(stored_raw).decode("ascii") if isinstance(stored_raw, (bytes, memoryview)) else stored_raw)
-            except (TypeError, ValueError):
-                stored = None
-        if stored is not None and stored >= 1 and not self._quorum_requested:
+        stored = self._stored_quorum()
+        self.verification_quorum_stored = stored
+        if stored is not None and not self._quorum_requested:
+            if stored < DEFAULT_VERIFICATION_QUORUM:
+                raise ConfigError(
+                    f"{self.db_path} has its verification quorum pinned at {stored}, below the default "
+                    f"{DEFAULT_VERIFICATION_QUORUM}: {'one account' if stored == 1 else f'{stored} accounts'} would "
+                    f"verify an entry. Set KIBISIS_VERIFICATION_QUORUM={stored} to accept that, or raise it to "
+                    f"{DEFAULT_VERIFICATION_QUORUM} or more with a review verdict run under "
+                    f"KIBISIS_VERIFICATION_QUORUM={DEFAULT_VERIFICATION_QUORUM}."
+                )
             self.verification_quorum = stored
             return
         if stored is not None and self.verification_quorum < stored:
@@ -1115,10 +1174,13 @@ class SQLiteMemoryVault(
                 f"{self.verification_quorum}. A quorum may be raised but not lowered: set "
                 f"KIBISIS_VERIFICATION_QUORUM to {stored} or more."
             )
+        if not self._pin_quorum or getattr(self, "read_only", False):
+            return  # adopt or run with the process's own; never pin
         if stored is None or self.verification_quorum > stored:
             with self._write_tx() as cursor:
                 self._set_meta(cursor, "verification_quorum", str(self.verification_quorum))
                 self._write_meta_mac(cursor)  # the stored quorum is one of the values the meta MAC covers
+            self.verification_quorum_stored = self.verification_quorum
 
     def _resolve_attester(self, origin: Optional[str], attester: Optional[str]) -> Optional[str]:
         """The account an attestation is recorded for, or ``None`` when nothing is recorded.

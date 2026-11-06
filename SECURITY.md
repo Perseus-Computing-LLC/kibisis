@@ -183,8 +183,14 @@ also stored in plain text.
   (`_resolve_attester`, vault.py), for `put(origin="user")`, `review_entity` and `admit` alike;
   `author_id` / `reviewer_id` are labels. `attester=` is honoured only on a vault opened with
   `trust_caller_identity=True` (embedders that authenticate their users), and `"principal"` or an
-  empty name is never a signer. The quorum is stored in `vault_meta` on first open; an open that asks
-  for less is refused (`ConfigError`), one that asks for more is stored, and a verified entry carries
+  empty name is never a signer. The quorum itself is a property of the vault file, not a per-process
+  setting: it is stored in `vault_meta` only by a pinning open (`pin_quorum=True`: the review verdicts
+  and `admit`, behind the terminal check), two by default until that first verdict. Every other open
+  adopts the stored value and never writes one; an open that asks for less is refused (`ConfigError`),
+  a pinning open that asks for more stores it, a stored quorum below the default is adopted only by a
+  process whose own `KIBISIS_VERIFICATION_QUORUM` names it, and while the meta MAC verifies only over
+  the legacy key set the stored quorum is not trusted (a value below the default is dropped before the
+  re-sign). A verified entry carries
   `quorum_at_verification`. `_review_verdict` / `_trusted_metadata` are not parameters of the public
   `put()`; `put_batch` rejects items that carry them.
 - Recall returns entries inside a `<kibisis-recall>` envelope with text escaped (`fence_recall`,
