@@ -341,6 +341,14 @@ class EntryIntegrityMixin:
                 f"{self.db_path}: the vault is keyed (integrity format {stored_format}) but has no key check; "
                 "refusing to open"
             )
+        if stored_format < 2 and (stored is not None or self._meta("meta_mac") is not None):
+            # Format 1 wrote neither record. A vault that carries one while claiming format 1 had its
+            # integrity_format edited down; migrating it would re-sign under the editor's story.
+            raise VaultIntegrityError(
+                f"{self.db_path}: vault_meta.integrity_format says {stored_format} but the vault carries a key "
+                "check or meta MAC, which only integrity format 2 and later write; the integrity record was "
+                "edited. Refusing to migrate; restore the record before opening."
+            )
         if stored_format < 2:
             self.integrity_upgrade = self._migrate_integrity()
             stored_format = int(self._meta("integrity_format") or 0)
