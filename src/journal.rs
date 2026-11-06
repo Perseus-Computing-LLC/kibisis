@@ -248,11 +248,27 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 /// Rows must be in order with sequences `1..=n`. With a head, its MAC must verify under `signing_key` and
 /// it must name the last row: a head past the end means rows were cut from the tail; a head with no rows
 /// means the whole journal was removed. Without a head, a journal that contains format 3 rows fails
-/// ([`ChainError::MissingHead`]); an empty journal with no head is sound.
+/// ([`ChainError::MissingHead`]); an empty journal with no head is sound. This is
+/// [`verify_chain_with`] with `head_required = false`; a keyed vault whose journal has ever held a row
+/// verifies with `head_required = true`, so that an empty journal with no head fails too.
 pub fn verify_chain(
     events: &[AuditEvent],
     head: Option<&JournalHead>,
     signing_key: &[u8],
+) -> Result<(), ChainError> {
+    verify_chain_with(events, head, signing_key, false)
+}
+
+/// [`verify_chain`] with the head demanded (`head_required`) even when `events` is empty or holds no
+/// format 3 row: the rule for a keyed vault whose journal has held a row (`vault_meta.journal_anchored`),
+/// so that removing the whole journal together with its head is detected. Rows below format 3 are
+/// refused either way ([`ChainError::UnsupportedFormat`]): the Python verifier allows them only in a
+/// vault whose pinned journal format floor is lower, and such a journal is not a format 3 journal.
+pub fn verify_chain_with(
+    events: &[AuditEvent],
+    head: Option<&JournalHead>,
+    signing_key: &[u8],
+    head_required: bool,
 ) -> Result<(), ChainError> {
     let mut expected_prev = GENESIS_HASH;
     for (index, ev) in events.iter().enumerate() {
@@ -281,7 +297,7 @@ pub fn verify_chain(
         expected_prev = &ev.event_hash;
     }
 
-    let anchored = events.iter().any(|ev| ev.format >= 3);
+    let anchored = head_required || events.iter().any(|ev| ev.format >= 3);
     let head = match head {
         None if anchored => return Err(ChainError::MissingHead),
         None => return Ok(()),

@@ -11,8 +11,14 @@ publish = false
 
 [lib]
 name = "kibisis_native"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# maturin builds with the default; `cargo test --no-default-features` links the crate's own tests
+# against the interpreter instead (an extension module has no libpython to link its tests with).
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 kibisis = { path = "../.." }
-pyo3 = { version = "0.30", features = ["extension-module", "abi3-py311"] }
+pyo3 = { version = "0.30", features = ["abi3-py311"] }

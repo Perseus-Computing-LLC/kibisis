@@ -37,6 +37,7 @@ def _no_passphrase_from_environment(monkeypatch):
 def fallback(monkeypatch):
     """Run as when the sqlcipher3 driver fails to load: the vault file is plain SQLite."""
     monkeypatch.setattr(vault_module, "sqlcipher3", sqlite3)
+    monkeypatch.setenv("KIBISIS_ALLOW_PLAINTEXT", "1")  # fallback mode is opt-in: the file is plain on disk
 
 
 def _raw(db):
@@ -219,6 +220,7 @@ def _stored_state(db):
 def test_upgrade_from_0_1_0a5(tmp_path, monkeypatch, mode):
     if mode == "fallback":
         monkeypatch.setattr(vault_module, "sqlcipher3", sqlite3)
+        monkeypatch.setenv("KIBISIS_ALLOW_PLAINTEXT", "1")  # fallback mode is opt-in: the file is plain on disk
     elif not vault_module._sqlcipher_available():
         pytest.skip("sqlcipher3 is not installed")
     db = _legacy_copy(tmp_path)
@@ -243,7 +245,7 @@ def test_upgrade_from_0_1_0a5(tmp_path, monkeypatch, mode):
         assert vault.adopt_unsigned_entries(author_id="human:reviewer") == 1
         assert vault.get(category, key, scope=scope).content == content
         assert vault.integrity_status() == {
-            "integrity_format": 2, "entries": len(LEGACY) + 1, "unsigned": 0, "legacy_signature": 0, "unbound": 0,
+            "integrity_format": 3, "entries": len(LEGACY) + 1, "unsigned": 0, "legacy_signature": 0, "unbound": 0,
         }
         events = vault.list_audit_events(limit=1000)
         assert [e.action for e in events][-2:] == ["migrate", "adopt"]

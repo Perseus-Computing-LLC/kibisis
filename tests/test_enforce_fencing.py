@@ -192,8 +192,8 @@ WRITES = {
     "purge": lambda v, kw: v.purge("notes", "existing", **kw),
     "tombstone": lambda v, kw: v.tombstone("notes", "existing", **kw),
     "admit_candidate": lambda v, kw: v.admit_candidate("notes", "new", "new value", **kw),
-    "review_entity": lambda v, kw: v.review_entity("notes", "candidate", "verified", **kw),
-    "review_entity_revoked": lambda v, kw: v.review_entity("notes", "candidate", "revoked", **kw),
+    "review_entity": lambda v, kw: v.review_entity("notes", "candidate", "verified", reviewer_id="r", **kw),
+    "review_entity_revoked": lambda v, kw: v.review_entity("notes", "candidate", "revoked", reviewer_id="r", **kw),
     "set_persona_slot": lambda v, kw: v.set_persona_slot("prefers short answers", **kw),
     "import_snapshot": lambda v, kw: v.import_snapshot(_snapshot(), **kw),
 }

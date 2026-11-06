@@ -95,6 +95,7 @@ class TestNegativeProbeAbstention(unittest.TestCase):
             key="revoked_rule",
             content="Old password rotation policy every 30 days",
             epistemic_state=EpistemicState.REVOKED.value,
+            origin="user",  # a retirement is a person's verdict; an origin-less write is stored as a candidate
         )
         self.vault.store(
             category="policy",

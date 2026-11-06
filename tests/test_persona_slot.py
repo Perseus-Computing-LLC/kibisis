@@ -1,6 +1,7 @@
 """Tests for Kibisis dedicated user persona / preference slot and ContextItem conversion."""
 
 import pytest
+from kibisis._operator import account_identity
 from kibisis import EpistemicState, SQLiteMemoryVault
 
 
@@ -65,7 +66,7 @@ def test_persona_slot_below_quorum_is_a_pending_candidate():
     vault = SQLiteMemoryVault(":memory:", allow_plaintext=True, verification_quorum=2)
     ent = vault.set_persona_slot(content="User prefers terse answers.", author_id="alice")
     assert ent.epistemic_state == EpistemicState.CANDIDATE
-    assert ent.metadata["attestations"] == ["alice"]
+    assert ent.metadata["attestations"] == [account_identity()]  # the account attests; author_id is a label
     assert ent.metadata["verification_pending"] == {"have": 1, "need": 2}
     assert vault.get_persona_slot() is not None
     vault.close()

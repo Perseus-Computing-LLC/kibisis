@@ -7,16 +7,41 @@ them here and approves, disputes or rejects them:
     python -m kibisis.review approve CATEGORY KEY [--notes TEXT]
     python -m kibisis.review dispute CATEGORY KEY [--notes TEXT]
     python -m kibisis.review reject  CATEGORY KEY [--notes TEXT]
+    python -m kibisis.review lift    CATEGORY KEY [--digest HEXPREFIX]
 
-``approve``, ``dispute`` and ``reject`` need a terminal on stdin, as ``kibisis admit`` does, and record
-the operating-system account they run as, read from the process's user id. ``--reviewer`` adds a label
-beside the account; it does not change who reviewed.
+``approve``, ``dispute``, ``reject`` and ``lift`` need a terminal on stdin, as ``kibisis admit`` does,
+and record the operating-system account they run as, read from the process's user id. ``--reviewer``
+adds a label beside the account; it does not change who reviewed. The terminal check stops pipes and
+cron jobs; a process that can allocate a pseudo-terminal passes it, so it is a guard against accident,
+not against an agent that has a shell.
 
-Approving records one account's approval. The entry becomes verified once ``KIBISIS_VERIFICATION_QUORUM``
-distinct accounts have approved it (two unless set; a person who wrote the entry as verified counts as
-one), and any supersession it proposed is applied then. Until then it stays a candidate, and a second
+Every run prints the vault path and the scope it resolved, and a verdict on an entry that is not in
+that scope lists the scopes that do hold the entry, so the person can set ``KIBISIS_SCOPE``.
+
+``lift`` removes the tombstones recorded under ``CATEGORY KEY`` (``--digest`` narrows it to one value)
+and journals each as ``tombstone_lifted``; the value may be written again afterwards. It is the only
+way past a principal-class tombstone (one a person made, or one made before tombstones had classes).
+A tombstone the agent made through ``kibisis_forget`` is model-class: a person's later write of the
+value lifts it on its own.
+
+Approving a candidate that proposed to supersede a verified entry retires that entry; ``list`` says so
+beside the candidate and ``approve`` repeats it.
+
+Approving records one account's approval. The entry becomes verified once the vault's verification
+quorum of distinct accounts have approved it (a person who wrote the entry as verified counts as one),
+and any supersession it proposed is applied then. Until then it stays a candidate, and a second
 approval from the same account changes nothing. Rejecting deletes the entry and records a tombstone, so
 the same value cannot be written, restored or imported again in that scope.
+
+The quorum is two accounts by default, and that is only a default until a person's first verdict (or
+``kibisis admit``) pins it in the vault file: the verdict commands store the quorum they run with
+(``KIBISIS_VERIFICATION_QUORUM``, else 2), and may raise it later but never lower it. ``list``, the
+servers and library opens never pin; they adopt the pinned value, and refuse to adopt one below the
+default unless their own ``KIBISIS_VERIFICATION_QUORUM`` names it. Every run prints the quorum in
+force (``quorum 1 — one account verifies``) beside the vault path.
+
+``list`` opens the vault read-only: it creates, converts, upgrades and pins nothing, and says so when
+the vault needs a writable open first (a verdict or the server does that).
 
 ``list`` also shows the agent's requests to forget an entry a person reviewed. The MCP server refuses
 those and journals the request; a person carries one out by rejecting the entry, and reviewing the entry
@@ -29,12 +54,17 @@ The vault, key and scope come from the same environment variables as the MCP ser
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import time
 from datetime import datetime, timezone
 from typing import Any, List, Optional
 
 from ._operator import NotInteractive, account_identity, require_terminal
-from .config import ConfigError, open_vault, resolve_scope
+from .config import (
+    ADOPT_KEYLESS_FLAG, ENV_VERIFICATION_QUORUM, ConfigError, cli_refusal_text, default_db_path, open_vault,
+    parse_verification_quorum, resolve_scope,
+)
 from .models import EpistemicState
 from .protocols import EncryptionRequiredError
 
@@ -59,7 +89,84 @@ def _parser() -> argparse.ArgumentParser:
             "--reviewer",
             help="label to record beside your account; the quorum counts accounts, not labels",
         )
+        _add_adopt_keyless(cmd)
+    lift = sub.add_parser("lift", help="remove the tombstones under CATEGORY KEY so the value may be written again (needs a terminal)")
+    lift.add_argument("category")
+    lift.add_argument("key")
+    lift.add_argument("--digest", help="hex digest (or prefix) of the one tombstoned value to lift")
+    _add_adopt_keyless(lift)
     return parser
+
+
+def _add_adopt_keyless(cmd: argparse.ArgumentParser) -> None:
+    """The one opt-in for giving a passphrase to a plain vault that holds entries (R5-1); only on the
+    commands behind the terminal check, never on ``list``, the servers or the OKF commands."""
+    cmd.add_argument(
+        "--adopt-keyless",
+        action="store_true",
+        help=(
+            "at the open, before this verdict runs: adopt the entries of a vault file that has no salt (written "
+            "without a passphrase) into this keyed vault, each stored as a model-origin candidate; a keyed vault "
+            "whose records were removed looks the same, so the open is refused without the flag. The adoption "
+            "is written even when the verdict itself is then refused"
+        ),
+    )
+
+
+def _adoption_line(vault: Any) -> Optional[str]:
+    """What the latest migration adopted from a keyless file (R5-1), or None: those entries are
+    candidates on nobody's word until a person reviews them."""
+    report = getattr(vault, "keyless_adoption", None)
+    adopted = report() if callable(report) else None
+    if not adopted:
+        return None
+    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(adopted["at"]))
+    n = adopted["entries"]
+    where = (
+        f"journal sequence {adopted['sequence']}" if adopted.get("sequence") is not None
+        else "in memory only: this read-only open wrote nothing"
+    )
+    events = adopted.get("events") or 0
+    chained = f", with {events} of the file's journal events chained on its word" if events else ""
+    return (
+        f"{n} {'entry' if n == 1 else 'entries'} adopted from a keyless file on {when} ({where}){chained}: "
+        "candidates until reviewed; nothing in the file vouched for them"
+    )
+
+
+def _supersession_notice(vault: Any, entity: Any, scope: str) -> Optional[str]:
+    """What approving ``entity`` does to the entry it proposed to supersede, or ``None``."""
+    proposal = (entity.metadata or {}).get("proposed_supersedes")
+    if not isinstance(proposal, dict):
+        return None
+    category, key = proposal.get("category"), proposal.get("key")
+    if not category or not key:
+        return None
+    target = vault.get(category, key, scope=scope)
+    state = _state(target) if target is not None else "missing"
+    return f"approving retires {category}:{key} ({state})"
+
+
+def _scopes_holding(vault: Any, category: str, key: str) -> List[str]:
+    """Scopes that hold an entry ``category:key`` (any state, archived or not)."""
+    cursor = vault._conn.cursor()
+    cursor.execute(
+        "SELECT DISTINCT scope FROM entities WHERE category = ? AND key = ? ORDER BY scope", (category, key)
+    )
+    return [row[0] for row in cursor.fetchall()]
+
+
+def _not_found(vault: Any, category: str, key: str, scope: str, stream: Any = None, prog: str = "kibisis-review") -> None:
+    """Explain a missing entry: the scope it was looked up in and the scopes that do hold it."""
+    stream = stream or sys.stderr
+    print(f"{prog}: {category}:{key} is not in scope {scope!r}.", file=stream)
+    held = _scopes_holding(vault, category, key)
+    if held:
+        print(
+            f"{prog}: it exists in scope(s) {', '.join(repr(s) for s in held)}; "
+            f"set KIBISIS_SCOPE to one of them (or run from that checkout) and retry.",
+            file=stream,
+        )
 
 
 def _state(entity: Any) -> str:
@@ -81,6 +188,9 @@ def _list(vault: Any, scope: str, category: Optional[str]) -> int:
         pending = meta.get("verification_pending")
         approvals = f", approvals {pending['have']} of {pending['need']}" if pending else ""
         print(f"{entity.category}:{entity.key}  (author {author}, version {entity.version}{approvals})")
+        notice = _supersession_notice(vault, entity, scope)
+        if notice:
+            print(f"    ! {notice}")
         for line in (entity.content or "").splitlines() or [""]:
             print(f"    {line}")
     if requests:
@@ -94,6 +204,36 @@ def _list(vault: Any, scope: str, category: Optional[str]) -> int:
     return 0
 
 
+def _quorum_line(vault: Any) -> str:
+    """One line saying how many accounts verify an entry in this vault, and whether that is pinned."""
+    quorum = vault.verification_quorum
+    stored = getattr(vault, "verification_quorum_stored", None)
+    who = "one account verifies" if quorum == 1 else f"{quorum} accounts verify"
+    dropped = getattr(vault, "quorum_dropped_from", None)
+    tail = ""
+    if dropped is not None:
+        tail = (
+            f"; a pinned {dropped} was dropped under a legacy meta MAC: the next verdict must run under "
+            f"{ENV_VERIFICATION_QUORUM}={dropped} (or name the quorum it means) to pin again"
+        )
+    if stored is None:
+        return f"quorum {quorum} — {who} (default until a verdict pins it){tail}"
+    return f"quorum {quorum} — {who} (pinned in the vault){tail}"
+
+
+def _refusal_text(command: str, exc: BaseException) -> str:
+    """The vault's refusal worded for the command that got it. ``list`` is a read and does not take
+    ``--adopt-keyless`` (only the verdicts and ``lift``, behind the terminal check, adopt; R7-2), so a
+    refused ``list`` names those commands instead of a flag it does not have."""
+    text = cli_refusal_text(exc)
+    if command == "list":
+        text = text.replace(
+            ADOPT_KEYLESS_FLAG,
+            f"open it with a verdict command ({', '.join(_VERDICTS)} or lift) and --adopt-keyless",
+        )
+    return text
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parser().parse_args(argv)
     if args.command != "list":
@@ -105,16 +245,50 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 3
     try:
         scope = resolve_scope()
-        vault = open_vault()
+        db_path = default_db_path()
+        if args.command == "list":
+            # A read: open the file as it is. Nothing here may create, convert, upgrade or re-sign the
+            # vault, and in particular nothing here may pin its quorum; that is a verdict's job.
+            parse_verification_quorum(os.environ.get(ENV_VERIFICATION_QUORUM))  # a bad value is a refusal even with no vault
+            if db_path == ":memory:" or not os.path.isfile(db_path):
+                print(f"vault {db_path}  scope {scope!r}", file=sys.stderr)
+                print(f"No vault at {db_path} yet; nothing to review.")
+                return 0
+            vault = open_vault(db_path, read_only=True)
+        else:
+            vault = open_vault(db_path, pin_quorum=True, adopt_keyless=bool(getattr(args, "adopt_keyless", False)))
     except (ConfigError, EncryptionRequiredError) as exc:
-        print(f"kibisis-review: {exc}", file=sys.stderr)
+        print(f"kibisis-review: {_refusal_text(args.command, exc)}", file=sys.stderr)
         return 2
+    except (ValueError, PermissionError) as exc:  # wrong passphrase, not a vault, needs a writable open first
+        print(f"kibisis-review: {_refusal_text(args.command, exc)}", file=sys.stderr)
+        return 2
+    print(f"vault {db_path}  scope {scope!r}", file=sys.stderr)
+    print(_quorum_line(vault), file=sys.stderr)
+    adoption = _adoption_line(vault)
+    if adoption:
+        print(adoption, file=sys.stderr)
 
     try:
         if args.command == "list":
             return _list(vault, scope, args.category)
 
         reviewer = account_identity()
+        if args.command == "lift":
+            lifted = vault.lift_tombstone(
+                args.category, args.key, scope=scope, digest=args.digest, author_id=reviewer, origin="user"
+            )
+            if not lifted:
+                print(f"kibisis-review: no tombstone under {args.category}:{args.key} in scope {scope!r}.", file=sys.stderr)
+                return 1
+            print(f"Lifted {lifted} tombstone(s) under {args.category}:{args.key} in scope {scope!r} (account {reviewer}).")
+            return 0
+
+        before = vault.get(args.category, args.key, scope=scope)
+        if before is None:
+            _not_found(vault, args.category, args.key, scope)
+            return 1
+        notice = _supersession_notice(vault, before, scope) if args.command == "approve" else None
         try:
             entity = vault.review_entity(
                 category=args.category,
@@ -139,8 +313,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"{args.category}:{args.key} has {pending['have']} of {pending['need']} approvals (account "
                 f"{reviewer}{label}); it stays a candidate until another account approves it."
             )
+            if notice:
+                print(f"    ! {notice} once the quorum is met")
         else:
-            print(f"{args.category}:{args.key} is now {_state(entity)} (account {reviewer}{label}).")
+            loud = f"; quorum {vault.verification_quorum} — one account verifies" if vault.verification_quorum == 1 else ""
+            print(f"{args.category}:{args.key} is now {_state(entity)} (account {reviewer}{label}{loud}).")
+            if notice:
+                print(f"    ! {notice.replace('approving retires', 'this approval retired')}")
         return 0
     finally:
         vault.close()

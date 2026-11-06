@@ -31,6 +31,7 @@ import html
 import json
 import re
 import sys
+import time
 import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional
@@ -38,7 +39,7 @@ from typing import Any, Dict, List, Mapping, Optional
 from .config import ConfigError, open_vault, resolve_scope, validate_scope
 from .models import EpistemicState, MemoryEntity
 from .protocols import EncryptionRequiredError
-from .vault import ReviewedEntryError, SQLiteMemoryVault, TombstonedValueError
+from .vault import OriginClassError, ReviewedEntryError, SQLiteMemoryVault, SupersededEntryError, TombstonedValueError
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "kibisis-mcp"
@@ -51,6 +52,8 @@ RECALL_NOTICE = (
 )
 
 _TEXT = {"type": "string"}
+#: Longest key the MCP tools accept (F12: keys are digested against tombstones like content).
+MAX_KEY_LENGTH = 128
 _NUMBER = {"type": "number"}
 
 TOOL_DEFINITIONS: List[Dict[str, Any]] = [
@@ -64,7 +67,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "category": {**_TEXT, "description": "Category, such as convention, decision or insight.", "default": "general"},
-                "key": {**_TEXT, "description": "Key, unique within the category."},
+                "key": {**_TEXT, "maxLength": 128, "description": "Key, unique within the category (at most 128 characters)."},
                 "content": {**_TEXT, "description": "The text to store."},
                 "valid_from": {**_NUMBER, "description": "Optional Unix time from which the entry is valid."},
                 "valid_until": {**_NUMBER, "description": "Optional Unix time after which the entry is no longer valid."},
@@ -165,7 +168,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     },
     {
         "name": "kibisis_health",
-        "description": "Report the vault's scope, entry counts and encryption state.",
+        "description": "Report the vault's scope, entry counts, encryption state and verification quorum.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "annotations": {
             "title": "Health",
@@ -378,6 +381,8 @@ class KibisisMCPServer:
         if method == "tools/list":
             return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOL_DEFINITIONS}}
         if method == "tools/call":
+            if not isinstance(params, dict):
+                return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": "params must be an object"}}
             return self._call_tool(req_id, params.get("name"), params.get("arguments") or {})
 
         if req_id is not None:
@@ -400,6 +405,21 @@ class KibisisMCPServer:
             return _result(req_id, f"Refused: {exc}", is_error=True)
         except TombstonedValueError as exc:
             # The vault has already journaled this refusal.
+            return _result(req_id, f"Refused: {exc}", is_error=True)
+        except PermissionError as exc:
+            # A policy refusal (OriginClassError, SupersededEntryError, ReviewedEntryError a tool body did
+            # not map, ...): tell the agent not to retry, with no traceback. The vault journals an
+            # origin-class refusal itself (``origin_class_refused``); the others are journaled here.
+            if not isinstance(exc, OriginClassError):
+                self.vault.record_refusal(
+                    path="mcp",
+                    reason="superseded_refused" if isinstance(exc, SupersededEntryError) else "permission_refused",
+                    scope=self.scope,
+                    category=str(args.get("category") or "") if isinstance(args, dict) else "",
+                    key=str(args.get("key") or "") if isinstance(args, dict) else "",
+                    author_id=MCP_AUTHOR,
+                    detail={"tool": str(name)[:64], "error": type(exc).__name__},
+                )
             return _result(req_id, f"Refused: {exc}", is_error=True)
         except (KeyError, ValueError, TypeError) as exc:
             message = exc.args[0] if isinstance(exc, KeyError) and exc.args else str(exc)
@@ -462,6 +482,10 @@ class KibisisMCPServer:
     def _remember(self, args: Dict[str, Any]) -> Dict[str, Any]:
         category = _required(args, "category", default="general")
         key = _required(args, "key")
+        if len(key) > MAX_KEY_LENGTH:
+            # A key is a name, and names are matched against tombstones (a value does not become
+            # storable by being filed as a key); a short cap keeps that check cheap and honest.
+            raise ValueError(f"'key' must be at most {MAX_KEY_LENGTH} characters")
         content = _required(args, "content")
         extra = args.get("metadata")
         if extra is not None and not isinstance(extra, dict):
@@ -599,8 +623,26 @@ class KibisisMCPServer:
         for row in cursor.fetchall():
             by_state[row["epistemic_state"]] = int(row["n"])
             plaintext += int(row["plain"])
+        quorum = int(self.vault.verification_quorum)
+        stored = getattr(self.vault, "verification_quorum_stored", None)
+        report = getattr(self.vault, "keyless_adoption", None)
+        adopted = report() if callable(report) else None
+        if adopted:
+            when = time.strftime("%Y-%m-%d", time.gmtime(adopted["at"]))
+            adoption: Any = {
+                "entries": adopted["entries"],
+                "journal_events": adopted.get("events", 0),
+                "at": adopted["at"],
+                "note": (
+                    f"{adopted['entries']} entries adopted from a keyless file on {when}: candidates on nobody's "
+                    "word until a person reviews them (R5-1)"
+                ),
+            }
+        else:
+            adoption = None
         return {
             "status": "healthy",
+            "keyless_adoption": adoption,
             "scope": self.scope,
             "active_entities": sum(by_state.values()),
             "by_state": by_state,
@@ -608,6 +650,14 @@ class KibisisMCPServer:
                 "whole_file": bool(getattr(self.vault, "_sqlcipher_active", False)),
                 "entry_key": bool(self.vault.passphrase),
                 "plaintext_entries": plaintext,
+            },
+            "verification_quorum": {
+                "accounts": quorum,
+                "pinned": stored is not None,
+                "note": (
+                    "quorum 1 — one account verifies" if quorum == 1
+                    else f"quorum {quorum} — {quorum} accounts verify"
+                ) + ("" if stored is not None else " (default until a verdict pins it)"),
             },
         }
 
@@ -620,6 +670,8 @@ def run_stdio_server() -> int:
         print(f"{SERVER_NAME}: {exc}", file=sys.stderr)
         return 2
     print(f"{SERVER_NAME}: serving scope {server.scope!r} from {server.vault.db_path}", file=sys.stderr)
+    if server.vault.verification_quorum == 1:
+        print(f"{SERVER_NAME}: quorum 1 — one account verifies", file=sys.stderr)
     for line in sys.stdin:
         line = line.strip()
         if not line:

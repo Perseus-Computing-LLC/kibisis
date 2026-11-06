@@ -7,6 +7,146 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **Write trust boundary.** A `model`, `tool` or `unknown` origin can only write `candidate` entries: any other
+  `epistemic_state` (`revoked` included) is capped and recorded as `trust_capped_from`, and `author_id`,
+  `last_verified_at`, `supersession`, `proposed_supersedes` and `slot` move under `agent_metadata`, so an agent's
+  write no longer moves recall's TTL clock. A cascade started by such a write no longer changes a higher-class
+  or person-reviewed dependent; it adds an `invalidation_notice` to that entry's metadata and stops there.
+- **Review doors.** `review_entity` refuses any `reviewer_origin` other than `user` (`PermissionError`) and a
+  verdict with no `reviewer_id` (`ValueError`); `put()` / `put_batch()` no longer accept the internal review
+  arguments (`TypeError`). A user-origin write or review attests as the operating-system account running the
+  process, never as `author_id` / `reviewer_id`; `attester=` is honoured only on a vault opened with
+  `trust_caller_identity=True`, and `principal` or an empty name is never a signer. A principal's write of
+  different content over an attested entry resets its attestations and the quorum starts over.
+- **Tombstones carry a class.** Each tombstone records the `origin_class` of whoever made it (older rows count as
+  `principal`). A higher-class write lifts a lower-class tombstone (journaled `tombstone_lifted`); a
+  principal-class tombstone blocks everyone until a person lifts it with `kibisis-review lift CATEGORY KEY
+  [--digest PREFIX]` or `lift_tombstone()`, which refuses a `model`, `tool` or `unknown` `origin`. A class never
+  goes down (`tombstone_reaffirmed`). MCP `kibisis_forget` records a model-class tombstone.
+- **Tombstone checks apply everywhere.** `tombstone(content=...)` runs the protected-entry check first and deletes
+  nothing when `content` does not match the stored value; a non-principal origin cannot tombstone `scope="*"`;
+  `purge()`, `archive()` and `set_persona_slot()` take `origin` and run the same check. The entry key and every
+  string in the caller's metadata (keys and values) are digested against tombstones; the vault's bookkeeping
+  strings are not. The canonical fold drops nonspacing marks and default-ignorable code points, folds a small
+  table of Latin/Cyrillic/Greek homoglyphs and turns Hangul fillers into spaces; the Rust fold is unchanged.
+- **Signed tombstones and journal continuity (integrity format 3).** Every tombstone row carries an HMAC verified
+  at open and on every hit; a journaled tombstone whose row is missing, or whose stored class is lower than the
+  journal says, refuses the open. A keyed vault pins the lowest journal format it has held, whether it ever held
+  a row, and the highest sequence a signed head covers (`journal_high_water`): rows cannot be rewritten in the
+  unkeyed format 1 layout, an append on a journal that no longer ends at the signed head is refused
+  (`VaultIntegrityError`), and `verify_audit_chain()` is False when the journal ends below the mark, so a wipe is
+  not laundered by the next write. The verifier streams the journal (no row cap), refuses rows above the
+  supported format and reports unreadable metadata through `vault.last_chain_error` instead of raising.
+- **Key check and meta MAC before anything is written.** `key_check` is compared before any migration or SQLCipher
+  conversion; a wrong passphrase leaves a plain file byte for byte unchanged, and a converted copy replaces it
+  only after it has opened, authenticated and upgraded. The vault's integrity records, journal marks and stored
+  `verification_quorum` are bound under one MAC; a keyed vault whose MAC is missing or wrong refuses to open. A
+  MAC over the legacy key set is re-signed at the first writable open, but no stored quorum under it is trusted:
+  it is logged at WARNING, dropped, remembered as `quorum_dropped_from`, and the next verdict re-pins it. Removing
+  `kdf_salt` while a key check, MAC, format 2+ record or sealed row remains is refused. A salted vault with no
+  key check migrates only when it is a genuine 0.1.0a5 file; any witness of a later format, any plaintext or
+  unopenable row, or an empty entity table beside unpurged `put` events refuses the open with nothing written.
+  An envelope naming another salt is refused.
+- **Keyless adoption is opt-in and never trusting.** A keyed open of a file with no salt that holds any content
+  (entries, tombstones, journal events, or `vault_meta` records a first open does not write) is refused unless
+  `adopt_keyless=True` / `--adopt-keyless` is passed. Adopted rows are stored as a model-origin write would be:
+  `candidate`, agent class, principal-only keys under `agent_metadata`, supersession and `tenant_id` dropped,
+  sealed on disk, stamped `adopted_from_keyless_file`. A keyless file with a tombstone row, or a journal and no
+  entries, is never adoptable; a planted `verification_quorum`, `quorum_dropped_from` or `journal_high_water` is
+  dropped with a WARNING; a file with no `entities` table is refused. A read-only open adopts in memory only.
+- **Quorum pinning.** The stored `verification_quorum` is written only by a pinning open (`pin_quorum=True`: the
+  `kibisis-review` verdicts and `kibisis admit`, behind their terminal check). Every other open adopts the stored
+  value or runs with its own and writes nothing; a stored quorum below the default is adopted only by a process
+  whose own argument or `KIBISIS_VERIFICATION_QUORUM` names it, otherwise `ConfigError` says what to set.
+  `open_vault(env=...)` reads `KIBISIS_VERIFICATION_QUORUM` from its mapping, not from `os.environ`.
+- **Snapshot trust.** `import_snapshot` keeps attestations, pending verifications and reviews only when the
+  snapshot's passphrase-sealed `trust_seal` opens here and `manifest_sha256` verifies; otherwise they are dropped
+  (journaled) and the state re-derived. A vault without a passphrase never keeps trust facts from a file. `origin`
+  and `author_id` are exported and restored, so a verified entry round-trips intact in its own vault. The restore
+  is one transaction, imported tombstones are journaled, a foreign snapshot leaves a reviewed or higher-class row
+  in place, and a tombstone's class comes from the file only under a seal naming the tombstones, else it is
+  capped at the importer's `origin`.
+- **Integrity failures are not silent.** A row that fails its check is left out of search, listing, export and
+  `forget_requests` with a WARNING, counted in `vault.integrity_failures`, and raises `EntryIntegrityError` on a
+  vault opened with `strict=True`. With a passphrase but no `sqlcipher3`, an on-disk vault is refused with
+  `EncryptionRequiredError` unless `allow_plaintext=True` or `KIBISIS_ALLOW_PLAINTEXT=1`.
+- **Leases.** `FileLeaseCoordinator` keeps a per-resource highest-token file, so deleting or rolling back the state
+  file cannot reissue a fencing token; a lease whose deadline has arrived can neither be renewed nor fence a write.
+- **MCP, AML and CLI hardening.** The MCP server maps any `PermissionError` to a `Refused:` tool result with no
+  traceback, answers non-object `params` with JSON-RPC `-32602`, and caps `kibisis_remember` keys at 128
+  characters. `kibisis aml-serve` checks the credential before routing (every unauthenticated `POST`, and
+  `Expect: 100-continue`, is `401`), closes idle connections after `--socket-timeout`, caps handler threads at
+  `--max-connections` (`503`), refuses `NaN`/`Infinity`, lone surrogates and out-of-range timestamps, answers a
+  reused `request_id` with a different payload `409`, and deletes only real vault files at retention. The OKF
+  commands resolve the vault like every other subcommand (`--db`, `KIBISIS_DB_PATH`, default path) through
+  `config.open_vault`; `okf-export` and `okf-import --dry-run` open it read-only and leave its bytes unchanged.
+
+### Changed
+- `INTEGRITY_FORMAT` is 3. The first writable open of a format 2 vault with its passphrase upgrades it in one
+  transaction; older versions cannot open an upgraded vault. A keyed format 1 file with any plaintext,
+  undecryptable or malformed row is refused as a whole instead of migrated with `entries_undecryptable > 0`.
+- Giving a passphrase to a plaintext vault that holds entries needs `adopt_keyless=True` (library) or
+  `--adopt-keyless` (`kibisis-review` verdicts and `lift`, `kibisis admit`); the adopted entries come back as
+  `origin="model"` candidates until a person reviews them. `kibisis-review list`, the servers and the OKF
+  commands never adopt.
+- A library open never stores the quorum. Opening a vault with a smaller `verification_quorum` than it stored,
+  or a vault pinned at 1 without naming 1, raises `ConfigError`; a file whose MAC predates quorum binding loses
+  its pin until the next verdict re-pins it. `put(origin="user", epistemic_state="verified")` from one process is
+  one attestation whatever `author_id` says; a quorum of two needs two accounts.
+- A snapshot restored into a vault under another passphrase keeps its entries' origin and author but not their
+  verdicts; a keyless vault's own export restores `verified` / `disputed` entries as `candidate`.
+- `kibisis-review list` opens the vault read-only (a missing vault is "nothing to review") and prints the quorum
+  in force and any keyless adoption; it and `kibisis admit` print the resolved vault path and scope and, when the
+  entry is elsewhere, the scopes that hold it. A refused open prints one line and exits 2.
+- `kibisis aml-serve` answers malformed or unexpected input with `400`/`422` instead of `500`, and exits 2 before
+  binding when a passphrase is set without `sqlcipher3` and without `KIBISIS_ALLOW_PLAINTEXT`.
+
+### Added
+- `SQLiteMemoryVault` / `config.open_vault` keywords `strict`, `read_only`, `pin_quorum`, `adopt_keyless`,
+  `allow_plaintext` and `trust_caller_identity`; `KIBISIS_ALLOW_PLAINTEXT`; `origin` on `purge()`, `archive()`,
+  `set_persona_slot()`, `lift_tombstone()` and `import_snapshot()`.
+- `kibisis.VaultIntegrityError`, `kibisis.EntryIntegrityError`, `kibisis.EncryptionRequiredError`,
+  `kibisis.vault.ReadOnlyVaultError`; `vault.integrity_failures`, `vault.last_chain_error`,
+  `vault.encrypted_at_rest`, `vault.verification_quorum_stored`, `vault.quorum_dropped_from`, `vault.keyless_adoption()`.
+- `kibisis-review lift CATEGORY KEY [--digest PREFIX]`; `--adopt-keyless` on the verdicts, `lift` and `kibisis
+  admit`; `kibisis-review list` marks a candidate that `approving retires <cat>:<key>`, and forget requests are
+  journaled as their own `forget_request` action so other refusals cannot hide them.
+- `kibisis_health` reports `verification_quorum` (`accounts`, `pinned`, `note`) and `keyless_adoption`.
+- `kibisis aml-serve --socket-timeout` and `--max-connections`; `--gate-verbose` on the OKF commands.
+- Rust: `kibisis::journal::verify_chain_with(.., head_required)` and `kibisis_native.verify_chain`, with the same
+  rules in Python's `kibisis._vault_audit.ChainVerifier`. `extension-module` is a default feature of
+  `bindings/python`, so `cargo test --no-default-features` runs the crate's own tests.
+
+### Fixed
+- `kibisis aml-serve`: a stored row with an unrenderable timestamp or unusable metadata no longer makes Search
+  answer `500`; malformed chunk sizes are `400`; `401` and `404` drain the body and close the connection; the
+  retention thread survives a failed sweep and a Search counts as activity; `server_bind` does no reverse DNS.
+- `kibisis_native.FileLeaseCoordinator` no longer raises `RuntimeError: Already borrowed` under concurrent calls,
+  and a `ttl_seconds` past the supported range is a `ValueError`, not a panic.
+- A vault holding `tombstone_lifted` events written before this release, or a lift of a global `*` row,
+  reconciles at open instead of refusing both open modes.
+- A read-only open runs the key check before the upgrade refusal, so a wrong passphrase is reported as such; a
+  non-integer `integrity_format` is a `VaultIntegrityError` naming it.
+- `KIBISIS_VERIFICATION_QUORUM` is validated (positive decimal only) and a bad value prints one line (exit 2).
+- `kibisis-review list` refused on a keyless file no longer suggests a flag it does not accept; the OKF commands'
+  import-time `DEFAULT_DB_PATH` is gone (a lazy alias of `default_db_path()` remains).
+
+### Documentation
+- SECURITY.md and README state the residual limits: the terminal check stops pipes and cron jobs but not an agent
+  that can allocate a pseudo-terminal in the operator's account, and a same-uid shell can run the review CLI; a
+  reset to a salted file with no entry, tombstone or journal event is an empty vault the discriminator cannot tell
+  from a fresh one (the operator sees a `migrate` event with `empty_keyed_file`); keyless adoption is an opt-in
+  that stores agent-class candidates only; a restore of the vault's own snapshot is a point-in-time replay of the
+  reviews too (a later rejection still wins); `import_snapshot(origin=None)` is principal, so a library caller
+  relaying an agent's file must pass the agent's `origin`; treat snapshot files like the database file; deleting
+  a lease's highest-token or lock file is out of scope.
+- SECURITY.md gains threat-model rows for the `aml-serve` network client and the OKF bundle author, and says a
+  read-only open may leave an empty `-wal`/`-shm` beside a WAL-mode vault. `deploy/aml/README.md` covers
+  `--plaintext`, retries and `409`, the timestamp rule, `--max-inflight` vs `--max-connections`, retention and
+  draining. README documents the tombstone fold limits, forget/lift, the fencing highest-token file and the
+  quorum default.
+
 ## [0.1.0-alpha.16] - 2026-11-05
 
 ### Changed

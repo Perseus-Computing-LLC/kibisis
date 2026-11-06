@@ -15,6 +15,7 @@ import os
 
 import pytest
 
+from kibisis._operator import account_identity
 from kibisis import EpistemicState, SQLiteMemoryVault
 from kibisis.vault import OriginClassError, ORIGIN_CLASSES, origin_class_of
 
@@ -22,6 +23,8 @@ from kibisis.vault import OriginClassError, ORIGIN_CLASSES, origin_class_of
 @pytest.fixture(autouse=True)
 def _no_live_ledger(monkeypatch):
     monkeypatch.setenv("ARGUS_LEDGER_PATH", "")
+
+ME = account_identity()
 
 
 @pytest.fixture
@@ -73,25 +76,33 @@ def test_default_quorum_is_two_and_env_overrides(monkeypatch):
 
 
 def test_single_principal_write_is_one_attestation_not_verified(vault):
+    # The attester is the account running the process; author_id is a label.
     e = vault.put("notes", "k", "fact", epistemic_state="verified", origin="user", author_id="alice")
     assert e.epistemic_state == EpistemicState.CANDIDATE
-    assert e.metadata["attestations"] == ["alice"]
+    assert e.metadata["attestations"] == [ME]
+    assert e.metadata["author_id"] == "alice"
     assert e.metadata["verification_pending"] == {"have": 1, "need": 2}
 
 
-def test_second_independent_principal_review_reaches_quorum(vault):
-    vault.put("notes", "k", "fact", epistemic_state="verified", origin="user", author_id="alice")
-    e = vault.review_entity("notes", "k", verdict="verified", reviewer_id="bob")
-    assert e.epistemic_state == EpistemicState.VERIFIED
-    assert sorted(e.metadata["attestations"]) == ["alice", "bob"]
-    assert "verification_pending" not in e.metadata
+def test_second_independent_principal_review_reaches_quorum():
+    # A second account needs a second identity: an embedder vault with trust_caller_identity names it.
+    v = SQLiteMemoryVault(":memory:", auto_gate=False, trust_caller_identity=True)
+    try:
+        v.put("notes", "k", "fact", epistemic_state="verified", origin="user", author_id="alice", attester="alice")
+        e = v.review_entity("notes", "k", verdict="verified", reviewer_id="bob", attester="bob")
+        assert e.epistemic_state == EpistemicState.VERIFIED
+        assert sorted(e.metadata["attestations"]) == ["alice", "bob"]
+        assert e.metadata["quorum_at_verification"] == 2
+        assert "verification_pending" not in e.metadata
+    finally:
+        v.close()
 
 
 def test_same_principal_twice_is_not_independent(vault):
     vault.put("notes", "k", "fact", epistemic_state="verified", origin="user", author_id="alice")
-    e = vault.review_entity("notes", "k", verdict="verified", reviewer_id="alice")
+    e = vault.review_entity("notes", "k", verdict="verified", reviewer_id="bob")
     assert e.epistemic_state == EpistemicState.CANDIDATE
-    assert e.metadata["attestations"] == ["alice"]
+    assert e.metadata["attestations"] == [ME]  # alice and bob were typed by the same account
 
 
 def test_quorum_one_lets_a_single_principal_write_verify():
@@ -105,9 +116,12 @@ def test_quorum_one_lets_a_single_principal_write_verify():
 
 def test_review_by_model_origin_never_counts(vault):
     vault.put("notes", "k", "fact", epistemic_state="verified", origin="user", author_id="alice")
-    e = vault.review_entity("notes", "k", verdict="verified", reviewer_id="bot", reviewer_origin="model")
+    with pytest.raises(PermissionError):
+        vault.review_entity("notes", "k", verdict="verified", reviewer_id="bot", reviewer_origin="model")
+    e = vault.get("notes", "k")
     assert e.epistemic_state == EpistemicState.CANDIDATE
-    assert e.metadata["attestations"] == ["alice"]
+    assert e.metadata["attestations"] == [ME]
+    assert "human_reviews" not in e.metadata
 
 
 def test_attestations_cannot_be_set_through_metadata(vault):
@@ -116,7 +130,7 @@ def test_attestations_cannot_be_set_through_metadata(vault):
         metadata={"attestations": ["alice", "bob", "carol"], "origin_class": "principal"},
     )
     assert e.epistemic_state == EpistemicState.CANDIDATE
-    assert e.metadata["attestations"] == ["alice"]
+    assert e.metadata["attestations"] == [ME]
 
 
 # --- K-R1: origin_class ----------------------------------------------------------------------

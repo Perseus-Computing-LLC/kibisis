@@ -34,6 +34,30 @@ class ConfigError(RuntimeError):
     """Raised when the environment does not describe a usable vault."""
 
 
+ENV_VERIFICATION_QUORUM = "KIBISIS_VERIFICATION_QUORUM"
+
+
+def parse_verification_quorum(value: Optional[str], default: int = 2) -> int:
+    """The verification quorum ``KIBISIS_VERIFICATION_QUORUM`` names: a positive decimal integer.
+
+    Surrounding whitespace is ignored. Anything else (``''``, ``abc``, ``2.0``, ``1_0``, ``0``, ``-1``)
+    raises :class:`ConfigError` with the offending value, so a bad setting is a refusal message from
+    the CLIs and the server rather than a traceback. ``None`` (unset) gives ``default``.
+    """
+    if value is None:
+        return int(default)
+    text = value.strip()
+    if not text.isdecimal() or not text.isascii():
+        raise ConfigError(
+            f"{ENV_VERIFICATION_QUORUM} must be a positive integer (number of distinct accounts that must "
+            f"attest before an entry is verified), got {value!r}"
+        )
+    quorum = int(text)
+    if quorum < 1:
+        raise ConfigError(f"{ENV_VERIFICATION_QUORUM} must be at least 1, got {value!r}")
+    return quorum
+
+
 def default_data_dir(env: Optional[Mapping[str, str]] = None, platform: Optional[str] = None) -> Path:
     """Per-user data directory: XDG on Linux, Application Support on macOS, LOCALAPPDATA on Windows."""
     env = os.environ if env is None else env
@@ -128,22 +152,82 @@ def resolve_scope(env: Optional[Mapping[str, str]] = None, cwd: Optional[str] = 
 
 
 def plaintext_allowed(env: Optional[Mapping[str, str]] = None) -> bool:
-    """True only when ``KIBISIS_ALLOW_PLAINTEXT`` is set to 1, true or yes."""
+    """True only when ``KIBISIS_ALLOW_PLAINTEXT`` is set to 1, true or yes.
+
+    The flag allows two things, both plain on disk on purpose: a vault without a passphrase, and a
+    vault with a passphrase on a host without the ``sqlcipher3`` driver (entry content sealed, the rest
+    of the file plain). :func:`open_vault` relays it to the vault for both cases.
+    """
     env = os.environ if env is None else env
     return env.get(ENV_ALLOW_PLAINTEXT, "").strip().lower() in ("1", "true", "yes")
 
 
-def open_vault(db_path: Optional[str] = None, env: Optional[Mapping[str, str]] = None) -> SQLiteMemoryVault:
-    """Open the vault the environment describes. Refuses to run without a key unless plaintext is allowed."""
+#: The keyless-adoption opt-in as the library names it in a refusal, and as the CLIs spell it.
+ADOPT_KEYLESS_KEYWORD = "pass adopt_keyless=True"
+ADOPT_KEYLESS_FLAG = "pass --adopt-keyless"
+
+
+def cli_refusal_text(exc: BaseException) -> str:
+    """A vault refusal worded for a person at a CLI: the library says ``pass adopt_keyless=True``
+    (its keyword); the commands that carry the opt-in call it ``--adopt-keyless``, and that is what
+    the person reads. Adoption happens at the open, before any verdict runs."""
+    return str(exc).replace(ADOPT_KEYLESS_KEYWORD, ADOPT_KEYLESS_FLAG)
+
+
+def open_vault(
+    db_path: Optional[str] = None,
+    env: Optional[Mapping[str, str]] = None,
+    *,
+    read_only: bool = False,
+    pin_quorum: bool = False,
+    adopt_keyless: bool = False,
+) -> SQLiteMemoryVault:
+    """Open the vault the environment describes. Refuses to run without a key unless plaintext is allowed.
+
+    Every setting comes from ``env`` (default ``os.environ``): the path, the key, the plaintext opt-in
+    and ``KIBISIS_VERIFICATION_QUORUM``, which is parsed here (:func:`parse_verification_quorum`) and
+    passed to the vault explicitly, so a scrubbed mapping isolates the vault from the process
+    environment for the quorum too. A mapping that names no quorum leaves it to the vault's default
+    and the file's stored value.
+
+    ``pin_quorum=True`` lets this open store the quorum in the vault file (on first open, or when it
+    raises the stored one). Only the review verdicts and ``admit`` pass it, behind their terminal
+    check; the servers, ``review list``, the OKF commands and embedders adopt the stored quorum and
+    never pin one.
+
+    ``adopt_keyless=True`` is the opt-in for giving a passphrase to a plain file that holds content and
+    no salt (R5-1): without it such an open is refused, since a keyed vault whose records a file
+    writer removed looks the same; with it the entries are adopted as model-origin candidates. Only the
+    operator CLIs behind the terminal check pass it (``--adopt-keyless``); the servers and the OKF
+    commands never do. The library's refusal names the keyword; a CLI prints it through
+    :func:`cli_refusal_text` so the person reads the flag they have.
+
+    ``read_only=True`` opens an existing vault without changing a byte of the vault file (no SQLCipher
+    conversion, integrity upgrade or index build; every write is refused) and does not create a missing
+    one. SQLite may still create an empty ``-wal`` and a ``-shm`` beside a WAL-mode vault and leave them;
+    the next writable open removes them.
+    """
     env = os.environ if env is None else env
     path = db_path or default_db_path(env)
     passphrase = resolve_passphrase(env=env)
     allow_plaintext = plaintext_allowed(env)
+    named = env.get(ENV_VERIFICATION_QUORUM)
+    quorum = parse_verification_quorum(named) if named is not None and named.strip() else None
     if not passphrase and not allow_plaintext:
         raise ConfigError(
             "No key: set KIBISIS_PASSPHRASE_FILE to a key file (create one with `python -m kibisis.keys PATH`) "
             "or set KIBISIS_PASSPHRASE. To store memory unencrypted on purpose, set KIBISIS_ALLOW_PLAINTEXT=1."
         )
+    if read_only:
+        if path == ":memory:" or not os.path.isfile(path):
+            raise ConfigError(f"No vault at {path} (nothing to read).")
+        return SQLiteMemoryVault(
+            path, passphrase=passphrase, allow_plaintext=allow_plaintext and not passphrase, read_only=True,
+            verification_quorum=quorum, env=env, adopt_keyless=adopt_keyless,
+        )
     if path != ":memory:":
         os.makedirs(os.path.dirname(os.path.abspath(path)), mode=0o700, exist_ok=True)
-    return SQLiteMemoryVault(path, passphrase=passphrase, allow_plaintext=allow_plaintext and not passphrase)
+    return SQLiteMemoryVault(
+        path, passphrase=passphrase, allow_plaintext=allow_plaintext, verification_quorum=quorum, env=env,
+        pin_quorum=pin_quorum, adopt_keyless=adopt_keyless,
+    )

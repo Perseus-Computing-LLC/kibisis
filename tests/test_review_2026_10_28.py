@@ -35,10 +35,10 @@ def test_tombstone_cannot_land_between_check_and_insert(tmp_path):
 
         checked = threading.Event()
         resume = threading.Event()
-        original = SQLiteMemoryVault._find_tombstone
+        original = SQLiteMemoryVault._tombstones_matching  # the write path's gate
 
-        def paused_find(cursor, scope, val_hash, can_hash):
-            result = original(cursor, scope, val_hash, can_hash)
+        def paused_find(self, cursor, scope, digests):
+            result = original(self, cursor, scope, list(digests))
             checked.set()
             resume.wait(10)
             return result
@@ -57,7 +57,7 @@ def test_tombstone_cannot_land_between_check_and_insert(tmp_path):
             except Exception as exc:  # noqa: BLE001
                 errors["b"] = exc
 
-        SQLiteMemoryVault._find_tombstone = staticmethod(paused_find)
+        SQLiteMemoryVault._tombstones_matching = paused_find
         try:
             t_a = threading.Thread(target=writer)
             t_a.start()
@@ -70,7 +70,7 @@ def test_tombstone_cannot_land_between_check_and_insert(tmp_path):
             t_a.join(30)
             t_b.join(30)
         finally:
-            SQLiteMemoryVault._find_tombstone = staticmethod(original)
+            SQLiteMemoryVault._tombstones_matching = original
 
         assert not t_a.is_alive() and not t_b.is_alive()
         assert "b" not in errors, errors
@@ -143,9 +143,16 @@ def test_search_list_and_put_report_the_same_provenance_as_get(tmp_path, passphr
     assert _provenance(hits[0].entity) == _provenance(got)
     listed = v.list_entities()
     assert len(listed) == 1 and _provenance(listed[0]) == _provenance(got)
-    # A re-write that gives no provenance keeps the stored one on every path.
+    # A re-write that gives no provenance keeps the stored one. Its content changed, so the stored
+    # attestation no longer applies (R2-A9): an origin-less write attests nothing, the entry waits for
+    # the person; the person's own re-write attests the new content and the quorum of one verifies it.
     rewritten = v.put("c", "k", "tabs for indentation, always", epistemic_state="verified")
     assert _provenance(rewritten) == ("user", "ticket-7", 0.9)
+    assert rewritten.epistemic_state == EpistemicState.CANDIDATE
+    assert rewritten.metadata.get("verification_pending") == {"have": 0, "need": 1}
+    rewritten = v.put("c", "k", "tabs for indentation, always", origin="user", epistemic_state="verified")
+    assert _provenance(rewritten) == ("user", "ticket-7", 0.9)
+    assert rewritten.epistemic_state == EpistemicState.VERIFIED
     assert _provenance(v.search("indentation")[0].entity) == ("user", "ticket-7", 0.9)
     assert _provenance(v.list_entities()[0]) == ("user", "ticket-7", 0.9)
     v.close()
@@ -218,11 +225,13 @@ def test_caller_supplied_human_reviews_does_not_count_as_reviewed(caplog):
 
 
 def test_snapshot_round_trip_keeps_review_history_and_tenant(tmp_path):
-    src = SQLiteMemoryVault(":memory:", allow_plaintext=True)
+    # Review history travels only between copies of the same vault (the snapshot's trust seal must
+    # open under the importer's key); a keyless vault's snapshot is foreign to every other vault.
+    src = SQLiteMemoryVault(":memory:", passphrase="snapshot-round-trip-test")
     src.put("c", "k", "a fact", tenant_id="acme", epistemic_state="candidate")
     src.review_entity("c", "k", "verified", reviewer_id="alice")
     snap = src.export_snapshot()
-    dst = SQLiteMemoryVault(":memory:", allow_plaintext=True)
+    dst = SQLiteMemoryVault(":memory:", passphrase="snapshot-round-trip-test")
     dst.import_snapshot(snap)
     got = dst.get("c", "k")
     assert got.metadata["tenant_id"] == "acme"
@@ -349,8 +358,10 @@ def test_removing_or_forging_the_head_fails_verification(tmp_path):
 
 
 def test_legacy_format_rows_still_verify_and_new_rows_anchor(tmp_path):
-    """A journal written by an older version has format 2 rows and no head; it verifies on its links,
-    and the first new append anchors it."""
+    """A journal written by an older version has format 2 rows. In a vault upgraded from that version the
+    journal format floor is 2, so those rows still verify on their links, and new rows append in format
+    3. A vault that never held legacy rows has its floor at 3 and refuses rows rewritten in format 2;
+    and once a keyed journal has held a row it needs its signed head, even with every row removed."""
     from kibisis.vault import _event_hash
 
     v = _journal_vault(tmp_path)
@@ -368,7 +379,15 @@ def test_legacy_format_rows_still_verify_and_new_rows_anchor(tmp_path):
             )
             prev = h
         v._conn.execute("DELETE FROM audit_head")
-    assert v.verify_audit_chain()
+    # This vault's floor is 3 (it never held legacy rows): the rewritten rows are refused.
+    assert not v.verify_audit_chain()
+    assert "below this vault's floor 3" in v.last_chain_error
+    # As the upgrade of a vault that did hold them would have left it: floor 2, head signed for the last row.
+    with v._conn:
+        v._set_meta(v._conn, "journal_format_floor", 2)
+        v._write_meta_mac(v._conn)
+        v._write_audit_head(v._conn, rows[-1]["sequence"], prev)
+    assert v.verify_audit_chain(), v.last_chain_error
     assert all(e.format == 2 for e in v.list_audit_events(limit=100))
     v.put("c", "new", "appended by the current version")
     events = v.list_audit_events(limit=100)
@@ -376,8 +395,14 @@ def test_legacy_format_rows_still_verify_and_new_rows_anchor(tmp_path):
     assert v.verify_audit_chain()
     head = v._conn.execute("SELECT sequence, event_hash FROM audit_head").fetchone()
     assert (head["sequence"], head["event_hash"]) == (events[-1].sequence, events[-1].event_hash)
-    # Tail truncation of the mixed journal is now detected too.
+    # Tail truncation of the mixed journal is detected too.
     with v._conn:
         v._conn.execute("DELETE FROM audit_journal WHERE sequence = (SELECT MAX(sequence) FROM audit_journal)")
     assert not v.verify_audit_chain()
+    # So is removing the whole journal together with its head: the vault remembers that it held rows.
+    with v._conn:
+        v._conn.execute("DELETE FROM audit_journal")
+        v._conn.execute("DELETE FROM audit_head")
+    assert not v.verify_audit_chain()
+    assert "no signed head" in v.last_chain_error
     v.close()

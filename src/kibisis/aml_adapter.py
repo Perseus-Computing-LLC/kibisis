@@ -13,8 +13,9 @@ Method, which is what a leaderboard entry for this adapter measures:
   timestamp and role are kept as entry metadata.
 * Add. A request is written in one transaction together with a marker keyed on its
   ``request_id``, so it is all-or-nothing and a retried request (same id, same payload, per the
-  contract) is acknowledged without being written twice. ``success`` is returned after commit,
-  when the messages are durable and searchable.
+  contract) is acknowledged without being written twice; the same id with a different payload is
+  refused with 409. ``success`` is returned after commit, when the messages are durable and
+  searchable. Timestamps must convert to a date (see :data:`MS_FLOOR`); otherwise 422.
 * Search. One Kibisis BM25 query (``match="any"``) over the user's messages; the query is the
   question plus any answer options. Hits are grouped by the Add request (conversation chunk) they
   came from and each hit brings the message before it as context. Every group becomes one memory:
@@ -26,7 +27,10 @@ No model calls, no summarisation, no rewriting of stored text.
 
 Concurrency: a vault is used by one request at a time (``SQLiteMemoryVault`` shares one SQLite
 connection), different users run in parallel, and requests beyond ``max_inflight`` get 429 with
-``Retry-After``. Evaluation data is never logged; vaults idle for ``retention_days`` are deleted.
+``Retry-After``. ``max_inflight`` bounds request processing (body read plus Add/Search), not
+connections: those are bounded by ``max_connections`` (503 beyond it) and ``socket_timeout``, after
+which an idle or stalled connection is closed. Evaluation data is never logged; vaults not used
+(no Add or Search) for ``retention_days`` are deleted, and only files that are vaults are.
 """
 
 from __future__ import annotations
@@ -36,11 +40,15 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
+import re
 import signal
+import socket
 import socketserver
 import threading
 import time
+import traceback
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -48,7 +56,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, cast
 
-from .vault import SQLiteMemoryVault
+from .protocols import EncryptionRequiredError
+from .vault import SQLiteMemoryVault, _plaintext_allowed_by_env, _sqlcipher_available
 
 LOG = logging.getLogger("kibisis.aml")
 
@@ -57,6 +66,8 @@ MESSAGE_CATEGORY = "aml_message"
 REQUEST_CATEGORY = "aml_request"
 SCOPE = "aml"
 VAULT_SUFFIX = ".kib"
+_VAULT_NAME = re.compile(r"[0-9a-f]{32}\.kib")
+_SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_TOP_K = 100
 MAX_TOP_K = 1000
 GAP = "..."
@@ -88,6 +99,10 @@ class AMLConfig:
     max_body_bytes: int = 64 * 1024 * 1024
     retention_days: float = 28.0
     retry_after_s: int = 2
+    #: Seconds a connection may sit idle (between requests, or mid-body) before the server closes it.
+    socket_timeout: float = 30.0
+    #: Connections (handler threads) accepted at once; beyond this a connection gets 503 and is closed.
+    max_connections: int = 256
 
     def __post_init__(self) -> None:
         digest = (self.key_sha256 or "").strip().lower()
@@ -96,6 +111,10 @@ class AMLConfig:
         self.key_sha256 = digest
         if self.candidates < 1 or self.context_before < 0 or self.max_inflight < 1 or self.max_open_vaults < 1:
             raise ValueError("candidates, max_inflight and max_open_vaults must be >= 1; context_before >= 0")
+        if not (self.socket_timeout > 0) or self.max_connections < 1:
+            raise ValueError("socket_timeout must be > 0 seconds and max_connections >= 1")
+        if self.max_body_bytes < 1 or self.retry_after_s < 0:
+            raise ValueError("max_body_bytes must be >= 1 and retry_after_s >= 0")
 
 
 # --------------------------------------------------------------------------- value helpers
@@ -130,27 +149,132 @@ def _text_of(content: Any, where: str) -> str:
     raise ContractError(422, f"{where} must be a string or an array of text parts")
 
 
+#: Numeric timestamps at or above this are milliseconds (1973-03-03T09:46:40Z). Numbers in
+#: [:data:`SECONDS_FLOOR`, :data:`SECONDS_CEILING`) are read as seconds (2001-09-09 .. 2096-10-02);
+#: this is the only other form, and nothing in it can also be a millisecond value the adapter
+#: accepts. Anything else (below 1e9, in [4e9, 1e11), negative, non-finite, past year 9999) is
+#: refused with 422: the contract's unit is milliseconds, and such a value cannot be told apart
+#: from a unit mistake.
+MS_FLOOR = 100_000_000_000
+SECONDS_FLOOR = 1_000_000_000
+SECONDS_CEILING = 4_000_000_000
+#: 9999-12-31T23:59:59.999Z, the last instant ``datetime`` can render.
+MS_CEILING = 253_402_300_799_999
+
+
 def _timestamp_ms(value: Any, where: str) -> Optional[int]:
-    """Milliseconds since the epoch from the contract's ms integer (seconds and ISO 8601 also accepted)."""
+    """Milliseconds since the epoch from the contract's ms integer (seconds and ISO 8601 also accepted).
+
+    Only values that convert to a ``datetime`` are accepted, so a stored timestamp can always be
+    rendered by Search. See :data:`MS_FLOOR` for the ms-vs-seconds rule.
+    """
     if value is None:
         return None
     if isinstance(value, bool):
         raise ContractError(422, f"{where} must be a number of milliseconds")
+    if isinstance(value, int) and not -MS_CEILING <= value <= MS_CEILING:
+        # Bounded before float(): a JSON integer of a few hundred digits overflows the conversion.
+        if value > 0:
+            raise ContractError(422, f"{where} is past the year 9999")
+        raise ContractError(422, f"{where}: send epoch milliseconds (>= {MS_FLOOR}), epoch seconds in "
+                                 f"[{SECONDS_FLOOR}, {SECONDS_CEILING}) or ISO 8601; a negative number is neither")
     if isinstance(value, (int, float)):
-        ms = float(value)
-        if abs(ms) < 1e11:  # a value this small is seconds, not milliseconds
-            ms *= 1000.0
-        return int(ms)
+        number = float(value)
+        if not math.isfinite(number):
+            raise ContractError(422, f"{where} must be a finite number of milliseconds")
+        if number >= MS_FLOOR:
+            ms = int(number)
+        elif SECONDS_FLOOR <= number < SECONDS_CEILING:
+            ms = int(number * 1000.0)
+        else:
+            raise ContractError(422, f"{where}: send epoch milliseconds (>= {MS_FLOOR}), epoch seconds in "
+                                     f"[{SECONDS_FLOOR}, {SECONDS_CEILING}) or ISO 8601; {number:g} is neither")
+        if ms > MS_CEILING:
+            raise ContractError(422, f"{where} is past the year 9999")
+        return ms
     if isinstance(value, str) and value.strip():
         text = value.strip().replace("Z", "+00:00")
         try:
             moment = _dt.datetime.fromisoformat(text)
-        except ValueError:
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=_dt.timezone.utc)
+            ms = int(moment.timestamp() * 1000)
+        except (ValueError, OverflowError, OSError):
             raise ContractError(422, f"{where} is not a timestamp") from None
-        if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=_dt.timezone.utc)
-        return int(moment.timestamp() * 1000)
+        if not 0 <= ms <= MS_CEILING:
+            raise ContractError(422, f"{where} is outside 1970..9999")
+        return ms
     raise ContractError(422, f"{where} must be a number of milliseconds")
+
+
+def _encodable(value: str, where: str) -> str:
+    """``value`` if it is valid Unicode; 422 for a lone surrogate (valid JSON, not storable as UTF-8)."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ContractError(422, f"{where} contains a lone surrogate (not valid Unicode)") from None
+    return value
+
+
+def _reject_constant(name: str) -> Any:
+    raise ValueError(f"non-finite JSON number {name}")
+
+
+def _parse_float(text: str) -> float:
+    number = float(text)
+    if not math.isfinite(number):  # 1e400 overflows to inf
+        raise ValueError(f"non-finite JSON number {text}")
+    return number
+
+
+def parse_json_body(raw: bytes) -> Any:
+    """Decode a request body: strict UTF-8, standard JSON only (no NaN/Infinity, no overflowing
+    floats), and no lone surrogates anywhere in it. Raises :class:`ContractError` 400 otherwise."""
+    try:
+        body = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant, parse_float=_parse_float)
+    except (UnicodeDecodeError, ValueError, RecursionError):  # JSONDecodeError is a ValueError; deep nesting recurses
+        raise ContractError(400, "body is not valid UTF-8 JSON") from None
+    if _has_lone_surrogate(body):
+        raise ContractError(400, "body contains a lone surrogate (not valid Unicode)")
+    return body
+
+
+@contextmanager
+def _validating(what: str, status: int = 422) -> Iterator[None]:
+    """Turn any unexpected exception raised while reading a request into a 4xx.
+
+    The fields are the client's input, not the server's state, so a shape nobody thought of (an integer
+    too wide for ``float``, a digit string past CPython's conversion limit, nesting past the recursion
+    limit) is the client's error, never a ``500``. :class:`ContractError` passes through; timeouts and
+    socket errors are the transport's and pass through too. The frames of the traceback are logged once,
+    without the exception's text, which could quote the request.
+    """
+    try:
+        yield
+    except (ContractError, OSError):  # socket.timeout and TimeoutError are OSErrors
+        raise
+    except Exception as exc:
+        frames = "".join(traceback.format_tb(exc.__traceback__)).rstrip()
+        LOG.error("%s: unexpected %s while reading the request; answering %d\n%s", what, type(exc).__name__,
+                  status, frames)
+        raise ContractError(status, f"{what} could not be read") from None
+
+
+def _has_lone_surrogate(value: Any) -> bool:
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            try:
+                item.encode("utf-8")
+            except UnicodeEncodeError:
+                return True
+        elif isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return False
 
 
 def _package_version() -> str:
@@ -166,12 +290,24 @@ def _utc(ms: int) -> _dt.datetime:
     return _dt.datetime.fromtimestamp(ms / 1000.0, tz=_dt.timezone.utc)
 
 
-def _iso(ms: Optional[int]) -> Optional[str]:
-    return None if ms is None else _utc(ms).strftime("%Y-%m-%dT%H:%M:%SZ")
+def _iso(ms: Any) -> Optional[str]:
+    """ISO 8601 of a stored timestamp, or None when the row holds nothing renderable (Search never 500s on a row)."""
+    if isinstance(ms, bool) or not isinstance(ms, (int, float)):
+        return None
+    try:
+        return _utc(int(ms)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, OverflowError, OSError):
+        LOG.warning("stored timestamp could not be rendered; omitted")
+        return None
 
 
-def _stamp(ms: int) -> str:
-    return _utc(ms).strftime("%Y-%m-%d (%a) %H:%M UTC")
+def _stamp(ms: Any) -> Optional[str]:
+    if isinstance(ms, bool) or not isinstance(ms, (int, float)):
+        return None
+    try:
+        return _utc(int(ms)).strftime("%Y-%m-%d (%a) %H:%M UTC")
+    except (ValueError, OverflowError, OSError):
+        return None
 
 
 # --------------------------------------------------------------------------- vault pool
@@ -200,6 +336,13 @@ class VaultPool:
 
     def path_for(self, user_id: str) -> Path:
         return self.data_dir / f"{_digest(user_id)}{VAULT_SUFFIX}"
+
+    @property
+    def encrypted_at_rest(self) -> bool:
+        """Whether the files this pool writes are SQLCipher databases: a passphrase is set *and* the
+        ``sqlcipher3`` driver is loaded. Without the driver a passphrase still seals entry content, but
+        the file is plain SQLite, and retention must recognise it as such (:meth:`is_vault_file`)."""
+        return self.passphrase is not None and _sqlcipher_available()
 
     def _open(self, path: Path) -> SQLiteMemoryVault:
         if self.passphrase is None:
@@ -257,31 +400,62 @@ class VaultPool:
         with self._lock:
             return sum(1 for s in self._slots.values() if s.vault is not None)
 
+    def touch(self, user_id: str) -> None:
+        """Mark the user's vault as used now, so retention counts reads as activity (mtime of the file)."""
+        try:
+            os.utime(self.path_for(user_id), None)
+        except OSError:
+            pass
+
+    @staticmethod
+    def is_vault_file(path: Path, encrypted: bool) -> bool:
+        """True for a regular file this pool could have created: ``<32 hex>.kib``, not a symlink, with a
+        SQLite header (plaintext pools) or a page-sized body with no SQLite header (SQLCipher pools, whose
+        first page is encrypted). Anything else in the data directory is never retention's to delete."""
+        if not _VAULT_NAME.fullmatch(path.name) or path.is_symlink() or not path.is_file():
+            return False
+        size = path.stat().st_size
+        if size < 512 or size % 512:
+            return False
+        with path.open("rb") as f:
+            header = f.read(16)
+        if header.startswith(_SQLITE_HEADER):
+            return not encrypted
+        return encrypted
+
     def purge_idle(self, max_idle_s: float, now: Optional[float] = None) -> int:
-        """Delete vaults with no write for max_idle_s seconds; returns how many were deleted."""
+        """Delete vaults not used (no Add or Search) for max_idle_s seconds; returns how many were deleted.
+
+        Only files :meth:`is_vault_file` accepts are candidates. The pool lock is held from the mtime
+        check to the unlink, so a request cannot open or write the vault in between; a vault whose slot
+        is in use is skipped. A failure on one file is logged and the sweep goes on.
+        """
         now = time.time() if now is None else now
         removed = 0
+        encrypted = self.encrypted_at_rest
         for path in sorted(self.data_dir.glob(f"*{VAULT_SUFFIX}")):
-            files = [Path(f"{path}{suffix}") for suffix in ("", "-wal", "-shm")]
             try:
-                last_write = max(f.stat().st_mtime for f in files if f.exists())
-            except ValueError:
-                continue
-            if now - last_write < max_idle_s:
-                continue
-            with self._lock:  # no request can open this vault while the lock is held
-                slot = self._slots.get(path.name)
-                if slot is not None:
-                    if slot.refs:
+                files = [Path(f"{path}{suffix}") for suffix in ("", "-wal", "-shm")]
+                with self._lock:  # no request can open this vault while the lock is held
+                    if not self.is_vault_file(path, encrypted):  # under the lock: the file checked is the file unlinked
                         continue
-                    del self._slots[path.name]
-                    self._close(slot)
-                for f in files:
-                    try:
-                        f.unlink()
-                    except FileNotFoundError:
-                        pass
-            removed += 1
+                    last_used = max(f.stat().st_mtime for f in files if f.exists())
+                    if now - last_used < max_idle_s:
+                        continue
+                    slot = self._slots.get(path.name)
+                    if slot is not None:
+                        if slot.refs:
+                            continue
+                        del self._slots[path.name]
+                        self._close(slot)
+                    for f in files:
+                        try:
+                            f.unlink()
+                        except FileNotFoundError:
+                            pass
+                removed += 1
+            except (OSError, ValueError) as exc:  # ValueError: the files vanished under the lock
+                LOG.warning("retention: skipped %s: %s", path.name, type(exc).__name__)
         return removed
 
     def close_all(self) -> None:
@@ -302,10 +476,12 @@ class AMLService:
         self.config = config
         self.pool = VaultPool(config.data_dir, config.passphrase, config.max_open_vaults)
 
-    def add(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        request_id = _required_str(body, "request_id")
-        user_id = _required_str(body, "user_id")
-        session_id = _required_str(body, "session_id")
+    @staticmethod
+    def _read_add(body: Dict[str, Any]) -> Tuple[str, str, str, List[Tuple[int, str, str, Optional[int]]]]:
+        """The Add request's fields, checked against the contract (422 for anything off it)."""
+        request_id = _encodable(_required_str(body, "request_id"), "request_id")
+        user_id = _encodable(_required_str(body, "user_id"), "user_id")
+        session_id = _encodable(_required_str(body, "session_id"), "session_id")
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
             raise ContractError(422, "messages must be a non-empty array")
@@ -313,30 +489,50 @@ class AMLService:
         for n, message in enumerate(messages):
             if not isinstance(message, dict):
                 raise ContractError(422, f"messages[{n}] must be an object")
-            text = _text_of(message.get("content"), f"messages[{n}].content")
+            text = _encodable(_text_of(message.get("content"), f"messages[{n}].content"), f"messages[{n}].content")
             role = message.get("role", "user")
             if not isinstance(role, str):
                 raise ContractError(422, f"messages[{n}].role must be a string")
-            rows.append((n, role.strip() or "user", text, _timestamp_ms(message.get("timestamp"), f"messages[{n}].timestamp")))
+            role = _encodable(role.strip(), f"messages[{n}].role") or "user"
+            rows.append((n, role, text, _timestamp_ms(message.get("timestamp"), f"messages[{n}].timestamp")))
+        return request_id, user_id, session_id, rows
 
+    def add(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        with _validating("add request"):
+            request_id, user_id, session_id, rows = self._read_add(body)
         rid = _digest(request_id, 24)
+        # The marker remembers what the request said, so a reused request_id with other content is
+        # refused (409) instead of being acknowledged and dropped; an identical retry stays a no-op.
+        payload_digest = _digest(json.dumps([session_id, rows], ensure_ascii=False, separators=(",", ":")), 64)
         items: List[Dict[str, Any]] = [
             dict(category=MESSAGE_CATEGORY, key=f"{rid}:{n:05d}", content=text, scope=SCOPE,
                  epistemic_state="candidate", origin="import", metadata={"r": rid, "i": n, "t": ts, "role": role})
             for n, role, text, ts in rows if text.strip()
         ]
         items.append(dict(category=REQUEST_CATEGORY, key=rid, content=f"aml request {rid}", scope=SCOPE,
-                          epistemic_state="candidate", origin="import", metadata={"messages": len(rows)}))
+                          epistemic_state="candidate", origin="import",
+                          metadata={"messages": len(rows), "payload": payload_digest}))
         with self.pool.use(user_id, create=True) as vault:
             assert vault is not None  # create=True always yields a vault
-            if vault.get(REQUEST_CATEGORY, rid, scope=SCOPE) is None:  # a retry of a committed request is a no-op
+            marker = vault.get(REQUEST_CATEGORY, rid, scope=SCOPE)
+            if marker is None:
                 with vault._write_tx():  # one transaction: the request lands whole or not at all
                     vault.put_batch(items)
+            else:  # a retry of a committed request is a no-op; a different payload under the same id is not
+                stored = (marker.metadata or {}).get("payload")
+                if isinstance(stored, str) and not hmac.compare_digest(stored, payload_digest):
+                    raise ContractError(409, "request_id was already used with a different payload")
         return {"success": True, "request_id": request_id, "user_id": user_id, "session_id": session_id}
 
-    def search(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        user_id = _required_str(body, "user_id")
-        query = _text_of(body.get("query"), "query").strip()
+    #: ``top_k`` as a digit string: ASCII digits, few enough that ``int()`` cannot refuse them (CPython
+    #: caps int/str conversion at 4300 digits; ``str.isdigit`` also passes superscripts ``int`` rejects).
+    _TOP_K_DIGITS = re.compile(r"^[0-9]{1,9}$")
+
+    @classmethod
+    def _read_search(cls, body: Dict[str, Any]) -> Tuple[str, str, int]:
+        """The Search request's ``user_id``, query text (question plus options) and ``top_k``."""
+        user_id = _encodable(_required_str(body, "user_id"), "user_id")
+        query = _encodable(_text_of(body.get("query"), "query"), "query").strip()
         if not query:
             raise ContractError(422, "query must be non-empty")
         options = body.get("options")
@@ -347,22 +543,29 @@ class AMLService:
         top_k = body.get("top_k", DEFAULT_TOP_K)
         if top_k is None:
             top_k = DEFAULT_TOP_K
-        if isinstance(top_k, str) and top_k.strip().isdigit():
+        if isinstance(top_k, str) and cls._TOP_K_DIGITS.fullmatch(top_k.strip()):
             top_k = int(top_k.strip())
         if isinstance(top_k, bool) or not isinstance(top_k, int) or not 1 <= top_k <= MAX_TOP_K:
             raise ContractError(422, f"top_k must be an integer from 1 to {MAX_TOP_K}")
         text = " ".join([query] + [_text_of(o, "options[]") for o in options])
+        return user_id, text, top_k
+
+    def search(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        with _validating("search request"):
+            user_id, text, top_k = self._read_search(body)
 
         groups: OrderedDict[str, Dict[str, Any]] = OrderedDict()
         with self.pool.use(user_id, create=False) as vault:
             if vault is None:
                 return {"data": []}
+            self.pool.touch(user_id)  # a Search counts as activity for retention
             hits = vault.search(text, category=MESSAGE_CATEGORY, scope=SCOPE, limit=max(self.config.candidates, top_k),
                                 match="any", include_unverified=True)
             for hit in hits:  # Kibisis returns best first; rank_score is BM25, lower is better
                 meta = hit.entity.metadata or {}
                 rid, n = meta.get("r"), meta.get("i")
-                if not isinstance(rid, str) or not isinstance(n, int):
+                if not isinstance(rid, str) or isinstance(n, bool) or not isinstance(n, int) or n < 0:
+                    LOG.warning("search: skipped a stored row with unusable metadata")
                     continue
                 group = groups.get(rid)
                 if group is None:
@@ -423,6 +626,9 @@ class AMLServer(ThreadingHTTPServer):
         self.config = config
         self.service = AMLService(config)
         self.inflight = threading.BoundedSemaphore(config.max_inflight)
+        #: One permit per accepted connection, held for the connection's whole life (``max_inflight``
+        #: bounds request processing only). Over the cap a connection gets 503 and is closed at once.
+        self.connections = threading.BoundedSemaphore(config.max_connections)
         super().__init__(address, AMLHandler)
 
     def server_bind(self) -> None:
@@ -433,11 +639,39 @@ class AMLServer(ThreadingHTTPServer):
         self.server_name = str(host)
         self.server_port = int(port)
 
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self.connections.acquire(blocking=False):
+            try:
+                request.settimeout(1.0)
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nRetry-After: "
+                                + str(self.config.retry_after_s).encode() + b"\r\nContent-Length: 0\r\n\r\n")
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+            LOG.warning("connection refused: %d connections open (max_connections)", self.config.max_connections)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.connections.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.connections.release()
+
 
 class AMLHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "kibisis-aml"
     sys_version = ""
+    #: Socket timeout applied by :meth:`setup` (StreamRequestHandler); the class default is replaced by
+    #: ``AMLConfig.socket_timeout`` per connection. A connection that sends nothing, or stalls mid-body,
+    #: is closed after this long and its thread ends.
+    timeout = 30.0
 
     ROUTES: Dict[str, str] = {
         "/v1/memories/add": "add",
@@ -450,6 +684,12 @@ class AMLHandler(BaseHTTPRequestHandler):
     @property
     def aml(self) -> AMLServer:
         return cast(AMLServer, self.server)
+
+    def setup(self) -> None:
+        super().setup()  # applies the class timeout; the configured one replaces it
+        config = getattr(self.server, "config", None)
+        if config is not None:
+            self.connection.settimeout(config.socket_timeout)
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib signature
         pass  # one line per request is written by _finish, without paths' query strings or bodies
@@ -496,43 +736,56 @@ class AMLHandler(BaseHTTPRequestHandler):
         key = self._presented_key()
         return key is not None and hmac.compare_digest(key_digest(key), self.aml.config.key_sha256)
 
+    #: Chunk-size line: hex digits, optional ``;extensions``. ``int(x, 16)`` alone would accept ``-1``,
+    #: ``0x10`` and ``+5``; a negative size turned the cap check false and the read into ``read(-1)``.
+    _CHUNK_SIZE = re.compile(rb"^[0-9A-Fa-f]{1,16}$")
+    _MAX_TRAILERS = 64
+
     def _read_body(self) -> bytes:
         limit = self.aml.config.max_body_bytes
         if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
             out = bytearray()
             while True:
                 size_line = self.rfile.readline(65537)
-                try:
-                    size = int(size_line.split(b";", 1)[0].strip(), 16)
-                except ValueError:
+                field = size_line.split(b";", 1)[0].strip()
+                if not self._CHUNK_SIZE.match(field):
                     self.close_connection = True
-                    raise ContractError(400, "malformed chunked body") from None
+                    raise ContractError(400, "malformed chunked body")
+                size = int(field, 16)  # never negative: the pattern allows digits only
                 if size == 0:
-                    while self.rfile.readline(65537) not in (b"\r\n", b"\n", b""):
-                        pass
-                    return bytes(out)
-                if len(out) + size > limit:
+                    for _ in range(self._MAX_TRAILERS):
+                        if self.rfile.readline(65537) in (b"\r\n", b"\n", b""):
+                            return bytes(out)
+                    self.close_connection = True
+                    raise ContractError(400, "malformed chunked body")
+                if len(out) + size > limit:  # checked before every chunk, so the total never passes the cap
                     self.close_connection = True
                     raise ContractError(413, f"body exceeds {limit} bytes")
-                out += self.rfile.read(size)
-                self.rfile.readline()
+                chunk = self.rfile.read(size)
+                if len(chunk) != size or self.rfile.readline(3) not in (b"\r\n", b"\n"):
+                    self.close_connection = True
+                    raise ContractError(400, "malformed chunked body")
+                out += chunk
         length = self.headers.get("Content-Length")
         if length is None:
             self.close_connection = True
             raise ContractError(411, "Content-Length required")
-        try:
-            size = int(length)
-        except ValueError:
+        if not re.fullmatch(r"[0-9]{1,18}", length.strip()):
             self.close_connection = True
-            raise ContractError(400, "bad Content-Length") from None
-        if size < 0 or size > limit:
+            raise ContractError(400, "bad Content-Length")
+        size = int(length.strip())
+        if size > limit:
             self.close_connection = True
             self._body_unread = size > 0
             raise ContractError(413, f"body exceeds {limit} bytes")
-        return self.rfile.read(size)
+        raw = self.rfile.read(size)
+        if len(raw) != size:  # the client closed early
+            self.close_connection = True
+            raise ContractError(400, "body shorter than Content-Length")
+        return raw
 
-    #: After refusing a request before reading its body (413, 429), the handler reads and drops the
-    #: declared body for at most this long, then closes. Closing a socket that still has unread data
+    #: After refusing a request before reading its body (401, 404, 413, 429), the handler reads and drops
+    #: the declared body for at most this long, then closes. Closing a socket that still has unread data
     #: makes the kernel reset the connection, and a client still sending its body then gets the reset
     #: instead of the reply (macOS does this even for a body just over the limit).
     DRAIN_SECONDS = 2.0
@@ -567,13 +820,17 @@ class AMLHandler(BaseHTTPRequestHandler):
         status = 500
         self._body_unread = False
         try:
-            if op is None:
-                self.close_connection = True
-                status = self._send(404, {"error": "not found"})
-                return
+            # The credential is checked first, so an unauthenticated client learns nothing about which
+            # paths exist. Both refusals leave the body unread: drain it so the reply, not a reset, arrives.
             if not self._authorized():
                 self.close_connection = True
                 status = self._send(401, {"error": "invalid or missing credentials"})
+                self._drain_body()
+                return
+            if op is None:
+                self.close_connection = True
+                status = self._send(404, {"error": "not found"})
+                self._drain_body()
                 return
             if not self.aml.inflight.acquire(blocking=False):
                 self.close_connection = True
@@ -583,31 +840,93 @@ class AMLHandler(BaseHTTPRequestHandler):
                 return
             try:
                 raw = self._read_body()
-                try:
-                    body = json.loads(raw.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    raise ContractError(400, "body is not valid UTF-8 JSON") from None
-                if not isinstance(body, dict):
-                    raise ContractError(422, "body must be a JSON object")
+                with _validating("request body", 400):  # the body is fully read: keep-alive stays sound
+                    body = parse_json_body(raw)
+                    if not isinstance(body, dict):
+                        raise ContractError(422, "body must be a JSON object")
                 result = getattr(self.aml.service, op)(body)
                 status = self._send(200, result)
             finally:
                 self.aml.inflight.release()
         except ContractError as exc:
-            status = self._send(exc.status, {"error": exc.message})
+            status = self._reply(exc.status, {"error": exc.message})
             if self._body_unread:
                 self._drain_body()
+        except (socket.timeout, TimeoutError):  # the client stalled mid-request: give the thread back
+            self.close_connection = True
+            status = self._reply(408, {"error": "request timed out"})
         except Exception as exc:  # never echo evaluation content; the type is enough to find the bug
             LOG.error("%s failed: %s", op, type(exc).__name__)
             self.close_connection = True
-            status = self._send(500, {"error": "internal error"})
+            status = self._reply(500, {"error": "internal error"})
         finally:
             LOG.info("%s %s %d %.1fms", self.command, op or "-", status, (time.perf_counter() - started) * 1000)
+
+    def _reply(self, status: int, payload: Dict[str, Any]) -> int:
+        """:meth:`_send` for the error branches: a client that is already gone must not turn the refusal
+        into a traceback on stderr (``socketserver.handle_error``)."""
+        try:
+            return self._send(status, payload)
+        except OSError:
+            self.close_connection = True
+            return status
+
+    def handle_expect_100(self) -> bool:
+        """``Expect: 100-continue`` is honoured only for a request that will be read.
+
+        The stdlib answers ``100 Continue`` in ``parse_request``, before :meth:`do_POST` and its
+        credential check; an unauthenticated client was invited to send a body, then refused and drained
+        for :attr:`DRAIN_SECONDS`. Now the credential and the route are checked first: ``401`` or ``404``
+        goes out instead of ``100``, nothing is drained (the client has sent no body yet) and the
+        connection closes. Other methods keep the stdlib behaviour (health reads no body).
+        """
+        if self.command != "POST":
+            return super().handle_expect_100()
+        if not self._authorized():
+            status, payload = 401, {"error": "invalid or missing credentials"}
+        elif self.ROUTES.get(self._path()) is None:
+            status, payload = 404, {"error": "not found"}
+        else:
+            return super().handle_expect_100()
+        self.close_connection = True
+        self._reply(status, payload)
+        LOG.info("%s %s %d %.1fms", self.command, "-", status, 0.0)
+        return False
+
+
+def storage_mode(config: AMLConfig) -> bool:
+    """Whether the vaults this server writes are SQLCipher files: a passphrase is set and ``sqlcipher3``
+    loads. (:attr:`VaultPool.encrypted_at_rest` reports the same once the pool exists.)
+
+    Raises :class:`EncryptionRequiredError` for the one configuration that cannot serve: a passphrase,
+    no ``sqlcipher3`` and no ``KIBISIS_ALLOW_PLAINTEXT`` opt-in. The vault constructor refuses that
+    combination, so every Add and Search would be ``500``; better to refuse at start-up with the reason.
+    """
+    if config.passphrase is None:
+        return False
+    if _sqlcipher_available():
+        return True
+    if not _plaintext_allowed_by_env():
+        raise EncryptionRequiredError(
+            "a vault key is set but the sqlcipher3 driver is not installed, so no vault could be opened and "
+            "every request would fail: install sqlcipher3, or set KIBISIS_ALLOW_PLAINTEXT=1 to store roles, "
+            "timestamps and request markers in plain SQLite files (entry content stays sealed), or run with "
+            "--plaintext"
+        )
+    return False
+
+
+def _encrypted_at_rest(config: AMLConfig) -> bool:  # kept for callers of the first-review name
+    return storage_mode(config)
 
 
 def run_server(config: AMLConfig, host: str = "127.0.0.1", port: int = 8080,
                ready: Optional[Callable[[AMLServer], None]] = None) -> None:
-    """Serve until SIGTERM/SIGINT; deletes vaults idle past config.retention_days once an hour."""
+    """Serve until SIGTERM/SIGINT; deletes vaults idle past config.retention_days once an hour.
+
+    Raises :class:`EncryptionRequiredError` before binding when the configuration cannot open a vault
+    (see :func:`storage_mode`)."""
+    encrypted = storage_mode(config)
     server = AMLServer((host, port), config)
     stop = threading.Event()
 
@@ -619,20 +938,30 @@ def run_server(config: AMLConfig, host: str = "127.0.0.1", port: int = 8080,
         signal.signal(signal.SIGTERM, _shutdown)
         signal.signal(signal.SIGINT, _shutdown)
 
+    def _purge() -> None:
+        try:
+            removed = server.service.pool.purge_idle(config.retention_days * 86400)
+        except Exception as exc:  # the sweep must outlive any one surprise; per-file errors are logged inside
+            LOG.error("retention sweep failed: %s", type(exc).__name__)
+            return
+        if removed:
+            LOG.info("retention: deleted %d vaults unused > %.0f days", removed, config.retention_days)
+
     def _retention() -> None:
         while not stop.wait(3600 if config.retention_days > 0 else 86400):
             if config.retention_days > 0:
-                removed = server.service.pool.purge_idle(config.retention_days * 86400)
-                if removed:
-                    LOG.info("retention: deleted %d vaults idle > %.0f days", removed, config.retention_days)
+                _purge()
 
     if config.retention_days > 0:
-        removed = server.service.pool.purge_idle(config.retention_days * 86400)
-        if removed:
-            LOG.info("retention: deleted %d vaults idle > %.0f days", removed, config.retention_days)
+        _purge()
     threading.Thread(target=_retention, name="aml-retention", daemon=True).start()
-    LOG.info("kibisis-aml %s listening on %s:%d (encrypted=%s, candidates=%d, max_inflight=%d)", ADAPTER_REVISION,
-             host, server.server_address[1], config.passphrase is not None, config.candidates, config.max_inflight)
+    if config.passphrase is not None and not encrypted:
+        LOG.warning("sqlcipher3 is not available and KIBISIS_ALLOW_PLAINTEXT is set: vault files are plain SQLite, "
+                    "not encrypted as a whole; entry content is sealed under the vault key, but roles, timestamps "
+                    "and request markers are stored in the clear. Retention treats these files as plaintext vaults.")
+    LOG.info("kibisis-aml %s listening on %s:%d (encrypted_at_rest=%s, candidates=%d, max_inflight=%d, "
+             "max_connections=%d, socket_timeout=%.0fs)", ADAPTER_REVISION, host, server.server_address[1], encrypted,
+             config.candidates, config.max_inflight, config.max_connections, config.socket_timeout)
     if ready is not None:
         ready(server)
     try:

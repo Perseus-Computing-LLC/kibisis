@@ -60,6 +60,7 @@ def _open(kind, path, monkeypatch, passphrase=PASS):
     """A vault of the given kind: 'plain' (no passphrase), 'sqlcipher', or 'fallback' (sqlcipher3 absent)."""
     if kind == "fallback":
         monkeypatch.setattr(vault_module, "sqlcipher3", sqlite3)
+        monkeypatch.setenv("KIBISIS_ALLOW_PLAINTEXT", "1")  # fallback mode is opt-in: the file is plain on disk
     elif kind == "sqlcipher":
         if not vault_module._sqlcipher_available():
             pytest.skip("sqlcipher3 is not installed")
