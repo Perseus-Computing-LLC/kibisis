@@ -51,6 +51,8 @@ RECALL_NOTICE = (
 )
 
 _TEXT = {"type": "string"}
+#: Longest key the MCP tools accept (F12: keys are digested against tombstones like content).
+MAX_KEY_LENGTH = 128
 _NUMBER = {"type": "number"}
 
 TOOL_DEFINITIONS: List[Dict[str, Any]] = [
@@ -64,7 +66,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "category": {**_TEXT, "description": "Category, such as convention, decision or insight.", "default": "general"},
-                "key": {**_TEXT, "description": "Key, unique within the category."},
+                "key": {**_TEXT, "maxLength": 128, "description": "Key, unique within the category (at most 128 characters)."},
                 "content": {**_TEXT, "description": "The text to store."},
                 "valid_from": {**_NUMBER, "description": "Optional Unix time from which the entry is valid."},
                 "valid_until": {**_NUMBER, "description": "Optional Unix time after which the entry is no longer valid."},
@@ -462,6 +464,10 @@ class KibisisMCPServer:
     def _remember(self, args: Dict[str, Any]) -> Dict[str, Any]:
         category = _required(args, "category", default="general")
         key = _required(args, "key")
+        if len(key) > MAX_KEY_LENGTH:
+            # A key is a name, and names are matched against tombstones (a value does not become
+            # storable by being filed as a key); a short cap keeps that check cheap and honest.
+            raise ValueError(f"'key' must be at most {MAX_KEY_LENGTH} characters")
         content = _required(args, "content")
         extra = args.get("metadata")
         if extra is not None and not isinstance(extra, dict):

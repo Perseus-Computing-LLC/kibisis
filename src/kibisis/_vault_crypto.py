@@ -42,15 +42,49 @@ logger = logging.getLogger("kibisis.vault")
 INTEGRITY_FORMAT = 2
 
 
+#: Code points that render as nothing but are not ``Cf``/``Cc`` (Hangul fillers are ``Lo``), plus the
+#: Default_Ignorable blocks NFKC keeps: variation selectors, the combining grapheme joiner and the
+#: Mongolian free variation selectors are ``Mn`` and are dropped by category below; these are the rest.
+_IGNORABLE_CODE_POINTS = frozenset(
+    [0x115F, 0x1160, 0x3164, 0xFFA0, 0x034F, 0x180B, 0x180C, 0x180D, 0x180E, 0x180F, 0x200B, 0x2060, 0x2061,
+     0x2062, 0x2063, 0x2064, 0xFEFF, 0xFE00, 0xFE01, 0xFE02, 0xFE03, 0xFE04, 0xFE05, 0xFE06, 0xFE07, 0xFE08,
+     0xFE09, 0xFE0A, 0xFE0B, 0xFE0C, 0xFE0D, 0xFE0E, 0xFE0F, 0x17B4, 0x17B5, 0x3164]
+    + list(range(0xE0100, 0xE01F0))
+)
+
+#: Confusables fold for the look-alikes an agent can type without noticing: the Cyrillic and Greek
+#: letters whose usual glyphs match a Latin letter, and dotless i. A small table on purpose: UTS #39's
+#: full skeleton is not shipped, and paraphrase is out of scope (README, "Limits").
+_CONFUSABLES = {
+    # Cyrillic lower case (after casefold every letter is lower case)
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x", "і": "i", "ј": "j", "ѕ": "s",
+    "ԁ": "d", "ɡ": "g", "һ": "h", "ԛ": "q", "ԝ": "w", "ӏ": "l", "ѵ": "v", "ҽ": "e", "ԍ": "g",
+    "ё": "e", "є": "e", "ү": "y", "ҳ": "x",
+    # Greek lower case
+    "α": "a", "ο": "o", "ν": "v", "ι": "i", "κ": "k", "ρ": "p", "τ": "t", "υ": "u", "χ": "x",
+    "ϲ": "c", "ϳ": "j", "ⲟ": "o",
+    # dotless i and other Latin look-alikes
+    "ı": "i", "ȷ": "j", "ⅰ": "i", "ℓ": "l",
+}
+
+
 def canonicalize_text(text: str) -> str:
     """Normalize text for evasion-resistant tombstone matching.
 
     Transforms text by:
-    1. Unicode NFKC normalization (replaces lookalikes, fullwidth chars, compatibility ligatures)
+    1. Unicode NFKC normalization (fullwidth characters, compatibility ligatures, composed forms)
     2. Unicode case folding (.casefold())
-    3. Stripping invisible Unicode format/control characters (Cf/Cc, e.g., zero-width spaces/joiners, soft hyphens)
-    4. Stripping all Unicode punctuation and symbols (replacing with space separators)
-    5. Collapsing all whitespace runs into single spaces and trimming
+    3. Dropping invisible code points: format/control (``Cf``/``Cc``), nonspacing/enclosing/spacing
+       marks (``Mn``/``Me``/``Mc``: variation selectors, combining grapheme joiner, Mongolian FVS,
+       combining accents), and the Default_Ignorable code points NFKC keeps (Hangul fillers,
+       zero-width joiners, variation selectors)
+    4. Folding common Latin/Cyrillic/Greek homoglyphs and dotless i to their Latin letter (a small
+       built-in table, not UTS #39's full skeleton)
+    5. Stripping all Unicode punctuation and symbols (replacing with space separators)
+    6. Collapsing all whitespace runs into single spaces and trimming
+
+    What it does not do: recognise a paraphrase, a translation, a different word order, or a
+    homoglyph outside the table. A tombstone stops a value and its spellings, not an idea.
     """
     if not text:
         return ""
@@ -60,10 +94,14 @@ def canonicalize_text(text: str) -> str:
         if ch.isspace():
             chars.append(" ")
             continue
-        cat = unicodedata.category(ch)
-        if cat in ("Cf", "Cc"):
-            # Drop invisible format/control characters (e.g. \u200b, \u200c, \u200d, \ufeff, \u00ad)
+        if ord(ch) in _IGNORABLE_CODE_POINTS:
             continue
+        cat = unicodedata.category(ch)
+        if cat in ("Cf", "Cc", "Mn", "Me", "Mc"):
+            # Drop invisible format/control characters (e.g. \u200b, \u200c, \u200d, \ufeff, \u00ad)
+            # and combining marks (e.g. \ufe0f, \u034f, \u180b, accents added to evade a match).
+            continue
+        ch = _CONFUSABLES.get(ch, ch)
         if cat.startswith(("P", "S")):
             chars.append(" ")
         else:
