@@ -167,8 +167,10 @@ def open_vault(
 ) -> SQLiteMemoryVault:
     """Open the vault the environment describes. Refuses to run without a key unless plaintext is allowed.
 
-    ``read_only=True`` opens an existing vault without changing a byte of it (no SQLCipher conversion,
-    integrity upgrade or index build; every write is refused) and does not create a missing one.
+    ``read_only=True`` opens an existing vault without changing a byte of the vault file (no SQLCipher
+    conversion, integrity upgrade or index build; every write is refused) and does not create a missing
+    one. SQLite may still create an empty ``-wal`` and a ``-shm`` beside a WAL-mode vault and leave them;
+    the next writable open removes them.
     """
     env = os.environ if env is None else env
     path = db_path or default_db_path(env)

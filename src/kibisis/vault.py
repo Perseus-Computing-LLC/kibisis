@@ -683,13 +683,23 @@ class SQLiteMemoryVault(
                     self.crypto_provider = AESGCMCryptoEnvelopeProvider(salt=salt)
                 self._signing_key, self._digest_key, self._term_key = derive_vault_keys(passphrase, salt)
                 self._keyed = True
-                if int(self._meta("integrity_format") or 0) < INTEGRITY_FORMAT:
-                    raise ValueError(f"{self.db_path} needs an integrity upgrade: open it writable once first")
+                # Same order as the writable open (_vault_crypto.py): key check, then the edited-down
+                # integrity_format test, then the upgrade refusal; so an edited record or a wrong
+                # passphrase is reported as such and never as "open it writable once first".
+                stored_format = int(self._meta("integrity_format") or 0)
                 stored = self._meta("key_check")
+                if stored is not None and not hmac.compare_digest(str(stored), self._key_check_value()):
+                    raise ValueError("Failed to authenticate or decrypt vault database with provided passphrase")
+                if stored_format < 2 and (stored is not None or self._meta("meta_mac") is not None):
+                    raise VaultIntegrityError(
+                        f"{self.db_path}: vault_meta.integrity_format says {stored_format} but the vault carries a "
+                        "key check or meta MAC, which only integrity format 2 and later write; the integrity "
+                        "record was edited. Refusing to open; restore the record first."
+                    )
+                if stored_format < INTEGRITY_FORMAT:
+                    raise ValueError(f"{self.db_path} needs an integrity upgrade: open it writable once first")
                 if stored is None:
                     raise VaultIntegrityError(f"{self.db_path}: the vault is keyed but has no key check; refusing to open")
-                if not hmac.compare_digest(str(stored), self._key_check_value()):
-                    raise ValueError("Failed to authenticate or decrypt vault database with provided passphrase")
                 self._integrity_format = INTEGRITY_FORMAT
                 # The same read-only integrity checks the writable open runs (area B): the meta MAC over the
                 # integrity records, the journal anchoring flag, and every tombstone row's MAC plus the
