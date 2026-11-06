@@ -15,6 +15,7 @@ from kibisis import (
     resolve_passphrase,
 )
 from kibisis.models import EncryptedEnvelope
+from kibisis.vault import VaultIntegrityError
 
 PASS = "correct horse battery staple"
 CANARY = "Zebracanary-7731-unique-token"
@@ -138,12 +139,16 @@ class TestEncryptionByDefault(unittest.TestCase):
         v.put("c", "k2", f"second {CANARY}-two")
         v.close()
         self.assertIn(CANARY.lower().encode(), _raw_bytes(self.db))     # premise: plaintext really was on disk
-        enc = SQLiteMemoryVault(self.db, passphrase=PASS, allow_plaintext=True)
+        with self.assertRaises(VaultIntegrityError):  # R5-1: a keyless file with rows needs the opt-in
+            SQLiteMemoryVault(self.db, passphrase=PASS, allow_plaintext=True)
+        self.assertIn(CANARY.lower().encode(), _raw_bytes(self.db))  # the refusal wrote nothing
+        enc = SQLiteMemoryVault(self.db, passphrase=PASS, allow_plaintext=True, adopt_keyless=True)
         result = enc.migrate_plaintext()
         self.assertEqual(result, {"migrated": 2, "remaining_plaintext": 0})
         enc.close()
         self.assertNotIn(CANARY.lower().encode(), _raw_bytes(self.db))
         self.assertEqual(SQLiteMemoryVault(self.db, passphrase=PASS).get("c", "k1").content, f"first {CANARY}")
+        self.assertEqual(SQLiteMemoryVault(self.db, passphrase=PASS).get("c", "k1").epistemic_state.value, "candidate")
         raw = sqlcipher3.connect(self.db)
         raw.execute(f"PRAGMA key = '{PASS}';")
         self.assertEqual(raw.execute("SELECT count(*) FROM entities_fts WHERE entities_fts MATCH ?", ('"' + CANARY + '"',)).fetchone()[0], 0)

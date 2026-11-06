@@ -144,7 +144,55 @@ behaviour; the R3-AB4 one is skipped until `fix/round3-entry` merges).
   tried; the path key stays for a vault that never had a passphrase). The genuine a5 fixture still
   migrates, read-only and writable, idempotently.
 
-### Not fixed
+### Round 5
+
+Review `review_notes/R5.md` (091c218). Repro suite `tests/review5_discriminator.py` →
+`tests/test_review5_discriminator.py` (collected; the four `test_attack_*` are now `test_fixed_r5_*`
+asserting the fix; 99 tests).
+
+### Fixed
+
+- **R5-1 (high)** the salt-absent door. A keyed vault whose whole `vault_meta` (salt included) was
+  deleted and whose rows were flattened to plaintext read as "never keyed" and the first keyed open
+  adopted every row as a signed entry in the writer's `epistemic_state`. Now (a) adoption is never
+  silent or trusting: `_migrate_integrity` makes every adopted row a `candidate` via
+  `_demote_adopted_row` (drops `human_reviews`, `attestations`, `verification_pending`,
+  `act_class_capped_from`, `trust_inherited_from`, `last_verified_at`; stamps
+  `adopted_from_keyless_file`), a tombstone row in a keyless file refuses the open outright, the
+  `migrate` event keeps `entries_adopted_from_keyless_vault`, and `SQLiteMemoryVault.keyless_adoption()`
+  reports the latest migration's count/date for `health` (MCP `kibisis_health.keyless_adoption`) and
+  `review list` ("N entries adopted from a keyless file on <date> …"); (b) the keyed open of a
+  salt-less file WITH rows needs the constructor kwarg `adopt_keyless=True` (default False; also on
+  `config.open_vault`), read-only or writable, else `VaultIntegrityError` "this file has N plaintext
+  entries and no salt; a keyed vault whose records were removed looks the same; pass adopt_keyless=True
+  to adopt them as candidates" — checked by `_refuse_unadopted_keyless_rows` before `_init_schema`, so
+  the refused file is untouched. A salt-less file with no rows and no tombstones is a fresh vault. The
+  CLI flag is in area C. (c) `_refuse_unless_genuine_a5` docstring, `_migrate_integrity` docstring and
+  SECURITY.md ("the second door", and the salt-removal bullet) now describe both doors.
+- **R5-2 (low-med)** "empty vault" means empty: with no entity row and `kdf_salt` present the a5
+  discriminator refuses when `rejected_value_tombstones` has any row or the journal any event
+  (witnesses "an entity table that is empty beside N tombstone rows" / "… beside a journal of N events,
+  first '<action>' on …"). The admitted empty reset's migration writes a `migrate` event with
+  `empty_keyed_file: true` and zero counts, so it is told from a vault created fresh.
+- **R5-3 (low)** `_refuse_keyed_records_without_salt` also refuses when any entity row has
+  `is_encrypted != 0` or a non-empty envelope ("N sealed entries … but vault_meta holds no kdf_salt; the
+  vault's salt was removed"), and runs before `_init_schema` in the writable open: no fresh salt, no
+  schema upgrade, bytes and mtime unchanged on the refused file (asserted).
+- **Minor** `integrity_format` is read through `_integrity_format_record()`: a non-integer value is a
+  `VaultIntegrityError` naming it, not a `ValueError` from `int()`. `_A5_FOREIGN_META` now lists every
+  `vault_meta` key the current code writes that a5 never wrote: `term_index_format`,
+  `search_index_format`, `quorum_dropped_from` added.
+
+### Changed behaviour callers may notice
+
+- Giving a passphrase to a plaintext vault that holds entries now needs `adopt_keyless=True`, and the
+  adopted entries come back as `candidate` (not served by `list_entities()` by default) until a person
+  reviews them. Existing tests that did this were updated accordingly.
+- A keyed a5-era file carrying `term_index_format` (a key a5 never wrote) is refused by the a5
+  discriminator; genuine a5 files do not carry it.
+- The empty keyed reset now leaves one `migrate` event in the journal.
+
+## Not fixed
 
 - A reset that also rewrites the journal headless **and** removes every entry and every `put` row is
   indistinguishable from an empty a5 file; that is the file writer deleting the vault (out of scope).

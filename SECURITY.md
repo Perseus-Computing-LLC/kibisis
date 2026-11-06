@@ -100,15 +100,34 @@ a guarantee beyond what the named code does.
   admits nothing by itself: a headless format 1 chain has no keyed element, so the opened rows are what
   authenticate the file; a keyed vault's format 1 chain head that verifies only under the path-derived
   key (one a file writer computes) is refused too. What the discriminator cannot tell from a genuine a5
-  file is the reset that satisfies all of it: a headless journal with no entry event and no sealed
-  entry, which is an empty vault. The operator then sees a vault with no entries (`list_entities()` is
-  empty in every scope) and a journal with no entry event, which is the file
-  writer deleting the vault (out of scope, SECURITY.md threat model), not a vault whose rejections
-  were laundered. The key check (or, for a 0.1.0a5 file, one of its sealed entries) is
-  compared against the file before any migration or SQLCipher conversion, and a converted copy replaces
-  the plain file only after it has opened, authenticated and upgraded. Removing `kdf_salt` while a key
-  check, meta MAC or integrity format of 2 or more remains is refused by both the read-only and the
-  writable open; no fresh salt is written over it.
+  file is the reset that satisfies all of it: a salted file with no entry, no tombstone row and no
+  journal event at all, which is an empty vault (a planted tombstone or any journal event on an empty
+  entity table is a witness, round 5). The operator then sees a vault with no entries (`list_entities()`
+  is empty in every scope) and a journal holding one `migrate` event with `empty_keyed_file`, which is
+  the file writer deleting the vault (out of scope, SECURITY.md threat model), not a vault whose
+  rejections were laundered; a vault created fresh has no such event. The key check (or, for a 0.1.0a5
+  file, one of its sealed entries) is compared against the file before any migration or SQLCipher
+  conversion, and a converted copy replaces the plain file only after it has opened, authenticated and
+  upgraded. Removing `kdf_salt` while a key check, meta MAC, integrity format of 2 or more, or any
+  sealed entry row remains is refused by both the read-only and the writable open before anything is
+  written; no fresh salt and no schema upgrade is written over it.
+
+  The second door is the file with no salt at all: `vault_meta` deleted whole, every row flattened to
+  plaintext with whatever content and state the writer chose, tombstones dropped. That file is
+  indistinguishable from a vault that was written without a passphrase, and the discriminator above
+  does not see it. It is guarded on its own terms (round 5, R5-1): a keyed open (read-only or writable)
+  of a salt-less file that holds entries is refused (`VaultIntegrityError`: "this file has N plaintext
+  entries and no salt; a keyed vault whose records were removed looks the same; pass adopt_keyless=True
+  to adopt them as candidates") unless the caller opted in; only the operator commands behind the
+  terminal check (`kibisis-review <verdict>|lift --adopt-keyless`, the admit command's
+  `--adopt-keyless`) can, never the MCP or AML servers or the OKF commands. With the opt-in every
+  adopted row becomes a `candidate`, its `human_reviews`, `attestations` and trust-derived metadata
+  reset, as a model-origin write would be stored; a tombstone row in such a file refuses the open
+  outright (it would be MAC-signed on nobody's word; lift it in the keyless vault first). The `migrate`
+  event records `entries_adopted_from_keyless_vault`, and `health` (MCP `kibisis_health`), `review
+  list` and `keyless_adoption()` show "N entries adopted from a keyless file on <date>" for as long as
+  that is the latest migration. What the writer gets from this door is therefore a vault of candidates
+  that a person must review one by one, and a notice that says where they came from.
 - *Stalling reads with an absurd KDF cost.* A provider bound to a vault derives keys from the vault's own
   salt at the fixed iteration count only; the salt and count written in an envelope are not used, and a
   foreign salt is refused before any derivation (`AESGCMCryptoEnvelopeProvider.decrypt`, crypto.py). The cap
@@ -142,8 +161,12 @@ also stored in plain text.
 - *Deleting the whole journal together with its head, and the integrity record.* `journal_anchored` under
   the meta MAC records that the journal has held a row, so emptying the journal and removing the head is
   caught (pinned by `tests/test_threat_model_claims.py`). A writer who also removes `kdf_salt`, `key_check`,
-  `integrity_format` and the MAC turns the file into one that looks like it never had a passphrase; that is
-  told apart from a new vault only by a copy of the head kept outside the file.
+  `integrity_format` and the MAC (and flattens every sealed row, since a sealed row without a salt is
+  refused) turns the file into one that looks like it never had a passphrase, with whatever rows the
+  writer left in it. An empty such file is told apart from a new vault only by a copy of the head kept
+  outside the file. One with rows is refused by every keyed open until an operator passes
+  `adopt_keyless` at a terminal, and then holds only candidates with a standing notice of the adoption
+  (above, "the second door"); the writer's rows are never served as verified.
 - *Reading everything that is not sealed content:* categories, keys, scopes, metadata, states, origins, the
   journal's categories, keys and author ids, and the `entities_fts` index of category, key and scope terms
   (created in `_init_schema`, vault.py). The content column of a sealed row is empty (`_seal`, _vault_crypto.py), so entry text and

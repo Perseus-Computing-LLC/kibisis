@@ -256,9 +256,19 @@ class SQLiteMemoryVault(
         strict: bool = False,
         read_only: bool = False,
         pin_quorum: bool = False,
+        adopt_keyless: bool = False,
         env: Optional[Mapping[str, str]] = None,
     ) -> None:
         """Open a vault. Entry content is encrypted by default.
+
+        ``adopt_keyless=True`` is the one way to give a passphrase to a plain file that holds entries
+        and no salt (a vault written without a passphrase). A keyed vault whose ``vault_meta`` and
+        seals a file writer removed looks exactly like one, so without the opt-in such an open is
+        refused (:class:`VaultIntegrityError`, read-only or writable), and with it every adopted entry
+        becomes a ``candidate`` with its attestations reset; :meth:`keyless_adoption` reports the
+        count until a later migration. Only the operator CLIs behind the terminal check pass it
+        (``kibisis-review ... --adopt-keyless``, ``kibisis admit --adopt-keyless``); the servers and
+        the OKF commands never do. A plain file with no entries needs no opt-in.
 
         ``read_only=True`` opens an existing on-disk vault as it is and never writes to it: the SQLite
         connection is ``mode=ro``, so the plain-SQLite-to-SQLCipher migration, the integrity upgrade and
@@ -351,8 +361,12 @@ class SQLiteMemoryVault(
         env_quorum = quorum_env.get("KIBISIS_VERIFICATION_QUORUM")
         self._quorum_requested = verification_quorum is not None or bool((env_quorum or "").strip())
         self._pin_quorum = bool(pin_quorum)
+        self._adopt_keyless = bool(adopt_keyless)
         #: The quorum the vault file remembers, or None until a verdict pinned one (then the default applies).
         self.verification_quorum_stored: Optional[int] = None
+        #: A quorum a person had pinned that was dropped because a legacy meta MAC never covered it (R5-4);
+        #: a pinning open that names no quorum will not pin below it. None once a verdict pins again.
+        self.quorum_dropped_from: Optional[int] = None
         self._meta_mac_legacy = False  # True while the meta MAC verifies only over the pre-quorum key set
         if verification_quorum is None:
             from .config import parse_verification_quorum  # config imports this module
@@ -466,10 +480,15 @@ class SQLiteMemoryVault(
             raise
         self._a5_checked = False  # True once _refuse_unless_genuine_a5 ran on the file as it was before _init_schema
         if passphrase:
-            # The a5 discriminator must see the file before _init_schema adds the tables and columns a later
-            # release's schema has (audit_head, audit_journal.format, tombstone_mac): a keyed file reset to
-            # look like 0.1.0a5 is refused here, and a genuine a5 file hands over its derived keys.
+            # Everything that refuses a file must see it before _init_schema adds the tables and columns a
+            # later release's schema has (audit_head, audit_journal.format, tombstone_mac) and before a salt
+            # is issued, so a refused file is not written to. In order: sealed rows or keyed records with no
+            # salt (the salt was removed, R5-3); plaintext rows with no salt and no adopt_keyless opt-in (a
+            # keyed vault reset to look never-keyed, R5-1); and the a5 discriminator, which refuses a keyed
+            # file reset to look like 0.1.0a5 and hands over a genuine a5 file's derived keys.
             try:
+                self._refuse_keyed_records_without_salt()
+                self._refuse_unadopted_keyless_rows()
                 prechecked = self._refuse_unless_genuine_a5(passphrase)
             except BaseException:
                 self._conn.close()
@@ -708,7 +727,11 @@ class SQLiteMemoryVault(
             if not self._conn.execute("SELECT name FROM sqlite_master WHERE name = 'entities'").fetchone():
                 raise ValueError(f"{self.db_path} is not a kibisis vault (no entities table)")
             if not self._has_meta_key("kdf_salt"):
-                self._refuse_keyed_records_without_salt()
+                self._refuse_keyed_records_without_salt(sealed_rows=bool(passphrase))
+                if passphrase:
+                    # The same door as the writable open (R5-1): a plain file with rows and no salt is served
+                    # as the plaintext vault it is only when the caller opted in to adopting it.
+                    self._refuse_unadopted_keyless_rows()
             if passphrase and self._has_meta_key("kdf_salt"):
                 self._was_keyed = True
                 salt = bytes(self._meta("kdf_salt"))
@@ -719,7 +742,7 @@ class SQLiteMemoryVault(
                 # Same order as the writable open (_vault_crypto.py): key check, then the edited-down
                 # integrity_format test, then the upgrade refusal; so an edited record or a wrong
                 # passphrase is reported as such and never as "open it writable once first".
-                stored_format = int(self._meta("integrity_format") or 0)
+                stored_format = self._integrity_format_record()
                 stored = self._meta("key_check")
                 if stored is not None and not hmac.compare_digest(str(stored), self._key_check_value()):
                     raise ValueError("Failed to authenticate or decrypt vault database with provided passphrase")
@@ -1155,12 +1178,41 @@ class SQLiteMemoryVault(
             return None
         return stored
 
+    def _dropped_quorum(self) -> Optional[int]:
+        """``vault_meta.quorum_dropped_from`` as a positive integer, or None (absent or malformed)."""
+        try:
+            raw = self._meta("quorum_dropped_from")
+        except sqlcipher3.OperationalError:
+            return None
+        if raw is None:
+            return None
+        try:
+            value = int(bytes(raw).decode("ascii") if isinstance(raw, (bytes, memoryview)) else raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value >= 1 else None
+
     def _drop_untrusted_stored_quorum(self, cursor: Any) -> None:
         """Before a legacy (pre-quorum) meta MAC is re-signed: remove a stored quorum the MAC never covered,
         whatever its value, so the re-signed MAC never turns a value nobody signed into a signed one.
-        Called by ``_verify_meta_mac`` under ``_meta_mac_legacy``."""
+        A dropped value above the default is kept as ``quorum_dropped_from`` (under the full-set MAC,
+        R5-4): not as a quorum (nobody signed it) but as a floor for the next pinning open that names
+        no quorum, so a person's pinned 3 cannot be turned into the default by their own later verdict
+        run without ``KIBISIS_VERIFICATION_QUORUM``. Called by ``_verify_meta_mac`` under
+        ``_meta_mac_legacy``."""
         if self._stored_quorum() is None and self._meta("verification_quorum") is not None:
+            raw = self._meta("verification_quorum")
+            try:
+                dropped = int(bytes(raw).decode("ascii") if isinstance(raw, (bytes, memoryview)) else raw)
+            except (TypeError, ValueError):
+                dropped = 0
             cursor.execute("DELETE FROM vault_meta WHERE key = 'verification_quorum'")
+            # Only a value above the default is worth a floor: a pinning open never pins below the default,
+            # so a dropped 1 or 2 (the forged lowering R2-B4 is about) is simply gone.
+            floor = max(dropped, self._dropped_quorum() or 0)
+            if floor > DEFAULT_VERIFICATION_QUORUM:
+                self._set_meta(cursor, "quorum_dropped_from", str(floor))
+                self.quorum_dropped_from = floor
 
     def _persist_verification_quorum(self) -> None:
         """Adopt the stored quorum, compare it with the process's, and store it only from a pinning open.
@@ -1173,12 +1225,17 @@ class SQLiteMemoryVault(
         names no quorum (no argument, no ``KIBISIS_VERIFICATION_QUORUM``) adopts the file's, unless the
         file's is below :data:`DEFAULT_VERIFICATION_QUORUM`: a quorum of one account is taken up only by
         a process that names it itself. With nothing stored, a pinning open stores the process's
-        quorum (the default, unless named) and every other open simply runs with it.
+        quorum (the default, unless named) and every other open simply runs with it; but when a
+        ``quorum_dropped_from`` record stands (a pinned value dropped under a legacy MAC, R5-4) a
+        pinning open that names no quorum and would pin below it is refused
+        (:class:`~kibisis.config.ConfigError`), and the record is cleared once a pinning open names
+        its quorum or pins at least that value.
         """
         from .config import ConfigError  # config imports this module
 
         stored = self._stored_quorum()
         self.verification_quorum_stored = stored
+        self.quorum_dropped_from = self._dropped_quorum()
         if stored is not None and not self._quorum_requested:
             if stored < DEFAULT_VERIFICATION_QUORUM:
                 raise ConfigError(
@@ -1198,11 +1255,28 @@ class SQLiteMemoryVault(
             )
         if not self._pin_quorum or getattr(self, "read_only", False):
             return  # adopt or run with the process's own; never pin
-        if stored is None or self.verification_quorum > stored:
+        dropped = self.quorum_dropped_from
+        pins = stored is None or self.verification_quorum > stored
+        if pins and dropped is not None and not self._quorum_requested and self.verification_quorum < dropped:
+            raise ConfigError(
+                f"{self.db_path} had its verification quorum pinned at {dropped}; that value was dropped at an "
+                "earlier open because the meta MAC did not cover it, and this open names no quorum, so it would "
+                f"pin the default {self.verification_quorum} in its place. Run under KIBISIS_VERIFICATION_QUORUM="
+                f"{dropped} to pin it again (or name the quorum you mean)."
+            )
+        clear = dropped is not None and (
+            self._quorum_requested or max(self.verification_quorum, stored or 0) >= dropped
+        )
+        if pins or clear:
             with self._write_tx() as cursor:
-                self._set_meta(cursor, "verification_quorum", str(self.verification_quorum))
-                self._write_meta_mac(cursor)  # the stored quorum is one of the values the meta MAC covers
-            self.verification_quorum_stored = self.verification_quorum
+                if pins:
+                    self._set_meta(cursor, "verification_quorum", str(self.verification_quorum))
+                if clear:
+                    cursor.execute("DELETE FROM vault_meta WHERE key = 'quorum_dropped_from'")
+                    self.quorum_dropped_from = None
+                self._write_meta_mac(cursor)  # the stored quorum and the dropped record are under the meta MAC
+            if pins:
+                self.verification_quorum_stored = self.verification_quorum
 
     def _resolve_attester(self, origin: Optional[str], attester: Optional[str]) -> Optional[str]:
         """The account an attestation is recorded for, or ``None`` when nothing is recorded.

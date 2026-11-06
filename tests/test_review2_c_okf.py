@@ -106,11 +106,16 @@ def test_control_read_only_open_edge_cases(tmp_path):
         SQLiteMemoryVault(str(tmp_path / "notdb.sqlite"), allow_plaintext=True, read_only=True)
     assert not (tmp_path / "missing.sqlite").exists()
     assert (tmp_path / "empty.sqlite").stat().st_size == 0
-    # a plain file with a passphrase in hand: read as plain, no conversion, no sidecar rewrite of the file
+    # a plain file with rows and a passphrase in hand: refused without the R5-1 opt-in (a keyed vault whose
+    # records were removed looks the same), nothing written; with it, read as plain, no conversion, no
+    # sidecar rewrite of the file, and its rows are served as what they are (plain, unverified)
     db = tmp_path / "plain.sqlite"
     _make(db, allow_plaintext=True)
     before = _sha(db)
-    ro = SQLiteMemoryVault(str(db), passphrase=PASSPHRASE, read_only=True, auto_gate=False)
+    with pytest.raises(VaultIntegrityError, match="plaintext entries and no salt"):
+        SQLiteMemoryVault(str(db), passphrase=PASSPHRASE, read_only=True, auto_gate=False)
+    assert _sha(db) == before
+    ro = SQLiteMemoryVault(str(db), passphrase=PASSPHRASE, read_only=True, auto_gate=False, adopt_keyless=True)
     try:
         assert ro.passphrase is None and ro.encrypted_at_rest is False
         assert [r.content for r in ro.list_entities(scope="*", include_unverified=True)] == ["Alpha.", "Beta."]
@@ -152,7 +157,7 @@ def test_fixed_read_only_refusal_of_an_edited_down_integrity_format_names_the_ed
     try:
         monkey.setenv("KIBISIS_ALLOW_PLAINTEXT", "1")
         monkey.setattr(kv, "sqlcipher3", __import__("sqlite3"))
-        keyed = SQLiteMemoryVault(str(plain), passphrase=PASSPHRASE, auto_gate=False)  # keys the plain file
+        keyed = SQLiteMemoryVault(str(plain), passphrase=PASSPHRASE, auto_gate=False, adopt_keyless=True)  # keys the plain file (R5-1 opt-in)
         keyed.close()
         with pytest.raises(ValueError, match="authenticate"):
             SQLiteMemoryVault(str(plain), passphrase="wrong-passphrase-0123456789", read_only=True)

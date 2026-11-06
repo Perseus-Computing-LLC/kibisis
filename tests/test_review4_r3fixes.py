@@ -323,22 +323,25 @@ def test_attack_every_single_witness_scrub_and_the_full_scrub_are_refused(tmp_pa
 
 
 def test_control_the_only_reset_that_passes_is_an_empty_vault(tmp_path):
-    """The reset the discriminator cannot tell from an a5 file: schema scrubbed, every row deleted, and
-    no entry event left (SECURITY.md). What the operator gets is an empty vault with a journal that
-    records no entry, not a vault whose rejections were laundered; the value is not readmitted as a
-    laundered entry because there is nothing left to launder."""
+    """The reset the discriminator cannot tell from an a5 file: schema scrubbed, every row, tombstone
+    and journal event deleted, and no vault_meta key a5 never wrote (SECURITY.md; round 5 made
+    ``term_index_format``, any tombstone and any journal event witnesses). What the operator gets is
+    an empty vault whose journal holds one ``migrate`` event saying a keyed file was here, not a vault
+    whose rejections were laundered; the value is not readmitted as a laundered entry because there
+    is nothing left to launder."""
     p = M._seeded(tmp_path / "v.sqlite")
     c = M._conn(p)
     M._scrub_everything_but_entries(c)
     _scrub_schema(c)
     c.execute("DELETE FROM entities")
     c.execute("DELETE FROM audit_journal")
+    c.execute("DELETE FROM vault_meta WHERE key = 'term_index_format'")
     c.commit()
     c.close()
     v = _open(p)
     try:
         assert v.list_entities() == []
-        assert all(e.action not in ("put", "update") for e in v.list_audit_events(limit=200))
+        assert [e.action for e in v.list_audit_events(limit=200)] == ["migrate"]
         assert v._conn.execute("SELECT count(*) FROM entities").fetchone()[0] == 0
     finally:
         v.close()

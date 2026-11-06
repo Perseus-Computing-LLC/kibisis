@@ -271,3 +271,16 @@ are kept; each now asserts the fixed behaviour).
 
 - A pre-R2-B4 file whose person pinned a quorum above the default loses the pin at its first open under
   this release (logged at WARNING with the value) until the next review verdict re-pins it.
+
+## Round 5
+
+- **R5-4 (low)** after `_drop_untrusted_stored_quorum` drops a quorum the legacy meta MAC never covered,
+  the value is kept as `vault_meta.quorum_dropped_from`, bound by the full-set MAC
+  (`crypto.VAULT_META_BOUND_OPTIONAL`: present keys are hashed as tagged pairs after the fixed set, so
+  files without the record keep their MAC; `_A5_FOREIGN_META` lists it). A pinning open that names no
+  quorum (no argument, no `KIBISIS_VERIFICATION_QUORUM`) and would pin below that value is refused
+  (`ConfigError` "… had its verification quorum pinned at N; that value was dropped … run under
+  KIBISIS_VERIFICATION_QUORUM=N …"); non-pinning opens run as before. The record is cleared once a
+  pinning open names its quorum or pins at least that value. `SQLiteMemoryVault.quorum_dropped_from`
+  exposes it; `review._quorum_line` appends "a pinned N was dropped under a legacy meta MAC …".
+  Editing or deleting the record fails both MAC checks.

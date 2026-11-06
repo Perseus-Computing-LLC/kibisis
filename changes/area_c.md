@@ -161,3 +161,12 @@ Second-pass findings R2-C-1..R2-C-5 (`review_notes/R2_C.md`), plus the "suspecte
 - `tests/review3_entry_mcp.py` → `tests/test_review3_entry_mcp.py`, `tests/review3_entry_aml.py` →
   `tests/test_review3_entry_aml.py`: collected; the `test_attack_*` cases assert the fixed behaviour;
   `test_control_health_and_ledger_do_not_leak_secrets` now expects the quorum in the health report.
+
+## Round 5
+
+- **R5-1 (b)** `--adopt-keyless` on `kibisis-review <verdict>` / `lift` (the TTY-gated commands) and on
+  the admit command in `kibisis` main: the one place an operator gives a passphrase to a plaintext
+  vault that holds entries; passes `adopt_keyless=True` to `open_vault`. `review list`, the MCP and
+  AML servers and the OKF commands never pass it (pinned by
+  `test_fixed_r5_1_servers_and_okf_commands_never_pass_the_opt_in`). `review list` prints the
+  adoption notice; `kibisis_health` reports `keyless_adoption` (`entries`, `at`, `note`) or null.

@@ -56,6 +56,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from typing import Any, List, Optional
 
@@ -85,11 +86,27 @@ def _parser() -> argparse.ArgumentParser:
             "--reviewer",
             help="label to record beside your account; the quorum counts accounts, not labels",
         )
+        _add_adopt_keyless(cmd)
     lift = sub.add_parser("lift", help="remove the tombstones under CATEGORY KEY so the value may be written again (needs a terminal)")
     lift.add_argument("category")
     lift.add_argument("key")
     lift.add_argument("--digest", help="hex digest (or prefix) of the one tombstoned value to lift")
+    _add_adopt_keyless(lift)
     return parser
+
+
+def _add_adopt_keyless(cmd: argparse.ArgumentParser) -> None:
+    """The one opt-in for giving a passphrase to a plain vault that holds entries (R5-1); only on the
+    commands behind the terminal check, never on ``list``, the servers or the OKF commands."""
+    cmd.add_argument(
+        "--adopt-keyless",
+        action="store_true",
+        help=(
+            "adopt the entries of a vault file that has no salt (written without a passphrase) into this "
+            "keyed vault, as candidates; a keyed vault whose records were removed looks the same, so this "
+            "is refused without the flag"
+        ),
+    )
 
 
 def _supersession_notice(vault: Any, entity: Any, scope: str) -> Optional[str]:
@@ -167,9 +184,31 @@ def _quorum_line(vault: Any) -> str:
     quorum = vault.verification_quorum
     stored = getattr(vault, "verification_quorum_stored", None)
     who = "one account verifies" if quorum == 1 else f"{quorum} accounts verify"
+    dropped = getattr(vault, "quorum_dropped_from", None)
+    tail = ""
+    if dropped is not None:
+        tail = (
+            f"; a pinned {dropped} was dropped under a legacy meta MAC: the next verdict must run under "
+            f"{ENV_VERIFICATION_QUORUM}={dropped} (or name the quorum it means) to pin again"
+        )
     if stored is None:
-        return f"quorum {quorum} — {who} (default until a verdict pins it)"
-    return f"quorum {quorum} — {who} (pinned in the vault)"
+        return f"quorum {quorum} — {who} (default until a verdict pins it){tail}"
+    return f"quorum {quorum} — {who} (pinned in the vault){tail}"
+
+
+def _adoption_line(vault: Any) -> Optional[str]:
+    """What the latest migration adopted from a keyless file (R5-1), or None: those entries are
+    candidates on nobody's word until a person reviews them."""
+    report = getattr(vault, "keyless_adoption", None)
+    adopted = report() if callable(report) else None
+    if not adopted:
+        return None
+    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(adopted["at"]))
+    n = adopted["entries"]
+    return (
+        f"{n} {'entry' if n == 1 else 'entries'} adopted from a keyless file on {when} (journal sequence "
+        f"{adopted['sequence']}): candidates until reviewed; nothing in the file vouched for them"
+    )
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -194,7 +233,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 0
             vault = open_vault(db_path, read_only=True)
         else:
-            vault = open_vault(db_path, pin_quorum=True)
+            vault = open_vault(db_path, pin_quorum=True, adopt_keyless=bool(getattr(args, "adopt_keyless", False)))
     except (ConfigError, EncryptionRequiredError) as exc:
         print(f"kibisis-review: {exc}", file=sys.stderr)
         return 2
@@ -203,6 +242,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
     print(f"vault {db_path}  scope {scope!r}", file=sys.stderr)
     print(_quorum_line(vault), file=sys.stderr)
+    adoption = _adoption_line(vault)
+    if adoption:
+        print(adoption, file=sys.stderr)
 
     try:
         if args.command == "list":

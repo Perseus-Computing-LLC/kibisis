@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import unicodedata
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from ._vault_audit import JOURNAL_FORMAT, _event_hash
@@ -22,6 +23,7 @@ from .crypto import (
     TOMBSTONE_BINDING,
     VAULT_META_BOUND_KEYS,
     VAULT_META_BOUND_KEYS_V1,
+    VAULT_META_BOUND_OPTIONAL,
     entry_aad,
     keyed_value_digest,
     sign_entry,
@@ -33,7 +35,7 @@ from .crypto import (
     verify_tenant_payload,
     verify_tombstone_mac,
 )
-from .models import EncryptedEnvelope
+from .models import EncryptedEnvelope, EpistemicState
 from .protocols import EncryptionRequiredError
 
 # The vault's logger: records keep the name callers filter on.
@@ -168,27 +170,91 @@ def _rekey_metadata(metadata: Dict[str, Any], digest_key: bytes) -> bool:
 class EntryIntegrityMixin:
     """Seals, signs, opens and checks entries; keys the value digests; upgrades the integrity format."""
 
-    def _refuse_keyed_records_without_salt(self) -> None:
-        """Raise :class:`VaultIntegrityError` when ``vault_meta`` holds what only a keyed vault writes
-        (a key check, a meta MAC, an integrity format of 2 or more) but no ``kdf_salt``: the salt was
-        removed. Without it the records cannot be checked and the file would read as a plaintext vault
-        (read-only) or be given a fresh salt and fail its key check only after writing (writable)."""
-        if not self._has_meta_key("integrity_format") and not self._has_meta_key("key_check") \
-                and not self._has_meta_key("meta_mac"):
-            return  # no vault_meta table, or none of the keyed records: never keyed
-        rows = self._conn.execute(
-            "SELECT key FROM vault_meta WHERE key IN ('key_check', 'meta_mac', 'integrity_format', 'kdf_salt')"
-        ).fetchall()
-        present = {r[0] for r in rows}
-        if "kdf_salt" in present:
+    def _integrity_format_record(self) -> int:
+        """``vault_meta.integrity_format`` as an integer: 0 when absent or empty. A value that is not
+        an integer (``'abc'``, ``'1.9'``) is an edited record and a :class:`VaultIntegrityError`, not
+        a ``ValueError`` from ``int()`` after the schema upgrade ran (R5 Minor)."""
+        raw = self._meta("integrity_format")
+        if raw is None:
+            return 0
+        try:
+            text = bytes(raw).decode("ascii") if isinstance(raw, (bytes, bytearray, memoryview)) else str(raw)
+            return int(text) if text.strip() else 0
+        except (TypeError, ValueError, UnicodeDecodeError):
+            raise VaultIntegrityError(
+                f"{self.db_path}: vault_meta.integrity_format is {raw!r}, not an integer; the integrity record "
+                "was edited. Refusing to open; restore the record before opening."
+            ) from None
+
+    def _refuse_keyed_records_without_salt(self, *, sealed_rows: bool = True) -> None:
+        """Raise :class:`VaultIntegrityError` when the file holds what only a keyed vault writes but no
+        ``kdf_salt``: a key check, a meta MAC, an integrity format of 2 or more in ``vault_meta``, or
+        (``sealed_rows``, R5-3) an entity row that is sealed (``is_encrypted`` not 0, or an envelope).
+        The salt was removed. Without it the records cannot be checked and the file would read as a
+        plaintext vault (read-only) or be given a fresh salt and fail every row only after writing it
+        (writable). Runs on the file as it is, before ``_init_schema``, so the refused file is not
+        written to at all."""
+        if self._has_meta_key("kdf_salt"):
             return
-        keyed = [k for k in ("key_check", "meta_mac") if k in present]
-        if "integrity_format" in present and int(self._meta("integrity_format") or 0) >= 2:
-            keyed.append("integrity_format >= 2")
+        keyed: List[str] = []
+        if self._has_meta_key("integrity_format") or self._has_meta_key("key_check") or self._has_meta_key("meta_mac"):
+            rows = self._conn.execute(
+                "SELECT key FROM vault_meta WHERE key IN ('key_check', 'meta_mac', 'integrity_format')"
+            ).fetchall()
+            present = {r[0] for r in rows}
+            keyed = [k for k in ("key_check", "meta_mac") if k in present]
+            if "integrity_format" in present and self._integrity_format_record() >= 2:
+                keyed.append("integrity_format >= 2")
+        if sealed_rows and self._table_exists("entities"):
+            sealed = self._conn.execute(
+                "SELECT count(*) FROM entities WHERE is_encrypted IS NOT 0 "
+                "OR (encrypted_envelope_json IS NOT NULL AND encrypted_envelope_json != '')"
+            ).fetchone()[0]
+            if sealed:
+                keyed.append(f"{sealed} sealed entries (is_encrypted = 1 or a sealed envelope)")
         if keyed:
             raise VaultIntegrityError(
-                f"{self.db_path}: vault_meta carries {', '.join(keyed)} but no kdf_salt; the vault's salt was "
-                "removed. Refusing to open; restore the salt before opening."
+                f"{self.db_path}: the file carries {', '.join(keyed)} but vault_meta holds no kdf_salt; the vault's "
+                "salt was removed. Refusing to open; restore the salt before opening."
+            )
+
+    def _table_exists(self, name: str) -> bool:
+        return bool(
+            self._conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)).fetchone()
+        )
+
+    def _keyless_rows(self) -> Tuple[int, int]:
+        """(entity rows, tombstone rows) of a file that holds no ``kdf_salt``."""
+        entries = self._conn.execute("SELECT count(*) FROM entities").fetchone()[0] if self._table_exists("entities") else 0
+        tombstones = (
+            self._conn.execute("SELECT count(*) FROM rejected_value_tombstones").fetchone()[0]
+            if self._table_exists("rejected_value_tombstones") else 0
+        )
+        return int(entries), int(tombstones)
+
+    def _refuse_unadopted_keyless_rows(self) -> None:
+        """The salt-absent door (R5-1). A file with no ``kdf_salt`` reads as a vault that never had a
+        passphrase, and the first keyed open adopts its plaintext rows into the keyed vault. A keyed
+        vault whose ``vault_meta`` was deleted whole (salt included) and whose rows were flattened to
+        plaintext by a file writer looks exactly the same, so the adoption is never silent: a file with
+        rows is refused unless the open passed ``adopt_keyless=True``, and then every adopted row
+        becomes a ``candidate`` (:meth:`_migrate_integrity`). A tombstone row in such a file is refused
+        outright: it would be MAC-signed on nobody's word; lift it in the keyless vault first. A file
+        with no rows and no tombstones is a fresh vault and needs no opt-in. Runs before
+        ``_init_schema`` so the refused file is not written to."""
+        if self._has_meta_key("kdf_salt"):
+            return
+        entries, tombstones = self._keyless_rows()
+        if tombstones:
+            raise VaultIntegrityError(
+                f"{self.db_path}: this file has no salt but holds {tombstones} tombstone rows; a tombstone adopted "
+                "from a keyless file would be signed on nobody's word. Lift the tombstones in the keyless vault "
+                "(open it without a passphrase) before giving it one."
+            )
+        if entries and not getattr(self, "_adopt_keyless", False):
+            raise VaultIntegrityError(
+                f"{self.db_path}: this file has {entries} plaintext entries and no salt; a keyed vault whose records "
+                "were removed looks the same; pass adopt_keyless=True to adopt them as candidates"
             )
 
     def _vault_salt(self) -> bytes:
@@ -264,6 +330,55 @@ class EntryIntegrityMixin:
         )
         if self._search_index or self._term_index:
             self._index_entry(cursor, r["id"], r["category"], r["key"], content, r["scope"])
+
+    #: Metadata an entry carries only because a person or the vault's own admission path established it;
+    #: cleared when a row is adopted from a keyless file (R5-1), as a model-origin write never carries them.
+    _TRUST_METADATA_KEYS: Tuple[str, ...] = (
+        "human_reviews", "attestations", "verification_pending", "act_class_capped_from",
+        "trust_inherited_from", "last_verified_at",
+    )
+
+    def _demote_adopted_row(self, cursor: Any, entity_id: int) -> None:
+        """Make an entry adopted from a keyless file a ``candidate`` with its trust facts reset
+        (:data:`_TRUST_METADATA_KEYS` dropped, ``adopted_from_keyless_file`` stamped). The origin and
+        origin class stay as stored; what is reset is anything that would count as a person's word."""
+        row = cursor.execute("SELECT metadata_json, epistemic_state FROM entities WHERE id = ?", (entity_id,)).fetchone()
+        try:
+            meta = json.loads(row["metadata_json"] or "{}")
+        except (TypeError, ValueError):
+            meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        for name in self._TRUST_METADATA_KEYS:
+            meta.pop(name, None)
+        meta["adopted_from_keyless_file"] = {"at": time.time(), "stored_state": row["epistemic_state"]}
+        cursor.execute(
+            "UPDATE entities SET epistemic_state = ?, metadata_json = ? WHERE id = ?",
+            (EpistemicState.CANDIDATE.value, json.dumps(meta, sort_keys=True), entity_id),
+        )
+
+    def keyless_adoption(self) -> Optional[Dict[str, Any]]:
+        """What the latest ``migrate`` event says about rows adopted from a keyless file (R5-1):
+        ``{"entries": n, "at": timestamp, "sequence": s}`` when it adopted any, else None. Shown by
+        ``health`` and ``review list`` for as long as the event is the latest migration, since every
+        adopted row is a candidate on nobody's word until a person reviews it."""
+        try:
+            row = self._conn.execute(
+                "SELECT sequence, timestamp, metadata_json FROM audit_journal WHERE action = 'migrate' "
+                "ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
+        except Exception:  # no audit_journal table yet (sqlite3 or sqlcipher3 OperationalError)
+            return None
+        if row is None:
+            return None
+        try:
+            meta = json.loads(row["metadata_json"] or "{}")
+        except (TypeError, ValueError):
+            return None
+        adopted = meta.get("entries_adopted_from_keyless_vault") if isinstance(meta, dict) else None
+        if not isinstance(adopted, int) or isinstance(adopted, bool) or adopted <= 0:
+            return None
+        return {"entries": adopted, "at": float(row["timestamp"]), "sequence": int(row["sequence"])}
 
     def _open_entry(self, r: Any) -> str:
         """Content of a stored row, after its integrity checks.
@@ -398,7 +513,10 @@ class EntryIntegrityMixin:
     #: integrity format 2 and later, or the schema upgrade of a later release, write.
     _A5_FOREIGN_TABLES: Tuple[str, ...] = ("audit_head",)
     _A5_FOREIGN_COLUMNS: Tuple[Tuple[str, str], ...] = (("audit_journal", "format"), ("rejected_value_tombstones", "tombstone_mac"))
-    _A5_FOREIGN_META: Tuple[str, ...] = ("key_check", "meta_mac", "journal_format_floor", "journal_anchored", "verification_quorum")
+    _A5_FOREIGN_META: Tuple[str, ...] = (
+        "key_check", "meta_mac", "journal_format_floor", "journal_anchored", "verification_quorum",
+        "quorum_dropped_from", "term_index_format", "search_index_format",
+    )
 
     def _refuse_unless_genuine_a5(self, passphrase: str) -> Optional[Tuple[bytes, Tuple[bytes, bytes, bytes]]]:
         """The one discriminator between a genuine Kibisis 0.1.0a5 file and a keyed (integrity format 2+)
@@ -437,12 +555,26 @@ class EntryIntegrityMixin:
           (no binding): every a5 row is its own proof of the passphrase. When no sealed row opens at
           all the passphrase is wrong (or every envelope was replaced): ``ValueError`` ("Failed to
           authenticate ..."), the same refusal as for any wrong passphrase;
-        * the entity table is empty while the journal records ``put``/``update`` events that were never
-          purged or tombstoned: the entries were deleted (the R3-AB2 ``DELETE FROM entities`` variant).
+        * the entity table is empty while the journal holds any event or the tombstone table any row:
+          a5 wrote tombstone rows with plain digests and journal events under any author, and a
+          migration of an empty table would MAC-sign the tombstones and chain the events into a
+          signed head on nobody's word (R5-2). An a5 file with no entries has nothing to lose.
 
-        What is left to a file writer is the reset that satisfies all of these: a headless journal
-        with no entry event and no sealed entry, which is an empty vault (SECURITY.md). The
-        ``tenant_sig`` column is not a witness: the fixture holds an a5 row without one.
+        What is left to a file writer on this (salt-present) door is the reset that satisfies all of
+        these: a headless journal with no event, no tombstone row and no entry, which is an empty
+        vault; it is admitted, and its migration writes a ``migrate`` event that tells it from a vault
+        created fresh (SECURITY.md). The ``tenant_sig`` column is not a witness: the fixture holds an
+        a5 row without one.
+
+        This discriminator does not see the second door. A file whose ``vault_meta`` was deleted whole
+        (salt included) is not a candidate here: it reads as a vault that never had a passphrase, and
+        the format 1 migration adopts its plaintext rows. That door is guarded separately by
+        :meth:`_refuse_unadopted_keyless_rows` (also run before ``_init_schema``): a keyless file with
+        rows is refused unless the open passed ``adopt_keyless=True``, every adopted row becomes a
+        ``candidate`` with its attestations reset, a tombstone row refuses the open, and the
+        ``migrate`` event's ``entries_adopted_from_keyless_vault`` is surfaced by ``health`` and
+        ``review list``. Sealed rows without a salt are refused by
+        :meth:`_refuse_keyed_records_without_salt` before anything is written (R5-3).
         """
         from .crypto import AESGCMCryptoEnvelopeProvider, derive_vault_keys
 
@@ -525,20 +657,23 @@ class EntryIntegrityMixin:
             found.append(
                 f"{len(closed)} of {len(rows)} sealed entries that do not open under the passphrase, first {closed[0]}"
             )
-        if not rows and "audit_journal" in tables:
-            live: set = set()
-            for ev in conn.execute("SELECT action, category, key, scope FROM audit_journal ORDER BY sequence ASC").fetchall():
-                ident = (ev["category"], ev["key"], ev["scope"])
-                if ev["action"] in ("put", "update"):
-                    live.add(ident)
-                elif ev["action"] in ("purge", "tombstone"):
-                    live.discard(ident)
-            if live:
-                category, key, scope = sorted(live)[0]
-                found.append(
-                    f"an entity table that is empty while the journal records {len(live)} entries that were never "
-                    f"purged, first '{category}:{key}' [scope={scope}]"
-                )
+        if not rows:
+            # "An empty vault" means empty (R5-2): no tombstone row (it would be MAC-signed) and no journal
+            # event (it would be chained into a signed head) on top of no entry.
+            if "rejected_value_tombstones" in tables:
+                n_tombstones = conn.execute("SELECT count(*) FROM rejected_value_tombstones").fetchone()[0]
+                if n_tombstones:
+                    found.append(f"an entity table that is empty beside {n_tombstones} tombstone rows")
+            if "audit_journal" in tables:
+                n_events = conn.execute("SELECT count(*) FROM audit_journal").fetchone()[0]
+                if n_events:
+                    first = conn.execute(
+                        "SELECT action, category, key, scope FROM audit_journal ORDER BY sequence ASC LIMIT 1"
+                    ).fetchone()
+                    found.append(
+                        f"an entity table that is empty beside a journal of {n_events} events, first "
+                        f"'{first['action']}' on '{first['category']}:{first['key']}' [scope={first['scope']}]"
+                    )
         if found:
             raise VaultIntegrityError(
                 f"{self.db_path}: the vault is keyed (kdf_salt present) but has no key check, and it is not a "
@@ -562,7 +697,7 @@ class EntryIntegrityMixin:
         Finally every tombstone row's MAC is checked and the journal's tombstone events are reconciled
         with the rows (:meth:`_check_tombstones`).
         """
-        stored_format = int(self._meta("integrity_format") or 0)
+        stored_format = self._integrity_format_record()
         stored = self._meta("key_check")
         if stored is not None:
             if not hmac.compare_digest(str(stored), self._key_check_value()):
@@ -593,7 +728,7 @@ class EntryIntegrityMixin:
             )
         if stored_format < 2:
             self.integrity_upgrade = self._migrate_integrity()
-            stored_format = int(self._meta("integrity_format") or 0)
+            stored_format = self._integrity_format_record()
         if stored_format < INTEGRITY_FORMAT:
             self._upgrade_to_format_3()
         else:
@@ -605,7 +740,7 @@ class EntryIntegrityMixin:
     # --- vault_meta MAC (integrity format 3) ------------------------------------------------------------
 
     def _meta_mac_fields(self) -> Dict[str, Any]:
-        return {name: self._meta(name) for name in VAULT_META_BOUND_KEYS}
+        return {name: self._meta(name) for name in VAULT_META_BOUND_KEYS + VAULT_META_BOUND_OPTIONAL}
 
     def _write_meta_mac(self, cursor: Any) -> None:
         """Sign the bound ``vault_meta`` values as they stand now; every change to one of them ends here.
@@ -670,7 +805,7 @@ class EntryIntegrityMixin:
         ``tombstones_signed`` and ``journal_format_floor`` to the report.
         """
         with self._write_tx() as cursor:
-            if int(self._meta("integrity_format") or 0) >= INTEGRITY_FORMAT:
+            if self._integrity_format_record() >= INTEGRITY_FORMAT:
                 self._verify_meta_mac()
                 return  # another process upgraded it first
             if not self.verify_audit_chain():
@@ -810,7 +945,18 @@ class EntryIntegrityMixin:
         does not decrypt, are left untouched and refused. Journal and tombstones: every plain SHA-256
         value digest becomes its keyed form, the journal's hashes are recomputed in order, and digest
         prefixes in refusal records are dropped. A ``migrate`` event records the counts, the old chain
-        head and whether the old chain verified. Returns the counts, or None for an empty vault.
+        head and whether the old chain verified. Returns the counts, or None for a vault with nothing
+        to migrate that never had a salt (a fresh vault). A salted file with nothing in it (the one
+        reset the a5 discriminator admits) gets the ``migrate`` event too, with every count at zero,
+        so it is told from a fresh vault (R5-2).
+
+        A file with no salt (never keyed, or a keyed vault whose ``vault_meta`` and seals a file
+        writer removed: nothing in the file tells them apart, R5-1) reaches this only with
+        ``adopt_keyless=True`` (:meth:`_refuse_unadopted_keyless_rows`). Its rows are adopted
+        regardless of signature, since the keyless signing key is computable from the path, and each
+        becomes a ``candidate`` with its attestations, reviews and trust-derived metadata reset, as a
+        model-origin write would be stored: ``entries_adopted_from_keyless_vault`` counts them and a
+        person's verdict is what makes any of them ``verified`` again.
         """
         counts: Dict[str, Any] = {
             "entries_resealed": 0,
@@ -825,7 +971,7 @@ class EntryIntegrityMixin:
         assert digest_key is not None
         trust_unsigned = self._sqlcipher_active and not self._converted_to_sqlcipher
         with self._write_tx() as cursor:
-            if int(self._meta("integrity_format") or 0) >= 2:
+            if self._integrity_format_record() >= 2:
                 return None  # another process upgraded it first
             rows = cursor.execute(
                 "SELECT id, category, key, scope, content, is_encrypted, encrypted_envelope_json, tenant_sig FROM entities"
@@ -840,13 +986,36 @@ class EntryIntegrityMixin:
             if not (rows or tombstones or events):
                 self._set_meta(cursor, "integrity_format", 2)
                 self._set_meta(cursor, "key_check", self._key_check_value())
-                return None
+                if not self._was_keyed:
+                    return None  # a fresh vault: nothing was here before this open
+                # A salted file with nothing in it: the one reset the a5 discriminator admits (or a vault
+                # that was emptied). Say so in the journal, so it never reads as a vault created fresh.
+                self._record_audit_event(
+                    cursor=cursor, action="migrate", category="", key="", scope="*", value_sha256="",
+                    metadata={"integrity_format": 2, "previous_head": "0" * 64, "previous_chain_valid": True,
+                              "empty_keyed_file": True, **counts},
+                )
+                return {"empty_keyed_file": True, **counts}
 
             # A vault that never had a passphrase holds only plaintext entries, signed (if at all) with a key
-            # anyone can compute, so its first open with a passphrase is where trust starts: adopt them.
+            # anyone can compute, so its first open with a passphrase is where trust starts. A keyed vault
+            # whose vault_meta (salt included) and seals were removed by a file writer looks the same, so the
+            # open had to pass adopt_keyless=True to get here, and what is adopted is adopted as a candidate
+            # with its trust facts reset: nothing in the file vouches for them (R5-1).
             # Otherwise decide every entry before changing anything, and stop under a wrong passphrase: an
             # upgrade under the wrong key would re-key the tombstones and the journal beyond repair.
             was_keyed = self._was_keyed or any(r["is_encrypted"] == 1 for r in rows)
+            if not was_keyed and rows and not getattr(self, "_adopt_keyless", False):
+                raise VaultIntegrityError(
+                    f"{self.db_path}: this file has {len(rows)} plaintext entries and no salt; a keyed vault whose "
+                    "records were removed looks the same; pass adopt_keyless=True to adopt them as candidates"
+                )
+            if not was_keyed and tombstones:
+                raise VaultIntegrityError(
+                    f"{self.db_path}: this file has no salt but holds {len(tombstones)} tombstone rows; a tombstone "
+                    "adopted from a keyless file would be signed on nobody's word. Lift the tombstones in the "
+                    "keyless vault (open it without a passphrase) before giving it one."
+                )
             # With a salt present the file passed ``_refuse_unless_genuine_a5`` before ``_init_schema``: every
             # row is sealed the way a5 sealed it and opens under the passphrase, and an empty table has no
             # unpurged entry event behind it. The chain check below is necessary (a journal that does not
@@ -888,6 +1057,8 @@ class EntryIntegrityMixin:
             for r, content in reseal:
                 self._write_sealed(cursor, r, content, encrypt=r["is_encrypted"] == 1)
                 counts["entries_resealed"] += 1
+                if not was_keyed:
+                    self._demote_adopted_row(cursor, r["id"])
 
             for t in tombstones:
                 exact, canonical = t["value_sha256"], t["canonical_sha256"] or ""

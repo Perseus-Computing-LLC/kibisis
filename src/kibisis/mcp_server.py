@@ -31,6 +31,7 @@ import html
 import json
 import re
 import sys
+import time
 import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional
@@ -624,8 +625,23 @@ class KibisisMCPServer:
             plaintext += int(row["plain"])
         quorum = int(self.vault.verification_quorum)
         stored = getattr(self.vault, "verification_quorum_stored", None)
+        report = getattr(self.vault, "keyless_adoption", None)
+        adopted = report() if callable(report) else None
+        if adopted:
+            when = time.strftime("%Y-%m-%d", time.gmtime(adopted["at"]))
+            adoption: Any = {
+                "entries": adopted["entries"],
+                "at": adopted["at"],
+                "note": (
+                    f"{adopted['entries']} entries adopted from a keyless file on {when}: candidates on nobody's "
+                    "word until a person reviews them (R5-1)"
+                ),
+            }
+        else:
+            adoption = None
         return {
             "status": "healthy",
+            "keyless_adoption": adoption,
             "scope": self.scope,
             "active_entities": sum(by_state.values()),
             "by_state": by_state,

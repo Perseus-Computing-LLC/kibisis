@@ -56,7 +56,9 @@ def _admit(args: argparse.Namespace) -> int:
     # entry the agent wrote, not a namesake in another file or scope.
     try:
         scope = validate_scope(args.scope) if args.scope is not None else resolve_scope()
-        vault = open_vault(args.db, pin_quorum=True)  # a person at a terminal: the one open that may pin the quorum
+        # A person at a terminal: the one open that may pin the quorum, and the one that may adopt the
+        # entries of a vault file that has no salt (--adopt-keyless, R5-1).
+        vault = open_vault(args.db, pin_quorum=True, adopt_keyless=bool(args.adopt_keyless))
     except (ConfigError, EncryptionRequiredError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
@@ -255,6 +257,14 @@ def main(argv: list[str] | None = None) -> int:
         help="label recorded with the review; the quorum counts the operating-system account, not this",
     )
     a.add_argument("--note", default=None)
+    a.add_argument(
+        "--adopt-keyless", action="store_true",
+        help=(
+            "adopt the entries of a vault file that has no salt (written without a passphrase) into this keyed "
+            "vault, as candidates; a keyed vault whose records were removed looks the same, so this is refused "
+            "without the flag"
+        ),
+    )
     a.set_defaults(func=_admit)
 
     e = sub.add_parser("okf-export", help="write allowlisted vault rows as an OKF v0.2 bundle (reads the vault only)")

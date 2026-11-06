@@ -1,9 +1,10 @@
 """Review 5 (091c218): the a5 discriminator (R4-1 lineage), the quorum under a legacy MAC (R4-2) and the
-lift reconciliation state space (R4-3), under attack.
+lift reconciliation state space (R4-3), under attack; converted to a regression suite at round 5.
 
-``test_control_*`` asserts the secure behaviour (failing = bug); ``test_attack_*`` demonstrates a
-defect (passing = bug). Vaults are opened WITHOUT SQLCipher with a passphrase (allow_plaintext) =
-SECURITY.md's file-writer model. Not collected by default; run by path.
+``test_control_*`` asserts the secure behaviour (failing = bug); ``test_fixed_r5_*`` are the four
+``test_attack_*`` repros rewritten to assert the round-5 fix (R5-1..R5-4, review_notes/R5.md).
+Vaults are opened WITHOUT SQLCipher with a passphrase (allow_plaintext) = SECURITY.md's
+file-writer model.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from kibisis.crypto import (
     AESGCMCryptoEnvelopeProvider,
     VAULT_META_BOUND_KEYS,
     VAULT_META_BOUND_KEYS_V1,
+    VAULT_META_BOUND_OPTIONAL,
     sign_tenant_payload,
     vault_meta_mac,
 )
@@ -75,16 +77,14 @@ def _a5_seal(salt: bytes, passphrase: str, scope: str, category: str, key: str, 
 # =============================================================== 1. the discriminator and the salt-absent door
 
 
-def test_attack_r5_1_salt_absent_reset_launders_a_keyed_vault_as_never_keyed(tmp_path):
-    """R5-1. ``_refuse_unless_genuine_a5`` is only reached with ``kdf_salt`` present. A file writer who
-    removes the WHOLE of vault_meta (salt included), sets every row plaintext with content of their
-    choosing, drops the tombstones and re-chains the journal headless makes the file look like a vault
-    that never had a passphrase; the next open with the real passphrase treats it as one: every row is
-    adopted (``entries_adopted_from_keyless_vault``), sealed and signed under the real key with the
-    epistemic state the writer wrote, the chain verifies, the rejected value is no longer tombstoned
-    and is readmitted. Same cost as R4-1 (the sealed text is lost) with a stronger outcome (adopted and
-    ``verified``, not left unsigned)."""
-    p = M._seeded(tmp_path / "v.sqlite")
+ADOPT_REFUSAL = "plaintext entries and no salt; a keyed vault whose records were removed looks the same"
+
+
+def _laundered_keyless_file(tmp_path, name="v.sqlite"):
+    """R5-1's file: a keyed vault whose WHOLE vault_meta (salt included) was deleted, every row
+    flattened to plaintext with the writer's content and state, tombstones dropped, journal
+    re-chained headless. Nothing in it tells it from a vault that never had a passphrase."""
+    p = M._seeded(tmp_path / name)
     c = M._conn(p)
     M._scrub_everything_but_entries(c)
     c.execute("DELETE FROM vault_meta")
@@ -92,27 +92,122 @@ def test_attack_r5_1_salt_absent_reset_launders_a_keyed_vault_as_never_keyed(tmp
               "content = 'FORGED ' || key, epistemic_state = 'verified'")
     c.commit()
     c.close()
-    v = _open(p)
+    return p
+
+
+def test_fixed_r5_1_salt_absent_reset_is_refused_without_the_opt_in_and_nothing_is_written(tmp_path):
+    """R5-1 (b). The salt-absent door needs an explicit opt-in: without ``adopt_keyless=True`` the
+    writable open AND the read-only open are refused, naming the count and the ambiguity, and the
+    file is byte for byte as the writer left it (no salt, no schema upgrade). A keyless file with
+    no rows is a fresh vault and needs no opt-in."""
+    p = _laundered_keyless_file(tmp_path)
+    before = R4._content(p)
+    digest, mtime = _file_digest(p), os.stat(p).st_mtime_ns
+    with pytest.raises(VaultIntegrityError, match=ADOPT_REFUSAL) as info:
+        _open(p)
+    assert "this file has 3 plaintext entries and no salt" in str(info.value)
+    assert "pass adopt_keyless=True to adopt them as candidates" in str(info.value)
+    assert R4._content(p) == before
+    assert (_file_digest(p), os.stat(p).st_mtime_ns) == (digest, mtime)
+    with pytest.raises(VaultIntegrityError, match=ADOPT_REFUSAL):
+        _open(p, read_only=True)  # the forged content is not served either
+    assert R4._content(p) == before
+    c = M._conn(p)
+    assert c.execute("SELECT count(*) FROM vault_meta").fetchone()[0] == 0
+    c.close()
+    # an empty keyless file (no rows, no tombstones) is a fresh vault: no opt-in needed
+    empty = tmp_path / "empty.sqlite"
+    SQLiteMemoryVault(str(empty), auto_gate=False, allow_plaintext=True).close()
+    v = _open(empty)
+    try:
+        assert v.integrity_upgrade is None and v.list_entities() == []
+    finally:
+        v.close()
+
+
+def test_fixed_r5_1_opted_in_adoption_demotes_every_row_to_candidate_and_is_surfaced(tmp_path):
+    """R5-1 (a). With the opt-in, every adopted row is a ``candidate`` with its attestations and
+    reviews reset, whatever state and metadata the file carried; the ``migrate`` event records
+    ``entries_adopted_from_keyless_vault``; ``keyless_adoption()``, ``review list``'s notice and
+    the MCP ``health`` report say so; the forged state is not ``verified`` and the value the vault
+    had rejected is writable only as what it is, a candidate on nobody's word."""
+    p = _laundered_keyless_file(tmp_path)
+    c = M._conn(p)
+    c.execute("UPDATE entities SET metadata_json = ? WHERE key = 'k0'", (json.dumps({
+        "human_reviews": [{"reviewer_id": "forged", "verdict": "verified"}],
+        "attestations": ["forged"], "last_verified_at": 1.0, "author_id": "alice", "note": "kept",
+    }),))
+    c.commit()
+    c.close()
+    v = _open(p, adopt_keyless=True)
     try:
         up = v.integrity_upgrade
         assert up["entries_adopted_from_keyless_vault"] == 3 and up["entries_resealed"] == 3
-        assert up["entries_left_unsigned"] == 0 and up["entries_undecryptable"] == 0
-        got = {(e.key, e.content, e.epistemic_state.value) for e in v.list_entities()}
-        assert got == {(f"k{i}", f"FORGED k{i}", "verified") for i in range(3)}
-        assert v.integrity_status()["unsigned"] == 0
+        assert v.list_entities() == []  # nothing verified is served
+        got = {(e.key, e.content, e.epistemic_state.value) for e in v.list_entities(epistemic_state="candidate")}
+        assert got == {(f"k{i}", f"FORGED k{i}", "candidate") for i in range(3)}
+        k0 = v.get("decision", "k0")
+        assert "human_reviews" not in k0.metadata and "attestations" not in k0.metadata
+        assert "last_verified_at" not in k0.metadata and k0.metadata["note"] == "kept"
+        assert k0.metadata["adopted_from_keyless_file"]["stored_state"] == "verified"
         assert v.verify_audit_chain() is True
-        assert v.is_tombstoned("decision", "any", VALUE) is False
-        v.remember("decision", "bad", VALUE, origin="user", author_id="alice")  # readmitted
+        migrate = [e for e in v.list_audit_events(limit=50) if e.action == "migrate"]
+        assert len(migrate) == 1 and migrate[0].metadata["entries_adopted_from_keyless_vault"] == 3
+        report = v.keyless_adoption()
+        assert report["entries"] == 3 and report["sequence"] == migrate[0].sequence
+        from kibisis.review import _adoption_line
+        assert "3 entries adopted from a keyless file on" in _adoption_line(v)
         assert v._meta("key_check") is not None and v._meta("meta_mac") is not None
     finally:
         v.close()
-    ro = _open(p, read_only=True)
+    ro = _open(p, read_only=True)  # salted now: the ordinary keyed open, no opt-in involved
     try:
-        assert {e.content for e in ro.list_entities()} >= {"FORGED k0"}
-        assert ro.get("decision", "bad").content == VALUE
-        assert ro.verify_audit_chain() is True
+        assert ro.list_entities() == [] and len(ro.list_entities(epistemic_state="candidate")) == 3
+        assert ro.keyless_adoption()["entries"] == 3
     finally:
         ro.close()
+    from kibisis.mcp_server import KibisisMCPServer
+    server = KibisisMCPServer(vault=_open(p), scope="default")
+    try:
+        health = server._health()
+        assert health["keyless_adoption"]["entries"] == 3
+        assert "adopted from a keyless file" in health["keyless_adoption"]["note"]
+    finally:
+        server.vault.close()
+
+
+def test_fixed_r5_1_a_keyless_file_with_tombstones_is_refused_even_with_the_opt_in(tmp_path):
+    """A tombstone in a keyless file would be MAC-signed on nobody's word: refused outright, with
+    nothing written; the operator lifts it in the keyless vault (no passphrase) first."""
+    p = _laundered_keyless_file(tmp_path)
+    c = M._conn(p)
+    exact, canonical = value_digests(VALUE)
+    c.execute(
+        "INSERT INTO rejected_value_tombstones (category, key, value_sha256, canonical_sha256, reason, author_id, "
+        "created_at, scope, sealed_digests, origin_class) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("decision", "planted", exact, canonical, "planted", "file-writer", 0.0, "default", None, "principal"),
+    )
+    c.commit()
+    c.close()
+    before = R4._content(p)
+    for kw in ({}, {"adopt_keyless": True}, {"read_only": True}):
+        with pytest.raises(VaultIntegrityError, match="tombstone rows; a tombstone adopted from a keyless file"):
+            _open(p, **kw)
+        assert R4._content(p) == before
+
+
+def test_fixed_r5_1_servers_and_okf_commands_never_pass_the_opt_in():
+    """The opt-in lives only on the operator commands behind the terminal check."""
+    for name in ("mcp_server.py", "aml_adapter.py"):
+        text = open(os.path.join(SRC, name), encoding="utf-8").read()
+        assert "adopt_keyless" not in text, name
+    for name in os.listdir(os.path.join(SRC, "okf")):
+        if name.endswith(".py"):
+            text = open(os.path.join(SRC, "okf", name), encoding="utf-8").read()
+            assert "adopt_keyless" not in text, name
+    main_text = open(os.path.join(SRC, "__main__.py"), encoding="utf-8").read()
+    assert main_text.count("adopt_keyless=bool(args.adopt_keyless)") == 1  # admit only
+    assert "_open_okf_vault" in main_text and "adopt_keyless" not in main_text.split("def _open_okf_vault")[1].split("def ")[0]
 
 
 def test_control_a_genuine_never_keyed_vault_and_the_laundered_file_differ_only_by_what_the_writer_chooses(tmp_path):
@@ -130,9 +225,12 @@ def test_control_a_genuine_never_keyed_vault_and_the_laundered_file_differ_only_
     assert {r[0] for r in c.execute("SELECT format FROM audit_journal")} == {3}
     assert c.execute("SELECT is_encrypted FROM entities").fetchone()[0] == 0
     c.close()
-    v = _open(p)  # first open with a passphrase: adopted, by design
+    with pytest.raises(VaultIntegrityError, match=ADOPT_REFUSAL):
+        _open(p)  # the genuine keyless vault is refused the same way: the file cannot tell
+    v = _open(p, adopt_keyless=True)  # first open with a passphrase: adopted, as candidates
     try:
         assert v.integrity_upgrade["entries_adopted_from_keyless_vault"] == 1
+        assert v.get("decision", "k0").epistemic_state.value == "candidate"
     finally:
         v.close()
 
@@ -161,40 +259,38 @@ def _plant_tombstone_and_history(c, content, author="file-writer"):
     R4._legacy_rechain_without_format(c)
 
 
-def test_attack_r5_2_the_empty_vault_reset_signs_planted_tombstones_and_audit_history(tmp_path):
-    """R5-2. The one state the discriminator admits ("an empty vault") is empty of ENTRIES only. The
-    file writer plants tombstone rows with plain digests and journal events of any non-entry action
-    under any author; the migration keys and MAC-signs the tombstones (``tombstones_rekeyed``) and
-    re-chains the forged history into a signed head: ``verify_audit_chain()`` is True, the planted
-    value is rejected in the operator's scope with a valid ``tombstone_mac``, and the forged
-    ``attestations_reset`` / ``state_transition`` events read as authentic."""
-    p = M._seeded(tmp_path / "v.sqlite")
-    c = M._conn(p)
-    M._scrub_everything_but_entries(c)
-    R4._scrub_schema(c)
-    c.execute("DELETE FROM entities")
-    c.execute("DELETE FROM audit_journal")
-    _plant_tombstone_and_history(c, "the value the writer wants blocked")
-    c.commit()
-    c.close()
-    v = _open(p)
-    try:
-        assert v.integrity_upgrade["tombstones_rekeyed"] == 1
-        assert v.verify_audit_chain() is True
-        assert v.is_tombstoned("decision", "anything", "the value the writer wants blocked") is True
-        tombs = v.list_tombstones()
-        assert len(tombs) == 1 and tombs[0]["origin_class"] == "principal"
-        actions = [e.action for e in v.list_audit_events(limit=50)]
-        assert "attestations_reset" in actions and "state_transition" in actions
-        with pytest.raises(vault_module.TombstonedValueError):
-            v.remember("decision", "x", "the value the writer wants blocked", origin="user", author_id="alice")
-    finally:
-        v.close()
-    ro = _open(p, read_only=True)
-    try:
-        assert ro.verify_audit_chain() is True and len(ro.list_tombstones()) == 1
-    finally:
-        ro.close()
+def test_fixed_r5_2_the_empty_vault_reset_with_planted_tombstones_or_history_is_refused_untouched(tmp_path):
+    """R5-2. "An empty vault" means empty: with no entity row, a planted tombstone row or ANY journal
+    event (``tombstone``, ``attestations_reset``, ``state_transition``, ...) is a witness; the open
+    is refused naming it and the file is as the writer left it. Each planted piece on its own is
+    enough."""
+    for variant in ("both", "tombstone_only", "history_only"):
+        p = M._seeded(tmp_path / f"{variant}.sqlite")
+        c = M._conn(p)
+        M._scrub_everything_but_entries(c)
+        R4._scrub_schema(c)
+        c.execute("DELETE FROM entities")
+        c.execute("DELETE FROM audit_journal")
+        c.execute("DELETE FROM vault_meta WHERE key = 'term_index_format'")  # a witness since round 5
+        _plant_tombstone_and_history(c, "the value the writer wants blocked")
+        if variant == "tombstone_only":
+            c.execute("DELETE FROM audit_journal")
+        elif variant == "history_only":
+            c.execute("DELETE FROM rejected_value_tombstones")
+        c.commit()
+        c.close()
+        before = R4._content(p)
+        with pytest.raises(VaultIntegrityError, match="not a 0.1.0a5 file") as info:
+            _open(p)
+        msg = str(info.value)
+        if variant != "history_only":
+            assert "empty beside 1 tombstone rows" in msg, msg
+        if variant != "tombstone_only":
+            assert "empty beside a journal of" in msg and "'tombstone' on 'decision:planted'" in msg, msg
+        assert R4._content(p) == before, variant
+        with pytest.raises((ValueError, VaultIntegrityError)):
+            _open(p, read_only=True)
+        assert R4._content(p) == before, variant
 
 
 def _fixture_envelope():
@@ -216,10 +312,12 @@ STATES = {
     "integrity_format_1_9": (["INSERT OR REPLACE INTO vault_meta VALUES ('integrity_format', '1.9')"], VaultIntegrityError),
     "is_encrypted_2": (["UPDATE entities SET is_encrypted = 2"], VaultIntegrityError),
     "is_encrypted_null_rebuilt": (["@is_encrypted_null"], VaultIntegrityError),
-    "term_index_format_left": ([], VaultIntegrityError),  # left by the R2-B1 reset; not a witness, rows still are
-    "envelope_valid_a5_shape_other_passphrase": (["@reseal:other passphrase (test only)"], ValueError),
-    "fixture_envelopes_spliced": (["@fixture_envelopes"], ValueError),
-    "attacker_salt_rows_resealed_under_attacker_passphrase": (["@attacker_salt"], ValueError),
+    "term_index_format_left": ([], VaultIntegrityError),  # left by the R2-B1 reset; a witness since round 5 (a5 never wrote it)
+    # term_index_format is a witness since round 5 (a5 never wrote it); the writer deletes it so the
+    # wrong-passphrase ambiguity these three states record is what is tested
+    "envelope_valid_a5_shape_other_passphrase": (["@drop_term_index_format", "@reseal:other passphrase (test only)"], ValueError),
+    "fixture_envelopes_spliced": (["@drop_term_index_format", "@fixture_envelopes"], ValueError),
+    "attacker_salt_rows_resealed_under_attacker_passphrase": (["@drop_term_index_format", "@attacker_salt"], ValueError),
     "one_row_real_bound_others_attacker_sealed": (["@reseal_all_but_k0:other passphrase (test only)"], VaultIntegrityError),
 }
 
@@ -249,6 +347,8 @@ def _apply(c, p, steps):
                 env, sig = _a5_seal(salt, other, r["scope"], r["category"], r["key"], f"attacker text for {r['key']}")
                 c.execute("UPDATE entities SET encrypted_envelope_json = ?, tenant_sig = ?, is_encrypted = 1 WHERE id = ?",
                           (env, sig, r["id"]))
+        elif step == "@drop_term_index_format":
+            c.execute("DELETE FROM vault_meta WHERE key = 'term_index_format'")
         elif step == "@fixture_envelopes":
             c.execute("UPDATE entities SET encrypted_envelope_json = ?", (_fixture_envelope(),))
         elif step == "@attacker_salt":
@@ -281,6 +381,8 @@ def test_control_salt_present_states_beyond_r4s_table_are_refused_untouched(tmp_
         assert "Failed to authenticate" in msg
     else:
         assert "not a 0.1.0a5 file" in msg, msg
+        if state == "term_index_format_left":
+            assert "vault_meta.term_index_format" in msg, msg
     # the read-only open refuses the same file without writing (by design: no upgrade, no discriminator)
     with pytest.raises((ValueError, VaultIntegrityError)):
         _open(p, read_only=True)
@@ -296,7 +398,7 @@ def test_control_attacker_salt_reseal_opens_only_under_the_attackers_passphrase(
     c = M._conn(p)
     M._scrub_everything_but_entries(c)
     R4._scrub_schema(c)
-    _apply(c, p, ["@attacker_salt"])
+    _apply(c, p, ["@drop_term_index_format", "@attacker_salt"])
     c.commit()
     c.close()
     with pytest.raises(ValueError, match="Failed to authenticate"):
@@ -308,12 +410,11 @@ def test_control_attacker_salt_reseal_opens_only_under_the_attackers_passphrase(
         v.close()
 
 
-def test_attack_r5_3_sealed_rows_without_any_vault_meta_get_a_fresh_salt_before_the_wrong_passphrase_refusal(tmp_path):
-    """R5-3 (low). With ``vault_meta`` emptied (or dropped) and the rows still sealed, the discriminator
-    is not a candidate, ``_init_schema`` runs, ``_vault_salt`` writes a FRESH salt (no keyed record is
-    left to stop it), and only then does the migration fail every row and raise a wrong passphrase.
-    The refusal has written: a new ``kdf_salt`` and the schema upgrade. SECURITY.md:108-110 ("no fresh
-    salt is written over it") holds only while a key check, MAC or format record remains."""
+def test_fixed_r5_3_sealed_rows_without_any_vault_meta_are_refused_before_anything_is_written(tmp_path):
+    """R5-3. With ``vault_meta`` emptied (or dropped) and the rows still sealed, a sealed row is itself
+    proof the file was keyed: the open is refused naming the sealed rows and the missing salt BEFORE
+    ``_init_schema`` and before any salt is issued; bytes and mtime are unchanged, and the next open
+    tells the same story. The read-only open refuses the same way."""
     for drop_table in (False, True):
         p = M._seeded(tmp_path / f"v{int(drop_table)}.sqlite")
         c = M._conn(p)
@@ -322,17 +423,21 @@ def test_attack_r5_3_sealed_rows_without_any_vault_meta_get_a_fresh_salt_before_
         c.commit()
         c.close()
         before = R4._content(p)
-        with pytest.raises(ValueError, match="Failed to authenticate"):
-            _open(p)
-        after = R4._content(p)
-        assert after != before
+        digest, mtime = _file_digest(p), os.stat(p).st_mtime_ns
+        for _ in range(2):  # the second refusal is the same refusal
+            with pytest.raises(VaultIntegrityError, match="salt was removed") as info:
+                _open(p)
+            assert "3 sealed entries" in str(info.value) and "no kdf_salt" in str(info.value)
+            assert R4._content(p) == before
+            assert (_file_digest(p), os.stat(p).st_mtime_ns) == (digest, mtime)
+        with pytest.raises(VaultIntegrityError, match="salt was removed"):
+            _open(p, read_only=True)
+        assert R4._content(p) == before
         c = M._conn(p)
-        assert c.execute("SELECT count(*) FROM vault_meta WHERE key = 'kdf_salt'").fetchone()[0] == 1
-        assert c.execute("SELECT count(*) FROM vault_meta WHERE key IN ('key_check', 'meta_mac')").fetchone()[0] == 0
+        assert c.execute("SELECT count(*) FROM sqlite_master WHERE name = 'vault_meta'").fetchone()[0] == int(not drop_table)
+        if not drop_table:
+            assert c.execute("SELECT count(*) FROM vault_meta").fetchone()[0] == 0
         c.close()
-        # the next open finds a salt and the witnesses the schema upgrade added: a different refusal
-        with pytest.raises(VaultIntegrityError, match="not a 0.1.0a5 file"):
-            _open(p)
 
 
 def test_control_read_only_open_of_a_reset_file_writes_nothing(tmp_path):
@@ -356,33 +461,40 @@ def test_control_read_only_open_of_a_reset_file_writes_nothing(tmp_path):
         assert not os.path.exists(str(p) + "-wal") or os.path.getsize(str(p) + "-wal") == 0
 
 
-def test_control_the_empty_reset_leaves_no_migrate_event_so_it_reads_exactly_as_a_new_vault(tmp_path):
-    """What the operator sees after the admitted reset. ``_migrate_integrity`` on an empty file writes
-    the format and key check and returns None WITHOUT a ``migrate`` event, so the reset file ends with
-    the same journal (none), the same ``vault_meta`` key set and the same integrity records as a vault
-    created fresh by this code: nothing inside the file says a vault was ever here. SECURITY.md:104-106
-    describes what the operator sees; it does not say that it is byte-for-byte the shape of a new vault."""
+def test_control_the_empty_reset_is_told_from_a_new_vault_by_its_migrate_event(tmp_path):
+    """What the operator sees after the admitted (truly empty) reset: since round 5 the migration of
+    a salted file with nothing in it writes a ``migrate`` event (``empty_keyed_file``), so the reset
+    file is NOT byte-for-byte the shape of a vault created fresh: its journal says a keyed file was
+    here. A vault created fresh has no such event."""
     p = M._seeded(tmp_path / "v.sqlite")
     c = M._conn(p)
     M._scrub_everything_but_entries(c)
     R4._scrub_schema(c)
     c.execute("DELETE FROM entities")
     c.execute("DELETE FROM audit_journal")
+    c.execute("DELETE FROM vault_meta WHERE key = 'term_index_format'")  # a witness since round 5
     c.commit()
     c.close()
     v = _open(p)
     try:
-        assert v.list_entities() == [] and v.integrity_upgrade is None
-        assert v._conn.execute("SELECT count(*) FROM audit_journal").fetchone()[0] == 0
-        reset_meta = {r[0] for r in v._conn.execute("SELECT key FROM vault_meta")}
-        reset_head = v._conn.execute("SELECT count(*) FROM audit_head").fetchone()[0]
+        assert v.list_entities() == []
+        assert v.integrity_upgrade is not None and v.integrity_upgrade["empty_keyed_file"] is True
+        events = v.list_audit_events(limit=10)
+        assert [e.action for e in events] == ["migrate"]
+        assert events[0].metadata["empty_keyed_file"] is True
+        assert v.verify_audit_chain() is True
+        assert v.keyless_adoption() is None
+    finally:
+        v.close()
+    v = _open(p)
+    try:
+        assert v.integrity_upgrade is None and [e.action for e in v.list_audit_events(limit=10)] == ["migrate"]
     finally:
         v.close()
     fresh = _open(tmp_path / "new.sqlite")
     try:
+        assert fresh.integrity_upgrade is None
         assert fresh._conn.execute("SELECT count(*) FROM audit_journal").fetchone()[0] == 0
-        assert {r[0] for r in fresh._conn.execute("SELECT key FROM vault_meta")} == reset_meta
-        assert fresh._conn.execute("SELECT count(*) FROM audit_head").fetchone()[0] == reset_head
     finally:
         fresh.close()
 
@@ -523,24 +635,67 @@ def test_control_legacy_mac_on_a_pinned_3_vault_drops_the_quorum_and_the_env_rep
         v.close()
 
 
-def test_attack_r5_4_after_a_legacy_mac_restore_a_verdict_run_without_the_env_pins_the_default(tmp_path):
-    """R5-4 (low, residual of the R4-2 design). The dropped quorum is re-pinned by the NEXT pinning
-    open with whatever that process runs with. A person who pinned 3 once (env set for that run) and
-    later runs a verdict without the env pins the default 2, permanently and silently (the only trace
-    is the WARNING at the drop, one open earlier). The end state is R4-2's: 3 became 2."""
+def test_fixed_r5_4_after_a_legacy_mac_restore_a_verdict_run_without_the_env_cannot_pin_lower(tmp_path):
+    """R5-4. The drop records ``quorum_dropped_from = 3`` under the full-set MAC. A later pinning
+    open that names no quorum would pin the default 2, below it: refused (ConfigError naming the 3
+    and the env to set). Non-pinning opens run as before. A pinning open under the env re-pins 3
+    and clears the record; a pinning open that names a LOWER quorum explicitly is allowed (the
+    person said so) and clears it too. A file writer cannot remove or lower the record: both MAC
+    checks fail."""
+    from kibisis.config import ConfigError
     p = tmp_path / "v.sqlite"
     legacy = _pinned(p, 3)
     _restore_legacy_mac(p, legacy)
-    _open(p).close()  # any writable open: the 3 is dropped
-    v = _open(p, pin_quorum=True)  # a verdict run without KIBISIS_VERIFICATION_QUORUM
+    v = _open(p)  # any writable open: the 3 is dropped, and recorded
     try:
-        assert v.verification_quorum == vault_module.DEFAULT_VERIFICATION_QUORUM == 2
-        assert v.verification_quorum_stored == 2
+        assert v.verification_quorum_stored is None and v.quorum_dropped_from == 3
+        assert v._meta("quorum_dropped_from") == "3"
+        assert v._meta("meta_mac") == vault_meta_mac(v._signing_key, v._meta_mac_fields())
+        from kibisis.review import _quorum_line
+        assert "a pinned 3 was dropped" in _quorum_line(v)
+    finally:
+        v.close()
+    with pytest.raises(ConfigError, match="pinned at 3") as info:
+        _open(p, pin_quorum=True)  # a verdict run without KIBISIS_VERIFICATION_QUORUM
+    assert "KIBISIS_VERIFICATION_QUORUM=3" in str(info.value)
+    for ro in (False, True):  # non-pinning opens: unchanged, the record stands
+        v = _open(p, read_only=ro)
+        try:
+            assert v.verification_quorum_stored is None and v.quorum_dropped_from == 3
+            assert v.verification_quorum == vault_module.DEFAULT_VERIFICATION_QUORUM
+        finally:
+            v.close()
+    # the file writer cannot lower or remove the record
+    for edit in ("UPDATE vault_meta SET value = '1' WHERE key = 'quorum_dropped_from'",
+                 "DELETE FROM vault_meta WHERE key = 'quorum_dropped_from'"):
+        shutil.copy(p, tmp_path / "e.sqlite")
+        c = M._conn(tmp_path / "e.sqlite")
+        c.execute(edit)
+        c.commit()
+        c.close()
+        for ro in (False, True):
+            with pytest.raises(VaultIntegrityError, match="meta MAC does not cover"):
+                _open(tmp_path / "e.sqlite", read_only=ro)
+    # the person's verdict under their env re-pins 3 and clears the record
+    v = _open(p, verification_quorum=3, pin_quorum=True)
+    try:
+        assert v.verification_quorum_stored == 3 and v.quorum_dropped_from is None
+        assert v._meta("quorum_dropped_from") is None
+        assert v._meta("meta_mac") == vault_meta_mac(v._signing_key, v._meta_mac_fields())
     finally:
         v.close()
     v = _open(p)
     try:
-        assert v.verification_quorum_stored == 2 and v.verification_quorum == 2
+        assert v.verification_quorum_stored == 3 and v.verification_quorum == 3
+    finally:
+        v.close()
+    # naming a lower quorum explicitly is the person's choice: allowed, record cleared
+    p2 = tmp_path / "v2.sqlite"
+    _restore_legacy_mac(p2, _pinned(p2, 3))
+    _open(p2).close()
+    v = _open(p2, verification_quorum=2, pin_quorum=True)
+    try:
+        assert v.verification_quorum_stored == 2 and v.quorum_dropped_from is None
     finally:
         v.close()
 
@@ -553,8 +708,8 @@ def test_control_every_vault_meta_key_written_is_under_the_mac_or_known_unbound(
             text = open(os.path.join(SRC, name), encoding="utf-8").read()
             written |= set(re.findall(r"_set_meta\(\w+,\s*\"(\w+)\"", text))
             written |= set(re.findall(r"INSERT (?:OR REPLACE )?INTO vault_meta \(key, value\) VALUES \('(\w+)'", text))
-    assert "kdf_salt" in written and "verification_quorum" in written
-    unbound = written - set(VAULT_META_BOUND_KEYS) - {"meta_mac"}
+    assert "kdf_salt" in written and "verification_quorum" in written and "quorum_dropped_from" in written
+    unbound = written - set(VAULT_META_BOUND_KEYS) - set(VAULT_META_BOUND_OPTIONAL) - {"meta_mac"}
     # search_index_format governs the SQLCipher-only entry search index (a file writer cannot reach it
     # without the passphrase); anything else here is a finding.
     assert unbound == {"search_index_format"}, unbound

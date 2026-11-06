@@ -113,13 +113,24 @@ def test_okf_export_and_import_dry_run_leave_every_byte_of_the_vault_alone(tmp_p
     (bundle / "default" / "decision").mkdir(parents=True)
     (bundle / "default" / "decision" / "a.md").write_text("---\ntype: decision\n---\nAlpha.")
     monkeypatch.setenv("KIBISIS_PASSPHRASE", PASSPHRASE)
+    # R5-1: a passphrase against a plain file that holds entries is refused outright (the OKF commands never
+    # pass the adopt_keyless opt-in), and the refusal writes nothing either
+    assert main(["okf-import", "--bundle", str(bundle), "--db", str(db), "--dry-run"]) == 1
+    assert "plaintext entries and no salt" in capsys.readouterr().err
+    assert _sha(db) == before and db.read_bytes().startswith(b"SQLite format 3")
+    assert main(["okf-export", "--profile", str(write_profile(tmp_path)), "--out", str(tmp_path / "out"), "--db", str(db), "--ungated"]) == 1
+    assert "plaintext entries and no salt" in capsys.readouterr().err
+    assert _sha(db) == before and db.read_bytes().startswith(b"SQLite format 3")
+    # opened as the plain file it is (no passphrase, plaintext allowed): read-only, nothing written
+    monkeypatch.delenv("KIBISIS_PASSPHRASE")
+    monkeypatch.setenv("KIBISIS_ALLOW_PLAINTEXT", "1")
     assert main(["okf-import", "--bundle", str(bundle), "--db", str(db), "--dry-run"]) == 0
     assert json.loads(capsys.readouterr().out)["written"] == 0
     assert _sha(db) == before and db.read_bytes().startswith(b"SQLite format 3")
     assert main(["okf-export", "--profile", str(write_profile(tmp_path)), "--out", str(tmp_path / "out"), "--db", str(db), "--ungated"]) == 0
     assert json.loads(capsys.readouterr().out)["exported"] == 1
     assert _sha(db) == before and db.read_bytes().startswith(b"SQLite format 3")
-    monkeypatch.delenv("KIBISIS_PASSPHRASE")
+    monkeypatch.delenv("KIBISIS_ALLOW_PLAINTEXT")
     SQLiteMemoryVault(str(db), allow_plaintext=True, auto_gate=False).close()  # still a plaintext vault
     # An encrypted vault: same guarantee (no integrity or index rewrite, no WAL growth into the main file).
     enc = tmp_path / "enc.sqlite"

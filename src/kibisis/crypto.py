@@ -240,6 +240,10 @@ def verify_tombstone_mac(
 VAULT_META_BOUND_KEYS_V1 = ("integrity_format", "kdf_salt", "key_check", "journal_format_floor", "journal_anchored",
                             "term_index_format")
 VAULT_META_BOUND_KEYS = VAULT_META_BOUND_KEYS_V1 + ("verification_quorum",)
+#: ``vault_meta`` keys bound by the full-set MAC only while present (R5-4): ``quorum_dropped_from``
+#: records a stored quorum that a legacy MAC never covered and was dropped at a writable open. A vault
+#: without the record keeps the MAC it has; one with it cannot lose it without the signing key.
+VAULT_META_BOUND_OPTIONAL = ("quorum_dropped_from",)
 
 
 def vault_meta_mac(signing_key: bytes, fields: Dict[str, Any], keys: Tuple[str, ...] = VAULT_META_BOUND_KEYS) -> str:
@@ -248,7 +252,9 @@ def vault_meta_mac(signing_key: bytes, fields: Dict[str, Any], keys: Tuple[str, 
     ``null``, so a writer with database access cannot lower the integrity format, swap the salt, drop
     the key check or the journal floor, change the term index format, or lower the verification
     quorum without the signing key. ``keys`` names the bound set (the legacy set for a MAC written
-    before ``verification_quorum`` was bound)."""
+    before ``verification_quorum`` was bound). A full set (one that binds ``verification_quorum``)
+    also binds each :data:`VAULT_META_BOUND_OPTIONAL` key that is present, as a tagged pair after the
+    fixed part, so vaults without the record keep their MAC."""
     parts: List[Any] = ["kibisis-vault-meta-mac", 1]
     for name in keys:
         value = fields.get(name)
@@ -258,6 +264,12 @@ def vault_meta_mac(signing_key: bytes, fields: Dict[str, Any], keys: Tuple[str, 
             parts.append(bytes(value).hex())
         else:
             parts.append(str(value))
+    if "verification_quorum" in keys:
+        for name in VAULT_META_BOUND_OPTIONAL:
+            value = fields.get(name)
+            if value is not None:
+                text = bytes(value).decode("utf-8", "replace") if isinstance(value, (bytes, bytearray, memoryview)) else str(value)
+                parts.append([name, text])
     return hmac.new(signing_key, _encode(parts), hashlib.sha256).hexdigest()
 
 

@@ -168,6 +168,7 @@ def open_vault(
     *,
     read_only: bool = False,
     pin_quorum: bool = False,
+    adopt_keyless: bool = False,
 ) -> SQLiteMemoryVault:
     """Open the vault the environment describes. Refuses to run without a key unless plaintext is allowed.
 
@@ -181,6 +182,11 @@ def open_vault(
     raises the stored one). Only the review verdicts and ``admit`` pass it, behind their terminal
     check; the servers, ``review list``, the OKF commands and embedders adopt the stored quorum and
     never pin one.
+
+    ``adopt_keyless=True`` is the opt-in for giving a passphrase to a plain file that holds entries and
+    no salt (R5-1): without it such an open is refused, since a keyed vault whose records a file
+    writer removed looks the same; with it the entries are adopted as candidates. Only the operator
+    CLIs behind the terminal check pass it (``--adopt-keyless``); the servers and the OKF commands never do.
 
     ``read_only=True`` opens an existing vault without changing a byte of the vault file (no SQLCipher
     conversion, integrity upgrade or index build; every write is refused) and does not create a missing
@@ -203,11 +209,11 @@ def open_vault(
             raise ConfigError(f"No vault at {path} (nothing to read).")
         return SQLiteMemoryVault(
             path, passphrase=passphrase, allow_plaintext=allow_plaintext and not passphrase, read_only=True,
-            verification_quorum=quorum, env=env,
+            verification_quorum=quorum, env=env, adopt_keyless=adopt_keyless,
         )
     if path != ":memory:":
         os.makedirs(os.path.dirname(os.path.abspath(path)), mode=0o700, exist_ok=True)
     return SQLiteMemoryVault(
         path, passphrase=passphrase, allow_plaintext=allow_plaintext, verification_quorum=quorum, env=env,
-        pin_quorum=pin_quorum,
+        pin_quorum=pin_quorum, adopt_keyless=adopt_keyless,
     )
