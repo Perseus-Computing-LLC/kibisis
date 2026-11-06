@@ -1,8 +1,11 @@
 """``python -m kibisis`` — operator commands.
 
 ``admit`` needs a person at the keyboard. ``okf-export`` and ``okf-check`` (P13.1) project the
-vault into an OKF v0.2 bundle and check one; they read the vault and never change it. ``okf-import``
-(P13.2) diffs a bundle into the vault as model-origin candidates; ``--dry-run`` writes nothing.
+vault into an OKF v0.2 bundle and check one; ``okf-export`` opens the vault read-only (no
+conversion, upgrade or index build) and never changes it. ``okf-import`` (P13.2) diffs a bundle
+into the vault as model-origin candidates; ``--dry-run`` opens it read-only and writes nothing.
+Every subcommand resolves the vault the same way: ``--db``, else ``KIBISIS_DB_PATH``, else the
+per-user data directory (``kibisis.config.default_db_path``).
 """
 from __future__ import annotations
 
@@ -10,14 +13,22 @@ import argparse
 import json
 import os
 import sys
+from typing import Optional, Tuple
 
-from .config import ConfigError, open_vault, resolve_scope, validate_scope
+from .config import ConfigError, default_db_path, open_vault, resolve_scope, validate_scope
 from ._operator import NotInteractive, account_identity, require_terminal
 from .protocols import EncryptionRequiredError
 from .vault import ORIGINS, AdmissionRefused, SQLiteMemoryVault
 
-#: Default vault for the ``okf-*`` commands. ``admit`` resolves its vault like the MCP server does.
-DEFAULT_DB_PATH = os.environ.get("KIBISIS_DB_PATH", os.path.expanduser("~/.hermes/kibisis/vault.sqlite"))
+_DB_HELP = "vault path (default: $KIBISIS_DB_PATH, else the per-user vault the MCP server and kibisis-review use)"
+
+
+def __getattr__(name: str) -> str:
+    # ``DEFAULT_DB_PATH`` used to be computed once at import from a path nothing else used. It is now
+    # the same vault every subcommand opens, read when asked so a later env change is honoured.
+    if name == "DEFAULT_DB_PATH":
+        return default_db_path()
+    raise AttributeError(name)
 
 __all__ = ["NotInteractive", "main"]
 
@@ -77,6 +88,23 @@ def _admit(args: argparse.Namespace) -> int:
     return 0
 
 
+def _open_okf_vault(db: Optional[str], *, read_only: bool) -> Tuple[Optional[SQLiteMemoryVault], int]:
+    """Open the vault an OKF command works on: the same path and key rules as every other subcommand
+    (``--db``, else KIBISIS_DB_PATH, else the XDG data dir; KIBISIS_ALLOW_PLAINTEXT). Never creates one."""
+    path = db or default_db_path()
+    if not os.path.isfile(path):
+        print(f"error: no vault at {path}", file=sys.stderr)
+        return None, 1
+    try:
+        return open_vault(path, read_only=read_only), 0
+    except ConfigError as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return None, 2
+    except Exception as exc:  # wrong or missing passphrase, not a vault, unreadable
+        print(f"error: cannot open the vault at {path}: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return None, 1
+
+
 def _okf_export(args: argparse.Namespace) -> int:
     from .okf.export import ExportError, GateRefused, command_gate, export_bundle
     from .okf.profile import ProfileError, load_profile
@@ -87,19 +115,13 @@ def _okf_export(args: argparse.Namespace) -> int:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
     try:
-        gate = command_gate(args.gate_cmd) if args.gate_cmd is not None else None
+        gate = command_gate(args.gate_cmd, verbose=args.gate_verbose) if args.gate_cmd is not None else None
     except (ExportError, ValueError) as exc:
         print(f"refused: --gate-cmd: {exc}", file=sys.stderr)
         return 2
-    # SQLiteMemoryVault creates a missing file; an export never creates a vault.
-    if not os.path.isfile(args.db):
-        print(f"error: no vault at {args.db}", file=sys.stderr)
-        return 1
-    try:
-        vault = SQLiteMemoryVault(args.db)
-    except Exception as exc:  # wrong or missing passphrase, not a vault, unreadable
-        print(f"error: cannot open the vault at {args.db}: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 1
+    vault, rc = _open_okf_vault(args.db, read_only=True)  # an export reads the vault and never changes it
+    if vault is None:
+        return rc
     try:
         report = export_bundle(vault, profile, args.out, at=args.at, ungated=args.ungated, bundle_gate=gate)
     except GateRefused as exc:
@@ -141,15 +163,10 @@ def _okf_import(args: argparse.Namespace) -> int:
     if os.path.islink(args.bundle) or not os.path.isdir(args.bundle):
         print(f"refused: no bundle directory at {args.bundle}", file=sys.stderr)
         return 2
-    # SQLiteMemoryVault creates a missing file; an import never creates a vault.
-    if not os.path.isfile(args.db):
-        print(f"error: no vault at {args.db}", file=sys.stderr)
-        return 1
-    try:
-        vault = SQLiteMemoryVault(args.db)
-    except Exception as exc:  # wrong or missing passphrase, not a vault, unreadable
-        print(f"error: cannot open the vault at {args.db}: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 1
+    # --dry-run reads the vault and never changes it; a real import never creates a vault either.
+    vault, rc = _open_okf_vault(args.db, read_only=args.dry_run)
+    if vault is None:
+        return rc
     try:
         report = import_bundle(vault, args.bundle, profile=profile, dry_run=args.dry_run)
     except BundleImportError as exc:
@@ -199,7 +216,8 @@ def _aml_serve(args: argparse.Namespace) -> int:
         config = AMLConfig(data_dir=args.data_dir, key_sha256=digest, passphrase=passphrase,
                            candidates=args.candidates, context_before=args.context_before,
                            max_inflight=args.max_inflight, max_open_vaults=args.max_open_vaults,
-                           retention_days=args.retention_days)
+                           retention_days=args.retention_days, socket_timeout=args.socket_timeout,
+                           max_connections=args.max_connections)
     except ValueError as exc:
         print(f"aml-serve: {exc}", file=sys.stderr)
         return 2
@@ -212,8 +230,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("admit", help="promote a candidate entry to verified (a person's action)")
     a.add_argument(
-        "--db", default=None,
-        help="vault path (default: $KIBISIS_DB_PATH, else the per-user vault the MCP server and kibisis-review use)",
+        "--db", default=None, help=_DB_HELP,
     )
     a.add_argument("--category", required=True)
     a.add_argument("--key", required=True)
@@ -232,11 +249,14 @@ def main(argv: list[str] | None = None) -> int:
     e = sub.add_parser("okf-export", help="write allowlisted vault rows as an OKF v0.2 bundle (reads the vault only)")
     e.add_argument("--profile", required=True, help="export profile (JSON, kibisis.okf_export_profile/1)")
     e.add_argument("--out", required=True, help="bundle directory: absent, empty, or a bundle okf-export wrote")
-    e.add_argument("--db", default=DEFAULT_DB_PATH, help="vault path (default: $KIBISIS_DB_PATH)")
+    e.add_argument("--db", default=None, help=_DB_HELP)
     e.add_argument("--at", default=None, help="ISO date or datetime for the log entry (default: today, UTC)")
     g = e.add_mutually_exclusive_group(required=True)
     g.add_argument("--gate-cmd", default=None,
-                   help="command run over the staged files (paths appended); non-zero aborts the bundle")
+                   help="command run over the staged files (paths appended); non-zero aborts the bundle. Its "
+                        "stdout is summarised (line count, exit status); --gate-verbose copies it to stderr")
+    e.add_argument("--gate-verbose", action="store_true",
+                   help="copy the gate command's stdout to stderr (it may quote vault content)")
     g.add_argument("--ungated", action="store_true", help="write without a content gate (synthetic fixtures only)")
     e.set_defaults(func=_okf_export)
 
@@ -247,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
 
     i = sub.add_parser("okf-import", help="diff an OKF v0.2 bundle into the vault as model-origin candidates")
     i.add_argument("--bundle", required=True, help="bundle directory to read")
-    i.add_argument("--db", default=DEFAULT_DB_PATH, help="vault path (default: $KIBISIS_DB_PATH)")
+    i.add_argument("--db", default=None, help=_DB_HELP)
     i.add_argument("--profile", default=None,
                    help="allowlist (export profile JSON); default: scope default, the four P13 categories")
     i.add_argument("--dry-run", action="store_true", help="report what would change and write nothing")
@@ -267,10 +287,16 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--candidates", type=int, default=200, help="BM25 hits fetched per search (default: 200)")
     s.add_argument("--context-before", type=int, default=1,
                    help="earlier messages of the same Add request shown before each hit (default: 1)")
-    s.add_argument("--max-inflight", type=int, default=32, help="requests served at once; more get 429 (default: 32)")
+    s.add_argument("--max-inflight", type=int, default=32,
+                   help="requests processed at once (body read plus Add/Search); more get 429 (default: 32). "
+                        "Connections are bounded by --max-connections and --socket-timeout, not by this")
     s.add_argument("--max-open-vaults", type=int, default=64, help="per-user vaults kept open (default: 64)")
+    s.add_argument("--max-connections", type=int, default=256,
+                   help="connections (handler threads) accepted at once; more get 503 and are closed (default: 256)")
+    s.add_argument("--socket-timeout", type=float, default=30.0,
+                   help="seconds an idle or stalled connection is kept before it is closed (default: 30)")
     s.add_argument("--retention-days", type=float, default=28.0,
-                   help="delete vaults with no write for this many days; 0 keeps them (default: 28)")
+                   help="delete vaults not used (no Add or Search) for this many days; 0 keeps them (default: 28)")
     s.set_defaults(func=_aml_serve)
 
     args = parser.parse_args(argv)

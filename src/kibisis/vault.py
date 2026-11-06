@@ -8,6 +8,8 @@ import inspect
 import json
 import logging
 import os
+import hmac
+import urllib.parse
 try:
     import sqlcipher3
 except ImportError:
@@ -85,6 +87,10 @@ from ._vault_snapshot import SnapshotMixin
 from ._vault_tombstone import TombstoneMixin
 
 logger = logging.getLogger(__name__)
+
+
+class ReadOnlyVaultError(Exception):
+    """Raised by a write on a vault opened with ``read_only=True`` (area C: okf-export, okf-import --dry-run)."""
 
 
 #: Metadata keys the vault writes itself and reads back as facts about trust and ownership. A caller's
@@ -222,8 +228,16 @@ class SQLiteMemoryVault(
         cache_mb: Optional[int] = None,
         verification_quorum: Optional[int] = None,
         term_index: bool = True,
+        read_only: bool = False,
     ) -> None:
         """Open a vault. Entry content is encrypted by default.
+
+        ``read_only=True`` opens an existing on-disk vault as it is and never writes to it: the SQLite
+        connection is ``mode=ro``, so the plain-SQLite-to-SQLCipher migration, the integrity upgrade and
+        the search-index build are skipped and any write fails. A plain-SQLite file that was never keyed
+        is read as the plaintext vault it is even when a passphrase is set. A vault that would need a
+        schema or integrity upgrade refuses to open read-only until it is opened writable once. Used by
+        ``okf-export`` and ``okf-import --dry-run``.
 
         ``verification_quorum`` (K-R1) is how many distinct principals must attest to an entry before
         it is stored as ``verified``: the author of a ``origin="user"`` write that asked for
@@ -283,6 +297,22 @@ class SQLiteMemoryVault(
             )
         self.passphrase = passphrase
         self.crypto_provider = crypto_provider
+
+        # --- read-only open (area C: okf-export / okf-import --dry-run) ------------------------------
+        # One well-marked block, kept apart from the ordering of the writable open below. ``mode=ro``
+        # makes every write fail in SQLite; _write_tx refuses first with ReadOnlyVaultError. A plain
+        # SQLite file is read as plain even with a passphrase (no in-place SQLCipher conversion).
+        self.read_only = bool(read_only)
+        if self.read_only:
+            if not on_disk or not os.path.exists(self.db_path) or os.path.getsize(self.db_path) == 0:
+                raise FileNotFoundError(f"read-only open needs an existing vault file: {self.db_path}")
+            with open(self.db_path, "rb") as f:
+                plain_file = f.read(16).startswith(b"SQLite format 3")
+            if plain_file and passphrase and not _sqlcipher_available():
+                plain_file = False  # a keyed vault kept in a plain file (no sqlcipher3): same path as below
+            self._open_read_only(passphrase, crypto_provider, memory_security, cache_mb, plain_file)
+            return
+        # --- end read-only open ---------------------------------------------------------------------
 
         # Integrity keys. With a passphrase, the signing and digest keys are derived from a PBKDF2 stretch
         # of it once the vault's salt is known (below); _legacy_signing_key checks format 1 signatures
@@ -376,6 +406,79 @@ class SQLiteMemoryVault(
         if on_disk:
             self._restrict_permissions()
 
+    # --- read-only open (area C) -------------------------------------------------------------------
+    def _open_read_only(
+        self,
+        passphrase: Optional[str],
+        crypto_provider: Optional[CryptoEnvelopeProvider],
+        memory_security: bool,
+        cache_mb: Optional[int],
+        plain_file: bool,
+    ) -> None:
+        """The read-only half of ``__init__``: open with ``mode=ro``, derive keys from the stored salt,
+        and refuse (instead of upgrading) a vault that is not at the current integrity format."""
+        sig_seed = passphrase if passphrase else self.db_path
+        self._legacy_signing_key = hashlib.sha256(f"kibisis-tenant-sig:{sig_seed}".encode("utf-8")).digest()
+        self._signing_key = self._legacy_signing_key
+        self._digest_key = None
+        self._term_key = None
+        self._keyed = False
+        self._integrity_format = 1
+        self._converted_to_sqlcipher = False
+        self._was_keyed = False
+        self.integrity_upgrade = None
+        self._search_index = False  # search reads the entries instead of touching an index
+        self._term_index = False
+        self._scan_cache = None
+        self._recent_recalls = deque(maxlen=1000)
+        self._tokenizer = None
+        self._tokenizer_lock = threading.Lock()
+        self._sqlcipher_active = False
+        self._cache_mb = int(cache_mb) if cache_mb is not None else None
+        uri = "file:" + urllib.parse.quote(os.path.abspath(self.db_path)) + "?mode=ro"
+        self._conn = sqlcipher3.connect(uri, uri=True, timeout=30.0, check_same_thread=False)
+        self._conn.row_factory = sqlcipher3.Row
+        try:
+            if passphrase and not plain_file:
+                escaped_pass = passphrase.replace("'", "''")
+                if memory_security:
+                    self._conn.execute("PRAGMA cipher_memory_security = ON;")
+                self._conn.execute(f"PRAGMA key = '{escaped_pass}';")
+                try:
+                    self._conn.execute("SELECT count(*) FROM sqlite_master;").fetchall()
+                    row = self._conn.execute("PRAGMA cipher_version;").fetchone()
+                    self._sqlcipher_active = bool(row and row[0])
+                except Exception as e:
+                    raise ValueError("Failed to authenticate or decrypt vault database with provided passphrase") from e
+            self._conn.execute("PRAGMA foreign_keys = ON")
+            if self._cache_mb is not None:
+                self._conn.execute(f"PRAGMA cache_size = -{self._cache_mb * 1024}")
+            if not self._conn.execute("SELECT name FROM sqlite_master WHERE name = 'entities'").fetchone():
+                raise ValueError(f"{self.db_path} is not a kibisis vault (no entities table)")
+            if passphrase and self._has_meta_key("kdf_salt"):
+                self._was_keyed = True
+                salt = bytes(self._meta("kdf_salt"))
+                if crypto_provider is None:
+                    self.crypto_provider = AESGCMCryptoEnvelopeProvider(salt=salt)
+                self._signing_key, self._digest_key, self._term_key = derive_vault_keys(passphrase, salt)
+                self._keyed = True
+                if int(self._meta("integrity_format") or 0) < INTEGRITY_FORMAT:
+                    raise ValueError(f"{self.db_path} needs an integrity upgrade: open it writable once first")
+                stored = self._meta("key_check")
+                if stored is not None and not hmac.compare_digest(str(stored), self._key_check_value()):
+                    raise ValueError("Failed to authenticate or decrypt vault database with provided passphrase")
+                self._integrity_format = INTEGRITY_FORMAT
+            elif passphrase:  # a plain file never opened with a passphrase: read as the plaintext vault it is
+                self.passphrase = None
+                self._legacy_signing_key = hashlib.sha256(f"kibisis-tenant-sig:{self.db_path}".encode("utf-8")).digest()
+                self._signing_key = self._legacy_signing_key
+                if plain_file and _sqlcipher_available():
+                    logger.warning("kibisis: %s is a plaintext vault; read-only open leaves it as it is", self.db_path)
+        except BaseException:
+            self._conn.close()
+            raise
+    # --- end read-only open ------------------------------------------------------------------------
+
     def _validate_fencing(
         self,
         fencing_token: Optional[int],
@@ -446,6 +549,8 @@ class SQLiteMemoryVault(
         Nested use inside an open transaction yields a cursor and leaves commit and rollback to the
         outermost block, so a compound operation (review, then re-write) stays one transaction.
         """
+        if getattr(self, "read_only", False):  # area C: a read-only open never writes
+            raise ReadOnlyVaultError(f"vault {self.db_path} was opened read-only")
         if self._conn.in_transaction:
             yield self._conn.cursor()
             return

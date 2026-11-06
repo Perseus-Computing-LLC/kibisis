@@ -133,8 +133,14 @@ def plaintext_allowed(env: Optional[Mapping[str, str]] = None) -> bool:
     return env.get(ENV_ALLOW_PLAINTEXT, "").strip().lower() in ("1", "true", "yes")
 
 
-def open_vault(db_path: Optional[str] = None, env: Optional[Mapping[str, str]] = None) -> SQLiteMemoryVault:
-    """Open the vault the environment describes. Refuses to run without a key unless plaintext is allowed."""
+def open_vault(
+    db_path: Optional[str] = None, env: Optional[Mapping[str, str]] = None, *, read_only: bool = False
+) -> SQLiteMemoryVault:
+    """Open the vault the environment describes. Refuses to run without a key unless plaintext is allowed.
+
+    ``read_only=True`` opens an existing vault without changing a byte of it (no SQLCipher conversion,
+    integrity upgrade or index build; every write is refused) and does not create a missing one.
+    """
     env = os.environ if env is None else env
     path = db_path or default_db_path(env)
     passphrase = resolve_passphrase(env=env)
@@ -143,6 +149,12 @@ def open_vault(db_path: Optional[str] = None, env: Optional[Mapping[str, str]] =
         raise ConfigError(
             "No key: set KIBISIS_PASSPHRASE_FILE to a key file (create one with `python -m kibisis.keys PATH`) "
             "or set KIBISIS_PASSPHRASE. To store memory unencrypted on purpose, set KIBISIS_ALLOW_PLAINTEXT=1."
+        )
+    if read_only:
+        if path == ":memory:" or not os.path.isfile(path):
+            raise ConfigError(f"No vault at {path} (nothing to read).")
+        return SQLiteMemoryVault(
+            path, passphrase=passphrase, allow_plaintext=allow_plaintext and not passphrase, read_only=True
         )
     if path != ":memory:":
         os.makedirs(os.path.dirname(os.path.abspath(path)), mode=0o700, exist_ok=True)
