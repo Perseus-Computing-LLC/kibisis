@@ -181,3 +181,11 @@ Second-pass findings R2-C-1..R2-C-5 (`review_notes/R2_C.md`), plus the "suspecte
   itself is then refused. `review list` / verdicts print the adoption line with "in memory only: this
   read-only open wrote nothing" for a read-only in-memory adoption (R6-3) and the count of journal
   events chained on the file's word (R6-1).
+
+## Round 7
+
+- **Minor (R7-2)** `kibisis-review list` refused on a keyless file said "pass --adopt-keyless", a flag
+  `list` does not accept (only the verdicts and `lift`, behind the terminal check, adopt), so following
+  the message gave an argparse error. `list` stays read-only; its refusal now says "open it with a
+  verdict command (approve, dispute, reject or lift) and --adopt-keyless" (`review._refusal_text`). The
+  verdicts' refusal is unchanged.

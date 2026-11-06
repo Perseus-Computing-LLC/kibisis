@@ -241,9 +241,12 @@ VAULT_META_BOUND_KEYS_V1 = ("integrity_format", "kdf_salt", "key_check", "journa
                             "term_index_format")
 VAULT_META_BOUND_KEYS = VAULT_META_BOUND_KEYS_V1 + ("verification_quorum",)
 #: ``vault_meta`` keys bound by the full-set MAC only while present (R5-4): ``quorum_dropped_from``
-#: records a stored quorum that a legacy MAC never covered and was dropped at a writable open. A vault
-#: without the record keeps the MAC it has; one with it cannot lose it without the signing key.
-VAULT_META_BOUND_OPTIONAL = ("quorum_dropped_from",)
+#: records a stored quorum that a legacy MAC never covered and was dropped at a writable open;
+#: ``journal_high_water`` (R7-4) is the highest journal sequence the vault has ever signed a head for,
+#: so a journal emptied, truncated or rolled back under a kept ``vault_meta`` cannot be restarted or
+#: continued below it. A vault without the record keeps the MAC it has (it is set at the next writable
+#: open or append); one with it cannot lose or lower it without the signing key.
+VAULT_META_BOUND_OPTIONAL = ("quorum_dropped_from", "journal_high_water")
 
 
 def vault_meta_mac(signing_key: bytes, fields: Dict[str, Any], keys: Tuple[str, ...] = VAULT_META_BOUND_KEYS) -> str:

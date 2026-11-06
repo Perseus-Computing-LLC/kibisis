@@ -62,8 +62,8 @@ from typing import Any, List, Optional
 
 from ._operator import NotInteractive, account_identity, require_terminal
 from .config import (
-    ENV_VERIFICATION_QUORUM, ConfigError, cli_refusal_text, default_db_path, open_vault, parse_verification_quorum,
-    resolve_scope,
+    ADOPT_KEYLESS_FLAG, ENV_VERIFICATION_QUORUM, ConfigError, cli_refusal_text, default_db_path, open_vault,
+    parse_verification_quorum, resolve_scope,
 )
 from .models import EpistemicState
 from .protocols import EncryptionRequiredError
@@ -221,6 +221,19 @@ def _quorum_line(vault: Any) -> str:
     return f"quorum {quorum} — {who} (pinned in the vault){tail}"
 
 
+def _refusal_text(command: str, exc: BaseException) -> str:
+    """The vault's refusal worded for the command that got it. ``list`` is a read and does not take
+    ``--adopt-keyless`` (only the verdicts and ``lift``, behind the terminal check, adopt; R7-2), so a
+    refused ``list`` names those commands instead of a flag it does not have."""
+    text = cli_refusal_text(exc)
+    if command == "list":
+        text = text.replace(
+            ADOPT_KEYLESS_FLAG,
+            f"open it with a verdict command ({', '.join(_VERDICTS)} or lift) and --adopt-keyless",
+        )
+    return text
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parser().parse_args(argv)
     if args.command != "list":
@@ -245,10 +258,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             vault = open_vault(db_path, pin_quorum=True, adopt_keyless=bool(getattr(args, "adopt_keyless", False)))
     except (ConfigError, EncryptionRequiredError) as exc:
-        print(f"kibisis-review: {cli_refusal_text(exc)}", file=sys.stderr)
+        print(f"kibisis-review: {_refusal_text(args.command, exc)}", file=sys.stderr)
         return 2
     except (ValueError, PermissionError) as exc:  # wrong passphrase, not a vault, needs a writable open first
-        print(f"kibisis-review: {cli_refusal_text(exc)}", file=sys.stderr)
+        print(f"kibisis-review: {_refusal_text(args.command, exc)}", file=sys.stderr)
         return 2
     print(f"vault {db_path}  scope {scope!r}", file=sys.stderr)
     print(_quorum_line(vault), file=sys.stderr)

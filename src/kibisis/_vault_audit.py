@@ -210,8 +210,12 @@ class AuditJournalMixin:
         # reuses an existing sequence. BEGIN IMMEDIATE covers a caller that has not written yet.
         if not self._conn.in_transaction:
             cursor.execute("BEGIN IMMEDIATE")
-        cursor.execute("SELECT sequence, event_hash FROM audit_journal ORDER BY sequence DESC LIMIT 1")
+        cursor.execute("SELECT sequence, event_hash, format FROM audit_journal ORDER BY sequence DESC LIMIT 1")
         last_row = cursor.fetchone()
+        # R7-4: continue only from a journal the signed head and the high-water mark vouch for. An
+        # append that started over from an emptied table (sequence 1, prev 0*64) would re-sign the head
+        # over the new one-row chain and launder the removal; refuse before anything is written.
+        self._refuse_discontinued_journal(cursor, last_row)
         seq, prev_hash = (last_row["sequence"] + 1, last_row["event_hash"]) if last_row else (1, "0" * 64)
 
         event_hash = _event_hash(
@@ -248,11 +252,99 @@ class AuditJournalMixin:
         )
 
     def _write_audit_head(self, cursor: Any, sequence: int, event_hash: str) -> None:
-        """Sign the chain head, in the same transaction as the append it describes."""
+        """Sign the chain head, in the same transaction as the append it describes, and raise the
+        vault's journal high-water mark to it (``vault_meta.journal_high_water``, under the meta MAC)
+        so the journal can never again be continued from below this sequence (R7-4)."""
         cursor.execute(
             "INSERT OR REPLACE INTO audit_head (id, sequence, event_hash, mac) VALUES (1, ?, ?, ?)",
             (sequence, event_hash, _head_mac(self._signing_key, sequence, event_hash)),
         )
+        self._raise_journal_high_water(cursor, sequence)
+
+    def _raise_journal_high_water(self, cursor: Any, sequence: int) -> None:
+        """Record ``sequence`` as the journal high-water mark when it is above the stored one, and
+        re-sign the meta MAC over it. Only a keyed vault at integrity format 3 keeps the mark (a vault
+        without a passphrase has no secret to sign it with; a vault still being upgraded gets it with
+        the MAC the upgrade writes)."""
+        if not self._keyed or self._integrity_format < 3:
+            return
+        stored = self._journal_high_water(trusted_only=False)
+        if stored is not None and stored >= int(sequence):
+            return
+        self._set_meta(cursor, "journal_high_water", int(sequence))
+        self._write_meta_mac(cursor)
+
+    def _journal_high_water(self, *, trusted_only: bool = True) -> Optional[int]:
+        """``vault_meta.journal_high_water`` of a keyed vault as an integer, or None when the vault is
+        not keyed, holds no mark, or (with ``trusted_only``) the mark is not covered by the meta MAC
+        (a legacy MAC never bound it, so it is unknown until the re-sign at the next writable open)."""
+        if not self._keyed:
+            return None
+        if trusted_only and getattr(self, "_meta_mac_legacy", False):
+            return None
+        raw = self._meta("journal_high_water")
+        if raw is None:
+            return None
+        try:
+            value = int(bytes(raw).decode("ascii") if isinstance(raw, (bytes, bytearray, memoryview)) else raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value >= 0 else None
+
+    def _refuse_discontinued_journal(self, cursor: Any, last_row: Any) -> None:
+        """Raise :class:`~kibisis.vault.VaultIntegrityError` unless the journal's last row is the one the
+        signed head names and no row below the high-water mark is missing; nothing is written.
+
+        The same rules :class:`ChainVerifier` applies to the head, checked on the write path before
+        an append (R7-4): a signed head with no rows, a head that names another row than the last
+        one, a head that does not verify, or no head where one is required (a keyed vault whose
+        journal has held a row, or a format 3 last row) means rows were removed or replaced under
+        it, and an append would start a fresh chain over the hole and re-sign the head above it.
+        The high-water mark (``vault_meta.journal_high_water``, under the meta MAC) catches the case
+        where the head went with the rows, or an older head and journal were put back: the journal
+        must reach at least that sequence.
+        """
+        from ._vault_crypto import VaultIntegrityError  # circular at import time
+
+        head = cursor.execute("SELECT sequence, event_hash, mac FROM audit_head WHERE id = 1").fetchone()
+        # The file's own record, read inside this transaction (not the in-process flag: a rolled-back
+        # batch leaves that set while the file's journal is empty and unanchored, legitimately).
+        anchored = bool(self._keyed and int(self._meta("journal_anchored") or 0))
+        last_sequence = None if last_row is None else int(last_row["sequence"])
+        if head is None:
+            if last_row is None and anchored:
+                raise VaultIntegrityError(
+                    f"{self.db_path}: the audit journal has held rows but holds none and has no signed head: the "
+                    "whole journal was removed; refusing to start a new chain over it"
+                )
+            if last_row is not None and (anchored or int(last_row["format"] or 1) >= JOURNAL_FORMAT):
+                raise VaultIntegrityError(
+                    f"{self.db_path}: the audit journal ends at sequence {last_sequence} but has no signed head; "
+                    "refusing to append to a journal whose head was removed"
+                )
+        else:
+            if not hmac.compare_digest(_head_mac(self._signing_key, int(head["sequence"]), str(head["event_hash"])),
+                                       str(head["mac"])):
+                raise VaultIntegrityError(
+                    f"{self.db_path}: the audit journal's signed head does not verify under this vault's key; "
+                    "refusing to append"
+                )
+            if last_row is None:
+                raise VaultIntegrityError(
+                    f"{self.db_path}: the audit journal's head is signed at sequence {head['sequence']} but the "
+                    "journal holds no rows: the whole journal was removed; refusing to start a new chain over it"
+                )
+            if int(head["sequence"]) != last_sequence or str(head["event_hash"]) != str(last_row["event_hash"]):
+                raise VaultIntegrityError(
+                    f"{self.db_path}: the audit journal's head is signed at sequence {head['sequence']} but the last "
+                    f"row is {last_sequence}: rows were removed or replaced under the head; refusing to append"
+                )
+        high_water = self._journal_high_water()
+        if high_water is not None and (last_sequence is None or last_sequence < high_water):
+            raise VaultIntegrityError(
+                f"{self.db_path}: the audit journal ends at sequence {last_sequence or 0}, below the signed high-water "
+                f"mark {high_water}: rows were removed; refusing to append"
+            )
 
     def list_audit_events(
         self,
@@ -348,6 +440,17 @@ class AuditJournalMixin:
         head = self._conn.execute("SELECT sequence, event_hash, mac FROM audit_head WHERE id = 1").fetchone()
         ok = verifier.finish(None if head is None else dict(head))
         self.last_chain_error = verifier.error
+        if ok:
+            # R7-4: the journal must reach the high-water mark the meta MAC binds, so a journal and head
+            # put back from before it, or emptied and restarted, fail even though they are self-consistent.
+            high_water = self._journal_high_water()
+            reached = verifier.last_sequence or 0
+            if high_water is not None and reached < high_water:
+                self.last_chain_error = (
+                    f"the journal ends at sequence {reached}, below the signed high-water mark {high_water}: "
+                    "rows were removed"
+                )
+                return False
         return ok
 
     def _chain_verifier(self) -> ChainVerifier:

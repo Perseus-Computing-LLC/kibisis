@@ -1,12 +1,8 @@
-"""Round-7 (final confirmation) review tests for kibisis at 28f56d1.
+"""Round-7 (final confirmation) review tests for kibisis, written against 28f56d1 as
+``tests/review7_final.py`` and converted here to pin the round-7 fixes (R7-1..R7-4).
 
-Not collected by default (``tests/review7_*.py`` is outside the ``test_*.py`` glob).
-Run with::
-
-    ARGUS_LEDGER_PATH=$TMPDIR/argus_r7.jsonl PYTHONPATH=src python -m pytest -q -p no:cacheprovider tests/review7_*.py
-
-``test_control_*`` = behaviour confirmed secure; ``test_attack_*`` = defect demonstration
-(a passing attack test means the defect is present).
+``test_control_*`` = behaviour confirmed secure at 28f56d1 and kept; ``test_attack_*`` = the round-7
+defect demonstrations, each now asserting the FIXED behaviour (the attack is refused or has no effect).
 """
 from __future__ import annotations
 
@@ -78,6 +74,15 @@ def _meta(p):
 def _tables(p):
     with _conn(p) as c:
         return sorted(r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'"))
+
+
+def _vacuum(p):
+    """Rewrite the file so freed pages carry no old content (VACUUM needs autocommit mode)."""
+    c = sqlite3.connect(str(p), isolation_level=None)
+    try:
+        c.execute("VACUUM")
+    finally:
+        c.close()
 
 
 def _open(p, **kw):
@@ -284,15 +289,31 @@ def test_control_r7_adoption_drops_tenant_id_and_tenant_filtered_recall_degrades
 # A. planted quorum / forged journal / legacy MAC key set
 # ---------------------------------------------------------------------------
 
-def test_control_r7_planted_low_quorum_in_keyless_file_is_refused_with_opt_in_and_writes_nothing(tmp_path):
-    for ro in (False, True):
+def test_control_r7_planted_low_quorum_in_keyless_file_is_dropped_by_the_opt_in_and_never_becomes_policy(tmp_path, caplog):
+    """R7-3 (fixed): a planted ``verification_quorum`` below the default is not the vault's policy and is not
+    a reason to refuse either: the opt-in open (writable or read-only) drops it, logged at WARNING with its
+    value, and runs at the default quorum; a plain open without the opt-in is still refused at the gate."""
+    import logging
+    for ro in (True, False):
         pq = R5._laundered_keyless_file(tmp_path, f"q{int(ro)}.sqlite")
         with _conn(pq) as c:
             c.execute("INSERT INTO vault_meta (key, value) VALUES ('verification_quorum', '1')")
-        with pytest.raises(ConfigError, match="pinned at 1"):
-            _open(pq, adopt_keyless=True, read_only=ro)
-        with pytest.raises(ConfigError if not ro else VaultIntegrityError):
-            _open(pq)  # a plain open is still refused: the planted 1 never became the quorum silently
+        with pytest.raises(VaultIntegrityError):
+            _open(pq, read_only=ro)  # no opt-in: refused at the gate, nothing written
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="kibisis.vault"):
+            v = _open(pq, adopt_keyless=True, read_only=ro)
+        try:
+            assert v.verification_quorum == 2 and v.verification_quorum_stored is None
+            assert v.quorum_dropped_from is None
+        finally:
+            v.close()
+        assert any("vault_meta.verification_quorum = '1'" in r.getMessage() and "no salt" in r.getMessage()
+                   and r.levelno == logging.WARNING for r in caplog.records)
+        if ro:
+            assert _meta(pq).get("verification_quorum") == "1"  # the read-only open left the file as it was
+        else:
+            assert "verification_quorum" not in _meta(pq)
 
 
 def test_control_r7_forged_keyless_journal_is_chained_on_the_files_word_and_rows_stay_candidates(tmp_path):
@@ -320,10 +341,13 @@ def test_control_r7_forged_keyless_journal_is_chained_on_the_files_word_and_rows
 
 
 def test_control_r7_legacy_mac_key_set_differs_from_the_full_set_only_by_the_quorum_keys():
+    """The full set binds the quorum; the full-set MAC also binds, while present, the dropped-quorum
+    floor and (R7-4) the journal high-water mark. The legacy set never covered any of them."""
     from kibisis.crypto import VAULT_META_BOUND_KEYS, VAULT_META_BOUND_KEYS_V1, VAULT_META_BOUND_OPTIONAL
     assert set(VAULT_META_BOUND_KEYS) - set(VAULT_META_BOUND_KEYS_V1) == {"verification_quorum"}
-    assert set(VAULT_META_BOUND_OPTIONAL) == {"quorum_dropped_from"}
+    assert set(VAULT_META_BOUND_OPTIONAL) == {"quorum_dropped_from", "journal_high_water"}
     assert set(VAULT_META_BOUND_KEYS_V1) <= set(VAULT_META_BOUND_KEYS)
+    assert not set(VAULT_META_BOUND_OPTIONAL) & set(VAULT_META_BOUND_KEYS_V1)
 
 
 # ---------------------------------------------------------------------------
@@ -421,7 +445,7 @@ def _review_env(tmp_path, monkeypatch):
     return review, p
 
 
-def test_control_r7_review_cli_verdict_help_shows_the_flag_and_a_refused_list_names_it(tmp_path, monkeypatch, capsys):
+def test_control_r7_review_cli_verdict_help_shows_the_flag_and_a_refused_list_names_the_way_in(tmp_path, monkeypatch, capsys):
     review, p = _review_env(tmp_path, monkeypatch)
     for sub in ("approve", "reject", "lift"):
         with pytest.raises(SystemExit):
@@ -435,16 +459,20 @@ def test_control_r7_review_cli_verdict_help_shows_the_flag_and_a_refused_list_na
 
 
 def test_attack_r7_review_list_refusal_names_a_flag_list_does_not_accept(tmp_path, monkeypatch, capsys):
-    """Minor (R7-2): `kibisis-review list` on a keyless file says "pass --adopt-keyless", but `list`
-    has no such flag (only the verdicts and lift do, as SECURITY.md says), so following the message
-    yields an argparse error; the library-only read_only+adopt_keyless path ("in memory only") is not
-    reachable from any CLI."""
+    """Minor (R7-2, fixed): `kibisis-review list` on a keyless file used to say "pass --adopt-keyless", a
+    flag `list` does not accept (only the verdicts and lift do, as SECURITY.md says), so following the
+    message gave an argparse error. `list` stays read-only (no flag added); its refusal now names the
+    commands that take the flag. A verdict's refusal still says "pass --adopt-keyless" as before."""
     review, _ = _review_env(tmp_path, monkeypatch)
     assert review.main(["list"]) == 2
-    assert "pass --adopt-keyless" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "pass --adopt-keyless" not in err
+    assert "open it with a verdict command (approve, dispute, reject or lift) and --adopt-keyless" in err
     with pytest.raises(SystemExit) as ex:
         review.main(["list", "--adopt-keyless"])
     assert ex.value.code == 2 and "unrecognized arguments: --adopt-keyless" in capsys.readouterr().err
+    assert review.main(["approve", "decision", "k0"]) == 2
+    assert "pass --adopt-keyless" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
@@ -452,57 +480,83 @@ def test_attack_r7_review_list_refusal_names_a_flag_list_does_not_accept(tmp_pat
 # ---------------------------------------------------------------------------
 
 def test_attack_r7_adopted_content_stays_plain_on_disk_until_migrate_plaintext(tmp_path):
-    """Low (R7-1): adoption re-signs the rows but seals none (`_write_sealed(..., encrypt=is_encrypted==1)`),
-    so in the no-SQLCipher mode the adopted entry text and its FTS words stay in the clear inside a vault
-    that now has a passphrase, until the library-only `migrate_plaintext()` runs.  SECURITY.md's "Without
-    SQLCipher" table says entry text is sealed in passphrase mode, and the adoption paragraph says rows are
-    stored "exactly as a model-origin put stores an agent's write"."""
+    """Low (R7-1, fixed): adoption used to re-sign the rows but seal none, so in the no-SQLCipher mode the
+    adopted entry text and its FTS words stayed in the clear inside a vault that now had a passphrase,
+    until the library-only `migrate_plaintext()` ran. Adoption now seals every adopted row in the adoption
+    transaction (the same `_write_sealed` a model-origin put uses), which also drops the plaintext's FTS
+    words; the plaintext is absent from the raw file bytes, the rows still read back and search through
+    the keyed path, and `migrate_plaintext()` finds nothing left to do."""
     pl = R5._laundered_keyless_file(tmp_path, "l.sqlite")
+    with _conn(pl) as c:
+        c.execute("UPDATE entities SET content = 'FORGED ' || key || ' zebraquince'")
+    _vacuum(pl)
+    assert b"zebraquince" in pl.read_bytes()
     v = _open(pl, adopt_keyless=True)
     try:
         v.remember("decision", "k_new", "sealed after adoption", origin="model")
-        assert v.encryption_status() == {"encrypted": 1, "plaintext": 3}
+        assert v.encryption_status() == {"encrypted": 4, "plaintext": 0}
+        assert v.verify_audit_chain()
+        assert v.get("decision", "k0", scope="default").content == "FORGED k0 zebraquince"
+        assert sorted(h.entity.key for h in v.recall("zebraquince", scope="default", limit=10).results) == ["k0", "k1", "k2"]
     finally:
         v.close()
     with _conn(pl) as c:
         rows = {r["key"]: (r["is_encrypted"], r["content"]) for r in c.execute("SELECT key, is_encrypted, content FROM entities")}
-        assert rows["k_new"] == (1, "")
-        assert all(rows[k][0] == 0 and rows[k][1].startswith("FORGED") for k in ("k0", "k1", "k2"))
-        assert c.execute("SELECT count(*) FROM entities_fts WHERE entities_fts MATCH 'forged'").fetchone()[0] == 3
+        assert all(rows[k] == (1, "") for k in ("k0", "k1", "k2", "k_new")), rows
+        assert c.execute("SELECT count(*) FROM entities_fts WHERE entities_fts MATCH 'zebraquince'").fetchone()[0] == 0
+    _vacuum(pl)
+    assert b"zebraquince" not in pl.read_bytes()
+    assert b"FORGED k0" not in pl.read_bytes()
     v = _open(pl)
     try:
-        assert v.migrate_plaintext() == {"migrated": 3, "remaining_plaintext": 0}
+        assert v.migrate_plaintext() == {"migrated": 0, "remaining_plaintext": 0}
+        assert v.verify_audit_chain()
     finally:
         v.close()
-    with _conn(pl) as c:
-        assert c.execute("SELECT count(*) FROM entities WHERE is_encrypted = 0").fetchone()[0] == 0
 
 
-def test_attack_r7_planted_high_quorum_in_keyless_file_is_adopted_and_signed_silently(tmp_path):
-    """Low (R7-3): a `verification_quorum` row planted in a salt-less file is read as the vault's stored
-    quorum.  Above the default it is adopted and signed by the opt-in open with no notice that it came from
-    an unsigned file; below the default it is refused with the generic ConfigError whose remedy is to set
-    the env to the planted value.  Stricter-only in the first case (a review lock-out, not a bypass)."""
+def test_attack_r7_planted_high_quorum_in_keyless_file_is_adopted_and_signed_silently(tmp_path, caplog):
+    """Low (R7-3, fixed): a `verification_quorum` (or `quorum_dropped_from`) row planted in a salt-less file
+    used to be read as the vault's stored quorum: above the default it was adopted and signed by the opt-in
+    open with no notice; below it, refused with a ConfigError whose remedy was to set the env to the planted
+    value. The adoption now drops both records in its transaction, logged at WARNING by name and value,
+    exactly as the legacy-MAC re-sign path does; the vault runs at the default and the signed meta MAC
+    binds no planted value. The person's own quorum is pinned by the next pinning open as usual."""
+    import logging
     pq = R5._laundered_keyless_file(tmp_path, "q.sqlite")
     with _conn(pq) as c:
         c.execute("INSERT INTO vault_meta (key, value) VALUES ('verification_quorum', '7')")
-    v = _open(pq, adopt_keyless=True)
+        c.execute("INSERT INTO vault_meta (key, value) VALUES ('quorum_dropped_from', '9')")
+    with caplog.at_level(logging.WARNING, logger="kibisis.vault"):
+        v = _open(pq, adopt_keyless=True)
     try:
-        assert v.verification_quorum == 7 and v.verification_quorum_stored == 7
+        assert v.verification_quorum == 2 and v.verification_quorum_stored is None
         assert v.quorum_dropped_from is None
+        assert v.verify_audit_chain()
     finally:
         v.close()
+    dropped = [r.getMessage() for r in caplog.records
+               if r.levelno == logging.WARNING and "no salt" in r.getMessage()]
+    assert any("vault_meta.verification_quorum = '7'" in m for m in dropped), dropped
+    assert any("vault_meta.quorum_dropped_from = '9'" in m for m in dropped), dropped
+    meta = _meta(pq)
+    assert "verification_quorum" not in meta and "quorum_dropped_from" not in meta
     v = _open(pq)
     try:
-        assert v.verification_quorum == 7  # survives the re-open under the signed meta MAC
+        assert v.verification_quorum == 2 and v.verification_quorum_stored is None  # nothing planted survived
+    finally:
+        v.close()
+    v = _open(pq, verification_quorum=3, pin_quorum=True)  # the person pins their own, under the full-set MAC
+    try:
+        assert v.verification_quorum_stored == 3
     finally:
         v.close()
     pq1 = R5._laundered_keyless_file(tmp_path, "q1.sqlite")
     with _conn(pq1) as c:
         c.execute("INSERT INTO vault_meta (key, value) VALUES ('verification_quorum', '1')")
-    v = _open(pq1, adopt_keyless=True, verification_quorum=1)
+    v = _open(pq1, adopt_keyless=True)  # no env needed to match a planted 1: it is dropped, not enforced
     try:
-        assert v.verification_quorum_stored == 1
+        assert v.verification_quorum == 2 and v.verification_quorum_stored is None
     finally:
         v.close()
 
@@ -545,49 +599,136 @@ def test_control_r7_fixture_lifecycle(tmp_path, fixture):
 
 
 def test_attack_r7_planted_low_quorum_refusal_has_already_committed_the_adoption(tmp_path):
-    """Low (R7-3b): with the opt-in, the adoption transaction (salt, key check, MAC, demoted rows, chained
-    journal) commits before the quorum check raises ConfigError, so a 'refused' open converted the file and
-    MAC-signed the writer-planted quorum 1 as the vault's stored quorum; a later open under
-    KIBISIS_VERIFICATION_QUORUM=1 (what the message suggests) needs no opt-in and runs with quorum 1."""
+    """Low (R7-3b, fixed): with the opt-in, the adoption transaction used to commit the writer-planted
+    quorum 1 under the meta MAC and THEN raise ConfigError, so the 'refused' open had already converted
+    the file, and a later open under KIBISIS_VERIFICATION_QUORUM=1 (what the message suggested) needed no
+    opt-in and ran with quorum 1. The planted record is now dropped inside the adoption transaction: the
+    opt-in open succeeds at the default quorum, nothing planted is signed, and a later open asking for
+    quorum 1 runs with its own 1 (as for any vault with no stored quorum) but pins nothing: the file's
+    stored quorum stays unset, and a plain open after it is back at the default."""
     pq = R5._laundered_keyless_file(tmp_path, "q.sqlite")
     with _conn(pq) as c:
         c.execute("INSERT INTO vault_meta (key, value) VALUES ('verification_quorum', '1')")
-    with pytest.raises(ConfigError):
-        _open(pq, adopt_keyless=True)
-    assert {"kdf_salt", "key_check", "meta_mac"} <= set(_meta(pq))
-    v = _open(pq, verification_quorum=1)  # no opt-in needed any more
+    v = _open(pq, adopt_keyless=True)
     try:
-        assert v.verification_quorum_stored == 1
-        assert v.keyless_adoption()["entries"] == 3
+        assert v.verification_quorum == 2 and v.verification_quorum_stored is None
+        assert (v.keyless_adoption() or {})["entries"] == 3
+    finally:
+        v.close()
+    assert {"kdf_salt", "key_check", "meta_mac"} <= set(_meta(pq))
+    assert "verification_quorum" not in _meta(pq)
+    v = _open(pq, verification_quorum=1)  # the process's own, as for any vault with nothing stored
+    try:
+        assert v.verification_quorum == 1 and v.verification_quorum_stored is None
+    finally:
+        v.close()
+    assert "verification_quorum" not in _meta(pq)
+    v = _open(pq)
+    try:
+        assert v.verification_quorum == 2 and v.verification_quorum_stored is None
     finally:
         v.close()
 
 
-def test_attack_r7_emptied_journal_with_head_intact_is_laundered_by_the_next_write(tmp_path):
-    """Medium (R7-4): a file writer empties `audit_journal` (or drops the table) and leaves the signed head.
-    `verify_audit_chain()` reports "a signed head with no rows: the whole journal was removed" -- until the
-    next append: `_append` continues from the last ROW (none -> sequence 1, prev 0*64), not from the signed
-    head, and re-signs the head over the new one-row chain.  One routine agent write (MCP remember) later,
-    verification is True and the removal has no trace.  Same for the head-removed variant pinned as 'caught'
-    by test_threat_model_claims: caught only until the next write."""
-    for wipe in ("DELETE FROM audit_journal", "DROP TABLE audit_journal", "DELETE FROM audit_journal; DELETE FROM audit_head"):
-        pk = tmp_path / f"k{abs(hash(wipe))}.sqlite"
-        v = _open(pk)
-        for i in range(3):
-            v.remember("decision", f"k{i}", f"fact {i}", origin="model")
-        v.close()
-        with _conn(pk) as c:
-            c.executescript(wipe)
-        v = _open(pk)
-        try:
-            assert v.verify_audit_chain() is False  # caught at this moment ...
+_WIPES = (
+    "DELETE FROM audit_journal",                                   # rows gone, signed head kept
+    "DROP TABLE audit_journal",                                    # table gone (recreated empty by the open), head kept
+    "DELETE FROM audit_journal; DELETE FROM audit_head",           # rows and head gone: only the high-water mark remains
+    "DELETE FROM audit_journal WHERE sequence > 2; DELETE FROM audit_head",  # rolled back to an earlier prefix, head gone
+)
+
+
+@pytest.mark.parametrize("wipe", _WIPES)
+def test_attack_r7_emptied_journal_with_head_intact_is_laundered_by_the_next_write(tmp_path, wipe):
+    """Medium (R7-4, fixed): a file writer empties `audit_journal` (or drops the table) and leaves the
+    signed head; `verify_audit_chain()` reported the removal, but the next append continued from the last
+    ROW (none -> sequence 1), not from the signed head, and re-signed the head over the new one-row chain,
+    so one routine agent write later the removal had no trace. Now `_append` refuses (VaultIntegrityError,
+    nothing written, head untouched) unless the last row is the one the signed head names AND the journal
+    reaches `vault_meta.journal_high_water`, the last signed sequence, bound under the meta MAC; the mark
+    also catches the rows-and-head wipe and a rollback to an older prefix, where no head contradicts the
+    rows. The chain stays False across the attempt and on reopen, writable or read-only."""
+    pk = tmp_path / f"k{abs(hash(wipe))}.sqlite"
+    v = _open(pk)
+    for i in range(3):
+        v.remember("decision", f"k{i}", f"fact {i}", origin="model")
+    v.close()
+    assert int(_meta(pk)["journal_high_water"]) == 3  # one event per put; a fresh vault has no migrate event
+    with _conn(pk) as c:
+        c.executescript(wipe)
+    v = _open(pk)
+    try:
+        assert v.verify_audit_chain() is False
+        first_error = v.last_chain_error
+        with pytest.raises(VaultIntegrityError, match="refusing to (append|start a new chain)"):
             v.remember("decision", "k_agent", "a routine agent write", origin="model")
-            assert v.verify_audit_chain() is True, wipe  # ... and laundered by the next append
-            assert [e.sequence for e in v.list_audit_events(limit=10)] == [1]
-        finally:
-            v.close()
-        v = _open(pk)
+        assert v.get("decision", "k_agent") is None  # nothing written
+        assert v.verify_audit_chain() is False, wipe  # not laundered by the attempt
+        assert v.last_chain_error == first_error
+    finally:
+        v.close()
+    assert int(_meta(pk)["journal_high_water"]) == 3  # the mark neither moved nor vanished
+    for ro in (False, True):
+        v = _open(pk, read_only=ro)
         try:
-            assert v.verify_audit_chain() is True, wipe
+            assert v.verify_audit_chain() is False, (wipe, ro)
         finally:
             v.close()
+    with _conn(pk) as c:  # the file writer's state is exactly what they left: no head re-signed over the hole
+        rows = c.execute("SELECT count(*) FROM audit_journal").fetchone()[0]
+        heads = c.execute("SELECT count(*) FROM audit_head").fetchone()[0]
+    assert rows == (2 if "sequence > 2" in wipe else 0)
+    assert heads == (0 if "audit_head" in wipe else 1)
+
+
+def test_control_r7_high_water_mark_follows_every_append_and_is_set_for_pre_r7_and_a5_files(tmp_path):
+    """The mark is the last signed sequence: raised by every append (and bound under the full-set MAC, so
+    it cannot be lowered or removed without the key); a keyed vault from before R7-4 (no mark under the
+    MAC) gets it from the signed head at the next writable open, and a read-only open of such a file
+    verifies without writing. Opening a fresh or untouched vault, writable or not, keeps the chain True."""
+    from kibisis.crypto import VAULT_META_BOUND_KEYS, VAULT_META_BOUND_OPTIONAL, vault_meta_mac
+    pk = tmp_path / "k.sqlite"
+    v = _open(pk)
+    v.remember("decision", "k0", "fact 0", origin="model")
+    signing_key = v._signing_key
+    v.close()
+    meta = _meta(pk)
+    assert int(meta["journal_high_water"]) == 1
+    with _conn(pk) as c:
+        bound = {r["key"]: r["value"] for r in c.execute("SELECT key, value FROM vault_meta")}
+    assert bound["meta_mac"] == vault_meta_mac(signing_key, {k: bound.get(k) for k in VAULT_META_BOUND_KEYS + VAULT_META_BOUND_OPTIONAL})
+    # lowering or removing the mark breaks the MAC: the open refuses
+    for sql in ("UPDATE vault_meta SET value = '0' WHERE key = 'journal_high_water'",
+                "DELETE FROM vault_meta WHERE key = 'journal_high_water'"):
+        pm = tmp_path / f"m{abs(hash(sql))}.sqlite"
+        shutil.copy(pk, pm)
+        with _conn(pm) as c:
+            c.execute(sql)
+        for ro in (False, True):
+            with pytest.raises(VaultIntegrityError):
+                _open(pm, read_only=ro)
+    # a pre-R7-4 file: mark absent and the MAC signed without it (legit, as the previous release wrote it)
+    pre = tmp_path / "pre.sqlite"
+    shutil.copy(pk, pre)
+    with _conn(pre) as c:
+        c.execute("DELETE FROM vault_meta WHERE key = 'journal_high_water'")
+        fields = {r["key"]: r["value"] for r in c.execute("SELECT key, value FROM vault_meta")}
+        c.execute("UPDATE vault_meta SET value = ? WHERE key = 'meta_mac'",
+                  (vault_meta_mac(signing_key, {k: fields.get(k) for k in VAULT_META_BOUND_KEYS + VAULT_META_BOUND_OPTIONAL}),))
+    before = pre.read_bytes()
+    v = _open(pre, read_only=True)
+    try:
+        assert v.verify_audit_chain()
+    finally:
+        v.close()
+    assert pre.read_bytes() == before and "journal_high_water" not in _meta(pre)
+    v = _open(pre)
+    try:
+        assert v.verify_audit_chain()
+    finally:
+        v.close()
+    assert int(_meta(pre)["journal_high_water"]) == 1  # set from the signed head at the writable open
+    v = _open(pre)
+    v.remember("decision", "k1", "fact 1", origin="model")
+    v.close()
+    assert int(_meta(pre)["journal_high_water"]) == 2

@@ -305,3 +305,45 @@ Fourth-pass findings in `review_notes/R4.md`; regression tests in `tests/test_re
   agreement test writes whole-second rows. Changing the crate type is an API change left to a release.
 - Lock-file deletion (a second process locking a new inode while the first holds the old one) is documented
   as out of scope rather than detected.
+
+## Round 7
+
+### Security
+
+- **Journal wipe laundered by the next append (R7-4, medium).** `_append` continued the chain from the
+  journal's last ROW, never from the signed head, so a writer who emptied `audit_journal` (or dropped the
+  table) and left the head was caught by `verify_audit_chain()` only until the next routine write, which
+  started a fresh chain at sequence 1 and re-signed the head over it. Fixed: a keyed vault records the
+  highest sequence it has signed a head for in `vault_meta.journal_high_water`, under the full-set meta
+  MAC (`VAULT_META_BOUND_OPTIONAL`, so a vault written before this round keeps its MAC and gets the mark
+  from its signed head at the next writable open; a read-only open verifies without writing; the legacy
+  V1 key set never bound it, so under a legacy MAC it is unknown and set at the re-sign). Every
+  `_write_audit_head` raises the mark. Before writing, `_append` requires the journal's last row to be
+  the one the signed head names (sequence and hash) and the journal to reach the mark
+  (`_refuse_discontinued_journal`); otherwise `VaultIntegrityError`, nothing written, head untouched.
+  `verify_audit_chain()` (and so the open-time check) reports False when the journal ends below the
+  mark, which also catches the rows-and-head wipe and a journal and head put back from an older copy,
+  where no head contradicts the rows. The a5 fixture migration and the format-3 upgrade set the mark
+  from the verified journal; a fresh vault sets it at its first append. `tests/test_threat_model_claims.py`
+  now asserts the wipe-with-head-removed case refuses the next write and stays False on reopen;
+  `tests/test_review7_final.py` (the round-7 review's `review7_final.py`, converted) pins all four wipe
+  variants plus the mark's lifecycle. `tests/test_review_b_journal.py`'s two next-append tests now expect
+  the refusal instead of a head re-signed over rewritten rows.
+- **Adopted rows stayed plain on disk (R7-1, low).** Keyless adoption re-signed each adopted row with
+  `encrypt=is_encrypted==1`, so in the no-SQLCipher mode the adopted text and its FTS words stayed in
+  the clear inside a vault that now had a passphrase until `migrate_plaintext()` ran. The adoption
+  transaction now seals every adopted row through the same `_write_sealed` a model-origin put uses
+  (which also drops the plaintext's FTS words); the plaintext is absent from the raw file bytes
+  afterwards, `migrate_plaintext()` finds nothing left, and the rows read and search back through the
+  keyed path.
+- **Planted policy records signed by the adoption (R7-3, low).** A `verification_quorum` or
+  `quorum_dropped_from` row in a salt-less file was read as the vault's stored policy: above the default
+  it was MAC-signed by the opt-in open with no notice; below it the open was refused by a `ConfigError`
+  whose remedy was to set the env to the planted value, and the adoption had already committed the
+  planted quorum under the MAC. Both are now dropped inside the adoption transaction (and, for the
+  read-only in-memory adoption, in the private copy), logged at WARNING by name and value, exactly as
+  the legacy-MAC re-sign path does (`_drop_keyless_policy_records`); a planted `journal_high_water` goes
+  with them, since the head the adoption signs is the first anyone signed. SECURITY.md's adoption
+  item, the quorum paragraph, the journal items and the "Without SQLCipher" table, and README's fencing
+  line, now say what the code does, including that `tenant_id` is dropped on adoption so tenant-filtered
+  recall sees adopted rows as tenant-less.

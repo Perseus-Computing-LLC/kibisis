@@ -143,8 +143,10 @@ class TestEncryptionByDefault(unittest.TestCase):
             SQLiteMemoryVault(self.db, passphrase=PASS, allow_plaintext=True)
         self.assertIn(CANARY.lower().encode(), _raw_bytes(self.db))  # the refusal wrote nothing
         enc = SQLiteMemoryVault(self.db, passphrase=PASS, allow_plaintext=True, adopt_keyless=True)
+        # R7-1: the adoption itself seals every adopted row, so there is nothing left to migrate
+        self.assertEqual(enc.encryption_status(), {"encrypted": 2, "plaintext": 0})
         result = enc.migrate_plaintext()
-        self.assertEqual(result, {"migrated": 2, "remaining_plaintext": 0})
+        self.assertEqual(result, {"migrated": 0, "remaining_plaintext": 0})
         enc.close()
         self.assertNotIn(CANARY.lower().encode(), _raw_bytes(self.db))
         self.assertEqual(SQLiteMemoryVault(self.db, passphrase=PASS).get("c", "k1").content, f"first {CANARY}")

@@ -9,6 +9,7 @@ import pytest
 
 import kibisis.vault as vault_module
 from kibisis import EntryIntegrityError, SQLiteMemoryVault
+from kibisis.vault import VaultIntegrityError
 
 PASS = "threat model passphrase (test only)"
 
@@ -90,7 +91,9 @@ def test_trust_flip_is_not_caught_without_sqlcipher(tmp_path):
 
 def test_deleting_journal_and_head_together_is_caught(tmp_path):
     """SECURITY.md, 'Deleting the whole journal together with its head': a keyed vault records that its
-    journal has held a row, so an empty journal with no head fails verification."""
+    journal has held a row, so an empty journal with no head fails verification; the vault's journal
+    high-water mark (``vault_meta.journal_high_water``, under the meta MAC) refuses every later append,
+    so the removal is not laundered by the next write and is still reported on reopen (R7-4)."""
     path = _seeded(tmp_path / "v.sqlite")
     _edit(path, "DELETE FROM audit_journal")
     _edit(path, "DELETE FROM audit_head")
@@ -98,4 +101,11 @@ def test_deleting_journal_and_head_together_is_caught(tmp_path):
     assert vault.verify_audit_chain() is False
     assert "no signed head" in vault.last_chain_error
     assert vault.get("decision", "person_fact") is not None  # entries stay readable
+    with pytest.raises(VaultIntegrityError, match="whole journal was removed"):
+        vault.remember("decision", "later", "a later fact", origin="user")
+    assert vault.get("decision", "later") is None
+    assert vault.verify_audit_chain() is False
+    vault.close()
+    vault = SQLiteMemoryVault(str(path), passphrase=PASS, auto_gate=False)
+    assert vault.verify_audit_chain() is False
     vault.close()

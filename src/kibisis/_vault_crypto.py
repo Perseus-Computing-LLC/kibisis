@@ -604,6 +604,28 @@ class EntryIntegrityMixin:
         except Exception:
             return None
 
+    def _drop_keyless_policy_records(self, cursor: Any) -> None:
+        """In the adoption transaction of a salt-less file (R7-3): drop the ``vault_meta`` policy records
+        the file carries, since nobody signed them, exactly as the legacy-MAC re-sign drops them
+        (``_drop_untrusted_stored_quorum``). A planted ``verification_quorum`` would otherwise be
+        MAC-signed by this open as the vault's stored policy (above the default: every later plain open
+        refused until the operator matches it; below it: adopted as a one-account quorum by the open the
+        refusal suggests); a planted ``quorum_dropped_from`` would become a floor; a planted
+        ``journal_high_water`` would refuse every append (R7-4). Each is logged at WARNING with its
+        value. The person loses nothing: the next verdict run under their ``KIBISIS_VERIFICATION_QUORUM``
+        pins the quorum under the full-set MAC, and the head this adoption signs sets the mark."""
+        for name in ("verification_quorum", "quorum_dropped_from", "journal_high_water"):
+            planted = self._meta(name)
+            if planted is None:
+                continue
+            logger.warning(
+                "%s: vault_meta.%s = %r came from a file with no salt, which nobody signed: dropped before the "
+                "adoption is signed",
+                self.db_path, name, planted,
+            )
+            cursor.execute("DELETE FROM vault_meta WHERE key = ?", (name,))
+        self.quorum_dropped_from = None
+
     def _key_check_value(self) -> str:
         return hmac.new(self._signing_key, b"kibisis key check v2", hashlib.sha256).hexdigest()
 
@@ -613,7 +635,7 @@ class EntryIntegrityMixin:
     _A5_FOREIGN_TABLES: Tuple[str, ...] = ("audit_head",)
     _A5_FOREIGN_COLUMNS: Tuple[Tuple[str, str], ...] = (("audit_journal", "format"), ("rejected_value_tombstones", "tombstone_mac"))
     _A5_FOREIGN_META: Tuple[str, ...] = (
-        "key_check", "meta_mac", "journal_format_floor", "journal_anchored", "verification_quorum",
+        "key_check", "meta_mac", "journal_format_floor", "journal_anchored", "journal_high_water", "verification_quorum",
         "quorum_dropped_from", "term_index_format", "search_index_format",
     )
 
@@ -834,7 +856,23 @@ class EntryIntegrityMixin:
             self._verify_meta_mac()
         self._integrity_format = INTEGRITY_FORMAT
         self._journal_anchored = bool(int(self._meta("journal_anchored") or 0))
+        self._ensure_journal_high_water()
         self._check_tombstones()
+
+    def _ensure_journal_high_water(self) -> None:
+        """A keyed vault whose meta MAC does not yet bind a journal high-water mark (written before
+        R7-4, or just re-signed from the legacy key set, which never covered one) gets it from the
+        signed head at this writable open: the head is the last sequence anybody signed, so the mark
+        can only ever be that or higher from now on. Only runs when the head verifies and names the
+        last row (``verify_audit_chain``); a journal that fails is left as it is, for the caller to see
+        through ``verify_audit_chain`` and for every append to refuse (``_refuse_discontinued_journal``)."""
+        if not self._keyed or getattr(self, "read_only", False) or self._journal_high_water() is not None:
+            return
+        head = self._conn.execute("SELECT sequence FROM audit_head WHERE id = 1").fetchone()
+        if head is None or not self.verify_audit_chain():
+            return
+        with self._write_tx() as cursor:
+            self._raise_journal_high_water(cursor, int(head["sequence"]))
 
     # --- vault_meta MAC (integrity format 3) ------------------------------------------------------------
 
@@ -925,11 +963,14 @@ class EntryIntegrityMixin:
                 signed += 1
             lowest = cursor.execute("SELECT MIN(format), COUNT(*) FROM audit_journal").fetchone()
             floor = int(lowest[0]) if lowest[0] is not None else JOURNAL_FORMAT
-            if lowest[1] and cursor.execute("SELECT 1 FROM audit_head WHERE id = 1").fetchone() is None:
+            if lowest[1]:
                 last = cursor.execute(
                     "SELECT sequence, event_hash FROM audit_journal ORDER BY sequence DESC LIMIT 1"
                 ).fetchone()
-                self._write_audit_head(cursor, last["sequence"], last["event_hash"])
+                if cursor.execute("SELECT 1 FROM audit_head WHERE id = 1").fetchone() is None:
+                    self._write_audit_head(cursor, last["sequence"], last["event_hash"])
+                # The journal verified up to its last row: that is the high-water mark the MAC below binds (R7-4).
+                self._set_meta(cursor, "journal_high_water", int(last["sequence"]))
             self._set_meta(cursor, "journal_format_floor", floor)
             self._set_meta(cursor, "journal_anchored", 1 if lowest[1] else 0)
             self._set_meta(cursor, "integrity_format", INTEGRITY_FORMAT)
@@ -1097,7 +1138,9 @@ class EntryIntegrityMixin:
                 if not self._was_keyed:
                     # A keyless file with no rows and no journal but vault_meta records a first keyed open
                     # never writes (a pinned quorum, say): admitted only with the opt-in
-                    # (_refuse_unadopted_keyless_rows); say so in the journal (R6-1).
+                    # (_refuse_unadopted_keyless_rows); say so in the journal (R6-1). Its policy records
+                    # are named there and dropped (R7-3): nobody signed them.
+                    self._drop_keyless_policy_records(cursor)
                     self._record_audit_event(
                         cursor=cursor, action="migrate", category="", key="", scope="*", value_sha256="",
                         metadata={"integrity_format": 2, "previous_head": "0" * 64, "previous_chain_valid": True,
@@ -1186,7 +1229,12 @@ class EntryIntegrityMixin:
                 raise ValueError("Failed to authenticate or decrypt vault database with provided passphrase")
 
             for r, content in reseal:
-                self._write_sealed(cursor, r, content, encrypt=r["is_encrypted"] == 1)
+                # R7-1: an adopted row is stored as a model-origin put stores an agent's write, sealed
+                # included; its plaintext (and the FTS words the triggers keep in step) leave the file here.
+                self._write_sealed(
+                    cursor, r, content,
+                    encrypt=r["is_encrypted"] == 1 or (not was_keyed and self.crypto_provider is not None),
+                )
                 counts["entries_resealed"] += 1
                 if not was_keyed:
                     self._demote_adopted_row(cursor, r["id"])
@@ -1248,6 +1296,13 @@ class EntryIntegrityMixin:
                     (value, prev_hash, event_hash, json.dumps(metadata, sort_keys=True), ev["sequence"]),
                 )
                 prev_hash = event_hash
+            if events:
+                # The chain was rewritten under this vault's keys, so its head must be too, before the
+                # migrate event below checks that the head names the last row (R7-4). A keyless file's
+                # head was signed with the path-derived key; a salted file's with the passphrase's.
+                self._write_audit_head(cursor, int(events[-1]["sequence"]), prev_hash)
+            if not was_keyed:
+                self._drop_keyless_policy_records(cursor)
             if not chain_was_valid:
                 logger.warning(
                     "%s: the audit journal did not verify before the integrity upgrade; the upgrade's "

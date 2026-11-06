@@ -820,6 +820,9 @@ class SQLiteMemoryVault(
         cursor = self._conn.cursor()
         for entity_id in ids:
             self._demote_adopted_row(cursor, entity_id)
+        # The writable adoption drops the file's policy records (R7-3); the in-memory view does the same,
+        # so a planted quorum is not read as this open's stored policy either.
+        self._drop_keyless_policy_records(cursor)
         self._conn.commit()
         if ids:
             self._keyless_adoption_view = {"entries": len(ids), "events": 0, "at": time.time(), "sequence": None}

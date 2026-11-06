@@ -23,7 +23,7 @@ import kibisis.vault as vault_module
 from kibisis import SQLiteMemoryVault
 from kibisis._vault_crypto import value_digests
 from kibisis.config import ConfigError, open_vault
-from kibisis.crypto import VAULT_META_BOUND_KEYS, VAULT_META_BOUND_KEYS_V1, vault_meta_mac
+from kibisis.crypto import VAULT_META_BOUND_KEYS, VAULT_META_BOUND_KEYS_V1, VAULT_META_BOUND_OPTIONAL, vault_meta_mac
 from kibisis.mcp_server import KibisisMCPServer, TOOL_DEFINITIONS
 from kibisis.vault import TombstonedValueError
 
@@ -566,7 +566,7 @@ def test_attack_legacy_meta_mac_keeps_a_lowered_quorum_that_is_still_at_the_defa
     fields = M._bound(c)
     c.close()
     assert fields.get("verification_quorum") is None  # dropped, not re-signed
-    assert fields["meta_mac"] == vault_meta_mac(signing_key, {k: fields.get(k) for k in VAULT_META_BOUND_KEYS})
+    assert fields["meta_mac"] == vault_meta_mac(signing_key, {k: fields.get(k) for k in VAULT_META_BOUND_KEYS + VAULT_META_BOUND_OPTIONAL})
     v = _open(p, verification_quorum=3, pin_quorum=True, trust_caller_identity=True)  # the person re-pins
     try:
         assert v.verification_quorum == 3 and v.verification_quorum_stored == 3

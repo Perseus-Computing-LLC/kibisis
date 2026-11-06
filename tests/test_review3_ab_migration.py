@@ -13,7 +13,7 @@ import pytest
 
 import kibisis.vault as vault_module
 from kibisis import SQLiteMemoryVault
-from kibisis.crypto import VAULT_META_BOUND_KEYS_V1, vault_meta_mac
+from kibisis.crypto import VAULT_META_BOUND_KEYS_V1, VAULT_META_BOUND_OPTIONAL, vault_meta_mac
 from kibisis.vault import _event_hash
 
 PASS = "review3-ab passphrase (test only)"
@@ -64,7 +64,7 @@ def _scrub_everything_but_entries(c):
     c.execute("DELETE FROM rejected_value_tombstones")
     c.execute("DELETE FROM audit_journal WHERE action IN ('tombstone', 'tombstone_reaffirmed')")
     c.execute("DELETE FROM vault_meta WHERE key IN ('key_check', 'meta_mac', 'integrity_format', "
-              "'journal_format_floor', 'journal_anchored')")
+              "'journal_format_floor', 'journal_anchored', 'journal_high_water')")
     c.execute("UPDATE entities SET tenant_sig = NULL")
     _legacy_rechain(c)
 
@@ -232,7 +232,7 @@ def test_attack_r2b4_legacy_v1_meta_mac_re_signs_an_attacker_quorum(tmp_path, ca
     c.close()
     # The forged quorum is gone, and the re-signed MAC is a full-set MAC over the file as it now stands.
     assert "verification_quorum" not in fields
-    assert fields["meta_mac"] == vault_meta_mac(signing_key, {k: fields.get(k) for k in VAULT_META_BOUND_KEYS})
+    assert fields["meta_mac"] == vault_meta_mac(signing_key, {k: fields.get(k) for k in VAULT_META_BOUND_KEYS + VAULT_META_BOUND_OPTIONAL})
     v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
     try:
         assert v.verification_quorum == 2 and v.verification_quorum_stored is None

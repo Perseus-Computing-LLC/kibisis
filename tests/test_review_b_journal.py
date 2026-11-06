@@ -134,16 +134,21 @@ def test_attack_format_downgrade_of_middle_deletion_is_caught(tmp_path):
     assert "below this vault's floor 3" in error
     assert all(fmt == 1 for *_, fmt in events)
     assert not any(a == "tombstone" for _, a, _, _ in events)
-    # The tombstone row itself still stands (and verifies under its own MAC): the value stays refused.
+    # The tombstone row itself still stands (and verifies under its own MAC), and since R7-4 no append
+    # at all continues a journal whose head was removed: the write is refused before the tombstone hit
+    # could even be journaled, and the chain stays False (the removal is not laundered by the attempt).
     v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
-    with pytest.raises(vault_module.TombstonedValueError):
+    with pytest.raises(vault_module.VaultIntegrityError, match="no signed head"):
         v.remember("decision", "k3b", "fact number 3", origin="user")
+    assert v.verify_audit_chain() is False
+    assert v._conn.execute("SELECT count(*) FROM rejected_value_tombstones").fetchone()[0] >= 1
     v.close()
 
 
 def test_attack_format_downgrade_of_payload_edit_and_reorder_is_caught(tmp_path):
     """F2: author_id rewritten and two rows swapped, then downgraded; verification fails, and the next
-    legitimate append does not launder it: the head signs the new row, but the rewritten rows still
+    legitimate append does not launder it: since R7-4 the append is refused outright (the head the
+    rewrite deleted is required), so nothing re-signs a head above the rewritten rows, which still
     fail under the floor."""
     p = _seeded(tmp_path / "v.sqlite")
     c = _conn(p)
@@ -158,7 +163,9 @@ def test_attack_format_downgrade_of_payload_edit_and_reorder_is_caught(tmp_path)
     assert ok is False and "floor 3" in error
 
     v = SQLiteMemoryVault(str(p), passphrase=PASS, auto_gate=False)
-    v.remember("decision", "k9", "a later fact", origin="user")
+    with pytest.raises(vault_module.VaultIntegrityError, match="no signed head"):
+        v.remember("decision", "k9", "a later fact", origin="user")
+    assert v.get("decision", "k9") is None  # nothing was written
     assert v.verify_audit_chain() is False
     assert "floor 3" in v.last_chain_error
     v.close()

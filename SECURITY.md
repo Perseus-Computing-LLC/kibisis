@@ -64,10 +64,13 @@ a guarantee beyond what the named code does.
   verdict on the same rows when the rows are what the crate's types hold (whole-second timestamps,
   compact canonical metadata JSON); a Python vault's journal is verified by the Python verifier, which
   hashes through the crate. A vault that has ever been keyed (`kdf_salt` present) pins the lowest
-  journal format it holds and whether its journal has ever held a row in `vault_meta`
-  (`journal_format_floor`, `journal_anchored`), under the meta MAC below, so rows rewritten in an older,
-  unkeyed hash layout are refused and deleting every row together with the head is caught too, whatever
-  `integrity_format` was edited to say.
+  journal format it holds, whether its journal has ever held a row, and the highest sequence it has
+  signed a head for, in `vault_meta` (`journal_format_floor`, `journal_anchored`, `journal_high_water`),
+  under the meta MAC below, so rows rewritten in an older, unkeyed hash layout are refused and deleting
+  every row, with or without the head, or putting back an older journal, is caught too, whatever
+  `integrity_format` was edited to say. The check holds across later writes: an append refuses
+  (`VaultIntegrityError`, nothing written) unless the journal's last row is the one the signed head
+  names and the journal reaches the high-water mark, so no routine write re-signs a head over the hole.
 - *Re-inserting a forgotten value.* Tombstones keep keyed digests of forgotten values
   (`crypto.keyed_value_digest`, crypto.py; `_seal_digests`, _vault_crypto.py), and `put`, restore and
   `import_snapshot` refuse a value whose digest matches, as content, key or a metadata string
@@ -126,12 +129,20 @@ a guarantee beyond what the named code does.
   and nothing else) is a fresh vault. A SQLite file that holds tables but no `entities` table is not
   a vault at all and is refused by every keyed open, writable included ("not a kibisis vault"), with
   nothing written. With the opt-in every adopted row is stored exactly as a model-origin `put` stores
-  an agent's write: a `candidate` with `origin_class: agent`, `act_class: inform`, origin `model`,
+  an agent's write, sealed included (its content is AES-GCM-sealed in the adoption transaction, and the
+  plaintext's full-text words leave the file with it): a `candidate` with `origin_class: agent`,
+  `act_class: inform`, origin `model`,
   every reserved metadata key (`human_reviews`, `attestations`, `origin_class`, `act_class`,
   `superseded_by`, `supersedes`, `trust_capped_from`, ...) dropped, every principal-only key
   (`author_id`, `supersession`, `proposed_supersedes`, ...) moved under `agent_metadata`, and its
   supersession links cleared (`_demote_adopted_row`); what the file said is kept as a label in
-  `adopted_from_keyless_file`. A forged principal-class row therefore neither blocks an agent's later
+  `adopted_from_keyless_file`; a `tenant_id` the file carried is dropped with the rest, so a
+  tenant-filtered recall sees every adopted row as tenant-less (the file's tenant labels were on
+  nobody's word). The file's policy records go the same way: a `verification_quorum` or
+  `quorum_dropped_from` planted in a salt-less file is dropped in the adoption transaction, logged at
+  WARNING by name and value, exactly as the legacy-MAC re-sign drops them, so the signed meta MAC never
+  binds a quorum nobody signed; the vault runs at the default until a verdict pins one. A forged
+  principal-class row therefore neither blocks an agent's later
   write on the key nor outranks it, and a person's verdict on it yields what a verdict on an agent's
   candidate yields. A writable open writes that into the file; a read-only open with the opt-in
   applies the same demotion to a private in-memory copy and writes nothing, so the writer's rows are
@@ -176,8 +187,12 @@ also stored in plain text.
   outside the file would.
 - *Deleting the file.*
 - *Deleting the whole journal together with its head, and the integrity record.* `journal_anchored` under
-  the meta MAC records that the journal has held a row, so emptying the journal and removing the head is
-  caught (pinned by `tests/test_threat_model_claims.py`). A writer who also removes `kdf_salt`, `key_check`,
+  the meta MAC records that the journal has held a row and `journal_high_water` the last sequence a head
+  was signed for, so emptying the journal with the head kept is refused at open (`verify_audit_chain()`
+  False) and again on every append, and emptying it together with the head, or putting back an older
+  journal and head, is refused by the high-water mark the same way; nothing is written and the next open
+  still reports it (pinned by `tests/test_threat_model_claims.py` and `tests/test_review7_final.py`). A
+  writer who also removes `kdf_salt`, `key_check`,
   `integrity_format` and the MAC (and flattens every sealed row, since a sealed row without a salt is
   refused) turns the file into one that looks like it never had a passphrase, with whatever rows the
   writer left in it. One with rows is refused by every keyed open until an operator passes
@@ -248,7 +263,9 @@ also stored in plain text.
   and `admit`, behind the terminal check), two by default until that first verdict. Every other open
   adopts the stored value and never writes one; an open that asks for less is refused (`ConfigError`),
   a pinning open that asks for more stores it, a stored quorum below the default is adopted only by a
-  process whose own `KIBISIS_VERIFICATION_QUORUM` names it, and while the meta MAC verifies only over
+  process whose own `KIBISIS_VERIFICATION_QUORUM` names it, a quorum found in a salt-less file is not
+  stored policy at all (dropped when the file is adopted, see the adoption item above), and while the
+  meta MAC verifies only over
   the legacy key set no stored quorum is trusted, whatever its value (the MAC never covered it, so a
   file writer can lower a pinned 3 to 2 as easily as to 1): it is ignored, logged at WARNING with the
   value, and dropped before the re-sign; the next verdict run under the person's
@@ -362,7 +379,7 @@ in one of two reduced modes. `_ranked_rows` () picks the search path:
 | Mode | Entry text on disk | Entry terms on disk | Categories, keys, metadata, states, journal |
 |---|---|---|---|
 | No passphrase (`allow_plaintext=True`) | Plain, in `entities.content` | Plain, in `entities_fts` (`_plaintext_rows`, _vault_search.py) | Plain |
-| Passphrase, no SQLCipher | Sealed (AES-GCM) | Keyed tokens, in order, in `entities_terms` (`_ensure_term_index`): HMAC-SHA256 of scope and word under a passphrase-derived key, no word in the clear; see the term index item above for what their shape shows. With `term_index=False`: not written, the index is built in process memory from decrypted entries (`_scan_index`) and rebuilt when the vault changes | Plain |
+| Passphrase, no SQLCipher | Sealed (AES-GCM); rows written before the vault had a passphrase, or legacy rows an older release left plain, are re-sealed by `migrate_plaintext()` (`encryption_status()` counts them); rows adopted from a salt-less file are sealed by the adoption itself | Keyed tokens, in order, in `entities_terms` (`_ensure_term_index`): HMAC-SHA256 of scope and word under a passphrase-derived key, no word in the clear; see the term index item above for what their shape shows. With `term_index=False`: not written, the index is built in process memory from decrypted entries (`_scan_index`) and rebuilt when the vault changes | Plain |
 | Passphrase + SQLCipher | Sealed, inside an encrypted file | Inside the encrypted file: a contentless FTS5 table of words and positions, enough to rebuild each entry's text without case or punctuation (`_ensure_search_index`, _vault_search.py) | Encrypted with the file |
 
 In the middle row with `term_index=False`, the search index lives in a `:memory:` SQLite connection; it is
