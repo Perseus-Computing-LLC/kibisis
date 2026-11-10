@@ -82,6 +82,16 @@ def _req(method: str, path: str, payload=None, auth: bool = True, extra: str = "
     return head.encode() + body
 
 
+def _permits_back(semaphore, want: int, timeout: float = 5.0) -> int:
+    """The semaphore's free permits once they reach ``want``, or their value at the deadline. The server
+    releases a connection permit in its handler thread after it has closed the socket, so a client can
+    read EOF before the release: an assertion made right after the response has to wait for it."""
+    deadline = time.monotonic() + timeout
+    while semaphore._value != want and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return semaphore._value
+
+
 def _statuses(out: bytes) -> list:
     return [int(m) for m in re.findall(rb"HTTP/1\.1 (\d{3})", out)]
 
@@ -176,14 +186,15 @@ def test_control_storage_failure_is_500_without_a_traceback_and_the_permits_come
     http_server.service.add = boom
     try:
         for _ in range(6):  # more than max_connections and max_inflight: permits must be released
+            _permits_back(http_server.connections, http_server.config.max_connections)  # else a late release is a 503 here
             out = _raw(http_server, _req("POST", "/add", _add()))
             assert _statuses(out) == [500] and b'"internal error"' in out, out
             assert b"Traceback" not in out and PASSPHRASE.encode() not in out and b"secret" not in out
     finally:
         http_server.service.add = original
     assert PASSPHRASE not in caplog.text and "secret detail" not in caplog.text
-    assert http_server.connections._value == http_server.config.max_connections
-    assert http_server.inflight._value == http_server.config.max_inflight
+    assert _permits_back(http_server.connections, http_server.config.max_connections) == http_server.config.max_connections
+    assert _permits_back(http_server.inflight, http_server.config.max_inflight) == http_server.config.max_inflight
     assert _statuses(_raw(http_server, _req("POST", "/add", _add(rid="after")))) == [200]
 
 
@@ -211,8 +222,7 @@ def test_control_handler_exception_releases_the_connection_permit(http_server, m
     monkeypatch.setattr(AMLHandler, "do_POST", explode)
     for _ in range(http_server.config.max_connections + 2):
         _raw(http_server, _req("POST", "/add", _add()), read_timeout=1.0)
-    time.sleep(0.3)
-    assert http_server.connections._value == http_server.config.max_connections
+    assert _permits_back(http_server.connections, http_server.config.max_connections) == http_server.config.max_connections
 
 
 # ------------------------------------------------------------------ retention boundaries

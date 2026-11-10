@@ -113,6 +113,15 @@ def _post(path: str, payload: dict, auth: bool = True, extra: str = "") -> bytes
     return head.encode() + body
 
 
+def _permits_back(semaphore, want: int, timeout: float = 5.0) -> int:
+    """The semaphore's free permits once they reach ``want``, or their value at the deadline: the server
+    releases a connection permit after it has closed the socket, so the client can be ahead of it."""
+    deadline = time.monotonic() + timeout
+    while semaphore._value != want and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return semaphore._value
+
+
 def _statuses(out: bytes) -> list:
     return [int(m) for m in __import__("re").findall(rb"HTTP/1\.1 (\d{3})", out)]
 
@@ -361,8 +370,7 @@ def test_control_connection_permits_are_returned_after_500_and_idle_close(http_s
     finally:
         for s in idle:
             s.close()
-    time.sleep(0.3)
-    assert http_server.connections._value == cap
+    assert _permits_back(http_server.connections, cap) == cap
     assert _statuses(_raw(http_server, _post("/search", {"user_id": "u", "query": "x"}))) == [200]
 
 
