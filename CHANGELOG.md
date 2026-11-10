@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.17] - 2026-11-10
+
 ### Security
 - **Write trust boundary.** A `model`, `tool` or `unknown` origin can only write `candidate` entries: any other
   `epistemic_state` (`revoked` included) is capped and recorded as `trust_capped_from`, and `author_id`,

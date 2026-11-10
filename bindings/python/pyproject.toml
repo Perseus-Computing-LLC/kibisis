@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "kibisis-native"
-version = "0.1.0a16"
+version = "0.1.0a17"
 description = "Python extension exposing the kibisis Rust lease coordinator (file leases with fencing tokens) and journal hashing."
 readme = "README.md"
 license = { text = "MIT" }
