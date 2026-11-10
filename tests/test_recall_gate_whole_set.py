@@ -128,7 +128,7 @@ def test_tied_crowd_is_withheld_at_any_limit(any_vault):
         out = vault.recall("valve", match="any", limit=limit)
         assert out.results == [] and out.receipt["n_matched"] == 90 and out.receipt["n_withheld_gate"] == 90
         assert all(h["z_bp"] == 0 and h["reason"] == "below_gate" for h in out.receipt["hits"])
-        assert len(out.withheld) == max(limit * 8, 64) if limit < 100 else 90
+        assert len(out.withheld) == min(90, max(limit * 8, 64))  # named: the best of them; counted: all
 
 
 def test_mcp_envelope_counts_every_hit_below_the_gate(vault):
