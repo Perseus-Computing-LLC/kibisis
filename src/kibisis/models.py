@@ -207,10 +207,22 @@ class SearchHit(BaseModel):
 
 
 class WithheldEntry(BaseModel):
-    """An entry ``recall`` matched but did not return, and why (K-R3/K-R4). Carries no content."""
+    """An entry ``recall`` matched but did not return, and why (K-R3/K-R4). Carries no content, unless the
+    caller asked ``recall`` for digests (``withheld_digest_chars``), and then only below the gate."""
     ref: str = Field(description="``category:key`` of the withheld entry.")
     reason: str = Field(description="``conflict_unresolved``, ``below_gate`` or ``stale``.")
     sources: List[str] = Field(default_factory=list, description="For a conflict: the refs it conflicts with.")
+    coverage_bp: Optional[int] = Field(
+        default=None, description="Below the gate: share of the query's words the entry matched, in basis points."
+    )
+    rank: Optional[int] = Field(
+        default=None, description="Below the gate: the entry's position among the matches in BM25 order, from 1."
+    )
+    updated_at: Optional[float] = Field(default=None, description="Below the gate: when the entry was last written.")
+    digest: Optional[str] = Field(
+        default=None,
+        description="Below the gate, and only when asked for: the first characters of the content, on one line.",
+    )
 
 
 class RecallResult(BaseModel):
