@@ -62,6 +62,33 @@ DEFAULT_MIN_COVERAGE_BP = 5000
 DEFAULT_Z_MAX_BP = -5000
 
 
+#: ``recall(prefer_recent=True)``: a hit that passed the gate has its score multiplied by
+#: ``1 + boost * 2 ** (-age / half_life)``. The boost is in basis points (5000: an entry written now
+#: scores half again as well), the half-life in days.
+DEFAULT_RECENCY_BOOST_BP = 5000
+
+
+DEFAULT_RECENCY_HALF_LIFE_DAYS = 30
+
+
+#: How many returned refs one ``kibisis.memory_recall`` ledger event names.
+ARGUS_RETURNED_REFS = 40
+
+
+# What the recall gate reads of every match: nothing sealed, so no entry is opened to gate it.
+_GATE_COLUMNS = (
+    "e.id, e.category, e.key, e.scope, e.metadata_json, e.epistemic_state, e.updated_at, e.created_at, e.origin"
+)
+
+
+# ``limit`` of a ranked query that wants every match (SQLite reads a negative LIMIT as none).
+_EVERY_MATCH = -1
+
+
+# Ids per ``IN (...)`` list, under SQLite's limit on bound values.
+_ID_CHUNK = 500
+
+
 # What keys-only search reads: no content, no sealed content.
 _HIT_COLUMNS = "e.id, e.category, e.key, e.scope, e.metadata_json"
 
@@ -94,6 +121,11 @@ def _search_terms(query: str, match: str) -> List[str]:
             unique.append(w.lower())
     content = [w for w in unique if w not in _SEARCH_STOPWORDS] or unique
     return [w for w in content if len(w) > 1] or content
+
+
+def _fts_query(terms: Sequence[str], match: str) -> str:
+    """The FTS5 query for search terms: each a quoted prefix phrase, any of them or all of them."""
+    return (" OR " if match == "any" else " ").join('"' + t.replace('"', '""') + '"*' for t in terms)
 
 
 def _bounded(
@@ -218,29 +250,66 @@ class SearchRecallMixin:
         z_max_bp: int = DEFAULT_Z_MAX_BP,
         ttl_seconds: Optional[Dict[str, float]] = None,
         actor: Optional[str] = None,
+        prefer_recent: bool = False,
+        recency_boost_bp: int = DEFAULT_RECENCY_BOOST_BP,
+        recency_half_life_days: float = DEFAULT_RECENCY_HALF_LIFE_DAYS,
+        withheld_digest_chars: int = 0,
     ) -> RecallResult:
         """Model-facing recall: :meth:`search` plus what was withheld and why, with a receipt (K-R3..K-R5).
 
         K-R3: two verified entries that conflict (``conflicts_with`` edge, or the same ``slot`` with
-        different content) are both withheld as ``conflict_unresolved`` with each other's ids. K-R4: a hit
-        is returned only if the share of query words it contains is at least ``min_coverage_bp`` (basis
-        points) and, with four or more matches to compare against, its BM25 z-score among the matched set
-        is at most ``z_max_bp``; the receipt carries ``n_store`` and every hit's z-score and coverage.
-        ``ttl_seconds`` maps an origin class to a maximum age since ``last_verified_at`` (else
-        ``updated_at``); older entries are withheld as ``stale``. K-R5: every call is journaled as a
-        ``recall`` event and mirrored to Argus as ``kibisis.memory_recall`` (counts and withheld ids; the
-        query appears only as a digest).
+        different content) are both withheld as ``conflict_unresolved`` with each other's ids.
+
+        K-R4: a hit is returned only if the share of query words it matched is at least
+        ``min_coverage_bp`` (basis points) and, with four or more matches to compare against, its BM25
+        z-score among the matched set is at most ``z_max_bp``. Both tests are taken over every match and
+        read the index that found it: a query word is covered wherever the index matched it (category,
+        key, content or scope, with the index's folding of case and accents), and ``n_matched``, the mean
+        and the deviation are those of the whole matched set, so a hit's verdict does not change with
+        ``limit``. ``ttl_seconds`` maps an origin class to a maximum age since ``last_verified_at`` (else
+        ``updated_at``); older entries are withheld as ``stale``.
+
+        ``prefer_recent`` re-orders the hits that passed the gate and changes nothing about which pass: a
+        hit's score is multiplied by ``1 + (recency_boost_bp / 10000) * 2 ** (-age / recency_half_life_days)``,
+        with the age taken from ``updated_at``, and that product is the ``rank_score`` it is returned with.
+        Use it for "what is the latest state" questions; leave it off for "what is the rule".
+
+        The receipt carries ``n_store``, ``n_matched`` and the counts withheld by reason, all over the
+        whole matched set. Its ``hits`` and the ``withheld`` list name the best ``max(limit * 8, 64)``
+        matches in BM25 order, plus any other entry that was returned or withheld for a conflict: each
+        with its coverage, z-score, ``rank`` (position in BM25 order) and ``updated_at``, so a caller can
+        pick a withheld key to read. Withheld rows carry no content. With ``withheld_digest_chars`` above
+        zero, a row below the gate (never one withheld for a conflict) also carries that many leading
+        characters of its content, on one line.
+
+        Entries are gated on what the vault keeps unsealed (scores, keys, metadata, times). An entry is
+        opened, and so checked for integrity, when it is returned, compared for a slot conflict or
+        digested; a hit that fails the check is left out, as :meth:`search` leaves it out.
+
+        K-R5: recall writes nothing to the vault or its journal: a read never writes. Each call is kept
+        in an in-process log (:meth:`recent_recalls`) and, when ``ARGUS_LEDGER_PATH`` is set, mirrored to
+        Argus as ``kibisis.memory_recall``: the counts, the refs returned (``returned``: one string,
+        comma-separated, at most 40 refs) and the withheld refs the receipt names. The query appears only
+        as a digest.
         """
         if scope == "*":
             raise ValueError("recall is bound to one scope; '*' is not available here")
-        # Over-fetch so the gate has a distribution to work with and withheld entries do not starve the limit.
-        pool = max(limit * 8, 64)
-        hits = self.search(
-            query, category=category, limit=pool, scope=scope, epistemic_state=epistemic_state,
-            as_of_valid_time=as_of_valid_time, include_unverified=True, active_only=active_only,
-            tenant_id=tenant_id, principal_id=principal_id, authorized_lineage_roots=authorized_lineage_roots,
-            match=match,
+        if recency_half_life_days <= 0 or recency_boost_bp < 0:
+            raise ValueError("recency_half_life_days must be above zero and recency_boost_bp must not be negative")
+        digest_chars = max(0, int(withheld_digest_chars))
+        # Every match is ranked and gated, on columns that are not sealed: the verdict for a hit must not
+        # depend on how many the caller asked for. Entries are opened further down, a few of them.
+        fts_terms, ranked = self._ranked_rows(
+            query, category, _EVERY_MATCH, scope, epistemic_state, as_of_valid_time, True, active_only, match,
+            _GATE_COLUMNS, snippets=False,
         )
+        if _bounded(tenant_id, principal_id, authorized_lineage_roots):
+            # Outside the caller's tenant, principal or lineage: not a match, and never opened.
+            ranked = [x for x in ranked if _within_bounds(x[0], tenant_id, principal_id, authorized_lineage_roots)]
+        rows = [x[0] for x in ranked]
+        scores = [float(x[1]) for x in ranked]
+        n = len(rows)
+        refs = [f"{r['category']}:{r['key']}" for r in rows]
         terms = [t.lower() for t in _search_terms(query, "any")]
         cursor = self._conn.cursor()
         if scope is None:
@@ -252,104 +321,205 @@ class SearchRecallMixin:
         n_store = int(cursor.fetchone()[0])
         now = time.time()
 
-        scores = [h.rank_score for h in hits]
-        mean = sum(scores) / len(scores) if scores else 0.0
-        var = sum((x - mean) ** 2 for x in scores) / len(scores) if scores else 0.0
+        mean = sum(scores) / n if n else 0.0
+        var = sum((x - mean) ** 2 for x in scores) / n if n else 0.0
         std = var ** 0.5
         # With four or more matches the z-score is meaningful. A crowd of tied scores carries no
         # evidence that any one of them answers the query: every z is 0 and the default gate drops them.
-        use_z = len(scores) >= 4
+        use_z = n >= 4
+        # Per query word, the ids the index matches it in (None: every match holds it).
+        term_ids = self._coverage_sets(terms, match, scope) if n else []
 
-        def _ref(e: MemoryEntity) -> str:
-            return f"{e.category}:{e.key}"
+        metas: Dict[int, Dict[str, Any]] = {}
+
+        def _meta(i: int) -> Dict[str, Any]:
+            found = metas.get(i)
+            if found is None:
+                raw = rows[i]["metadata_json"]
+                found = metas[i] = (json.loads(raw) if raw else {}) or {}
+            return found
+
+        # Opened entries: position -> (whole row, content, snippet), or None when the entry cannot be read.
+        opened: Dict[int, Optional[Tuple[Any, str, Optional[str]]]] = {}
+
+        def _open(positions: Sequence[int]) -> None:
+            need = [i for i in positions if i not in opened]
+            if not need:
+                return
+            full = self._full_rows([rows[i]["id"] for i in need], _fts_query(fts_terms, match))
+            for i in need:
+                got = full.get(rows[i]["id"])
+                content = self._readable_content(got[0]) if got is not None else None
+                # None: gone since it was ranked, or failed its integrity check (tampered, damaged, moved).
+                opened[i] = None if got is None or content is None else (got[0], content, got[1])
 
         # K-R3: conflicts among the verified entries in the matched set and their declared partners.
-        by_ref = {_ref(h.entity): h for h in hits}
+        position = {ref: i for i, ref in enumerate(refs)}
         conflict_sources: Dict[str, List[str]] = {}
-        verified_hits = [h for h in hits if h.entity.epistemic_state == EpistemicState.VERIFIED]
-        for h in verified_hits:
-            for other_ref in h.entity.metadata.get("conflicts_with") or []:
-                other = by_ref.get(other_ref)
-                if other is None:
+        verified = [i for i, r in enumerate(rows) if r["epistemic_state"] == EpistemicState.VERIFIED.value]
+        for i in verified:
+            for other_ref in _meta(i).get("conflicts_with") or []:
+                j = position.get(other_ref)
+                if j is None:
                     c, k = other_ref.split(":", 1)
-                    other_entity = self.get(c, k, scope=scope or "default") if scope is not None else None
+                    other = self.get(c, k, scope=scope or "default") if scope is not None else None
+                    live = other is not None and other.epistemic_state == EpistemicState.VERIFIED and not other.archived
                 else:
-                    other_entity = other.entity
-                if other_entity is None or other_entity.epistemic_state != EpistemicState.VERIFIED or other_entity.archived:
+                    live = rows[j]["epistemic_state"] == EpistemicState.VERIFIED.value
+                if not live:
                     continue
-                conflict_sources.setdefault(_ref(h.entity), []).append(other_ref)
-                conflict_sources.setdefault(other_ref, []).append(_ref(h.entity))
-        slots: Dict[Tuple[str, str], List[SearchResult]] = {}
-        for h in verified_hits:
-            slot = h.entity.metadata.get("slot")
+                conflict_sources.setdefault(refs[i], []).append(other_ref)
+                conflict_sources.setdefault(other_ref, []).append(refs[i])
+        slots: Dict[Tuple[str, str], List[int]] = {}
+        for i in verified:
+            slot = _meta(i).get("slot")
             if slot:
-                slots.setdefault((h.entity.category, str(slot)), []).append(h)
-        for group in slots.values():
-            if len({g.entity.content for g in group}) > 1:
-                for g in group:
-                    others = [_ref(o.entity) for o in group if o is not g]
-                    conflict_sources.setdefault(_ref(g.entity), []).extend(o for o in others if o not in conflict_sources.get(_ref(g.entity), []))
+                slots.setdefault((rows[i]["category"], str(slot)), []).append(i)
+        groups = [group for group in slots.values() if len(group) > 1]
+        if groups:
+            _open([i for group in groups for i in group])  # a slot conflict is a difference in content
+            for group in groups:
+                readable = [i for i in group if opened[i] is not None]
+                if len({opened[i][1] for i in readable}) > 1:  # type: ignore[index]
+                    for i in readable:
+                        mine = conflict_sources.setdefault(refs[i], [])
+                        mine.extend(refs[o] for o in readable if o != i and refs[o] not in mine)
 
-        results: List[SearchResult] = []
-        withheld: List[WithheldEntry] = []
-        hit_receipts: List[Dict[str, Any]] = []
+        # K-R4, for every match, in BM25 order.
+        coverage: List[int] = []
+        z_bps: List[Optional[int]] = []
+        reasons: List[str] = []  # "" for a hit that passed
+        passed: List[int] = []
+        conflicting: List[int] = []
         n_conflict = n_gate = n_stale = 0
-        for h in hits:
-            ref = _ref(h.entity)
-            text = h.entity.content.lower()
-            covered = sum(1 for t in terms if t in text) if terms else 0
-            coverage_bp = int(round(10000 * covered / len(terms))) if terms else 10000
-            z_bp: Optional[int] = (int(round(10000 * (h.rank_score - mean) / std)) if std > 1e-9 else 0) if use_z else None
-            kept = True
+        for i, r in enumerate(rows):
+            if terms:
+                entity_id = r["id"]
+                covered = sum(1 for ids in term_ids if ids is None or entity_id in ids)
+                coverage_bp = int(round(10000 * covered / len(terms)))
+            else:
+                coverage_bp = 10000
+            z_bp: Optional[int] = (int(round(10000 * (scores[i] - mean) / std)) if std > 1e-9 else 0) if use_z else None
             reason = ""
-            if ref in conflict_sources:
-                kept, reason = False, "conflict_unresolved"
+            if refs[i] in conflict_sources:
+                reason = "conflict_unresolved"
                 n_conflict += 1
-                withheld.append(WithheldEntry(ref=ref, reason=reason, sources=sorted(set(conflict_sources[ref]))))
+                conflicting.append(i)
             elif coverage_bp < min_coverage_bp or (z_bp is not None and z_bp > z_max_bp):
-                kept, reason = False, "below_gate"
+                reason = "below_gate"
                 n_gate += 1
-                withheld.append(WithheldEntry(ref=ref, reason=reason))
             elif ttl_seconds:
-                klass = h.entity.metadata.get("origin_class") or origin_class_of(h.entity.origin)
+                klass = _meta(i).get("origin_class") or origin_class_of(r["origin"] or "unknown")
                 ttl = ttl_seconds.get(klass)
                 if ttl is not None:
-                    last = h.entity.metadata.get("last_verified_at") or h.entity.updated_at or h.entity.created_at
+                    last = _meta(i).get("last_verified_at") or r["updated_at"] or r["created_at"]
                     if last is not None and now - float(last) > float(ttl):
-                        kept, reason = False, "stale"
+                        reason = "stale"
                         n_stale += 1
-                        withheld.append(WithheldEntry(ref=ref, reason=reason))
-            hit_receipts.append({
-                "ref": ref, "coverage_bp": coverage_bp, "z_bp": z_bp, "kept": kept, "reason": reason,
-                "contrasts_with": list(h.entity.metadata.get("contrasts_with") or []),
-            })
-            if kept and len(results) < limit:
-                results.append(h)
+            coverage.append(coverage_bp)
+            z_bps.append(z_bp)
+            reasons.append(reason)
+            if not reason:
+                passed.append(i)
+
+        # Order of the hits that passed: BM25, or BM25 times a recency factor. Never who passed.
+        boost: Dict[int, float] = {}
+        order = passed
+        if prefer_recent:
+            for i in passed:
+                at = rows[i]["updated_at"] or rows[i]["created_at"]
+                age_days = max(0.0, (now - float(at)) / 86400.0) if at is not None else None
+                boost[i] = 1.0 if age_days is None else (
+                    1.0 + (recency_boost_bp / 10000.0) * 2.0 ** (-age_days / float(recency_half_life_days))
+                )
+            order = sorted(passed, key=lambda i: scores[i] * boost[i])  # stable: ties keep BM25 order
+
+        results: List[SearchResult] = []
+        returned: List[int] = []
+        left_out: set = set()  # passed the gate, could not be read
+        patterns: Optional[Tuple[Any, Any]] = None
+        taken = 0
+        while len(results) < limit and taken < len(order):
+            batch = order[taken:taken + (limit - len(results))]
+            taken += len(batch)
+            _open(batch)
+            for i in batch:
+                got = opened[i]
+                if got is None:
+                    left_out.add(i)
+                    continue
+                row, content, snip = got
+                if snip is None:
+                    patterns = patterns or _snippet_patterns(fts_terms)
+                    snip = _snippet(content, patterns)
+                results.append(SearchResult(
+                    entity=self._entity(row, content), rank_score=scores[i] * boost.get(i, 1.0), snippet=str(snip)
+                ))
+                returned.append(i)
+
+        # What the receipt names: the best of the matched set, whatever was returned, every conflict.
+        window = min(n, max(limit * 8, 64))
+        listed = sorted((set(range(window)) | set(returned) | set(conflicting)) - left_out)
+        if digest_chars:
+            _open([i for i in listed if reasons[i] == "below_gate"])
+        withheld: List[WithheldEntry] = []
+        hit_receipts: List[Dict[str, Any]] = []
+        for i in listed:
+            ref, reason = refs[i], reasons[i]
+            hit: Dict[str, Any] = {
+                "ref": ref, "coverage_bp": coverage[i], "z_bp": z_bps[i], "kept": not reason, "reason": reason,
+                "contrasts_with": list(_meta(i).get("contrasts_with") or []),
+                "rank": i + 1, "updated_at": rows[i]["updated_at"],
+            }
+            if i in boost:
+                hit["recency_bp"] = int(round(10000 * boost[i]))
+            if reason == "conflict_unresolved":
+                withheld.append(WithheldEntry(ref=ref, reason=reason, sources=sorted(set(conflict_sources[ref]))))
+            elif reason == "below_gate":
+                digest: Optional[str] = None
+                if digest_chars and opened.get(i) is not None:
+                    digest = " ".join(opened[i][1].split())[:digest_chars]  # type: ignore[index]
+                    hit["digest"] = digest
+                withheld.append(WithheldEntry(
+                    ref=ref, reason=reason, coverage_bp=coverage[i], rank=i + 1, updated_at=rows[i]["updated_at"],
+                    digest=digest,
+                ))
+            elif reason:
+                withheld.append(WithheldEntry(ref=ref, reason=reason))
+            hit_receipts.append(hit)
         if conflict_sources:
             # A partner that did not match the query is withheld too: both sides of the pair stay out.
             seen = {w.ref for w in withheld}
             for ref, sources in conflict_sources.items():
-                if ref not in seen and ref not in by_ref:
+                if ref not in seen and ref not in position:
                     withheld.append(WithheldEntry(ref=ref, reason="conflict_unresolved", sources=sorted(set(sources))))
                     n_conflict += 1
 
+        n_matched = n - len(left_out)
         receipt: Dict[str, Any] = {
             "channel": channel,
             "scope": scope or "*",
             "n_store": n_store,
-            "n_matched": len(hits),
+            "n_matched": n_matched,
             "n_returned": len(results),
             "n_withheld_conflict": n_conflict,
             "n_withheld_gate": n_gate,
             "n_withheld_stale": n_stale,
             "gate": {"min_coverage_bp": int(min_coverage_bp), "z_max_bp": int(z_max_bp)},
+            "recency": {
+                "prefer_recent": bool(prefer_recent), "boost_bp": int(recency_boost_bp),
+                "half_life_days": recency_half_life_days,
+            },
             "hits": hit_receipts,
         }
         query_digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:12]
         journal_meta = {
-            "channel": channel, "query_sha256_12": query_digest, "n_store": n_store, "n_matched": len(hits),
+            "channel": channel, "query_sha256_12": query_digest, "n_store": n_store, "n_matched": n_matched,
             "n_returned": len(results), "n_withheld_conflict": n_conflict, "n_withheld_gate": n_gate,
-            "n_withheld_stale": n_stale, "withheld": [w.ref for w in withheld],
+            "n_withheld_stale": n_stale,
+            # Which entries were read, for access statistics: integers and strings only in the ledger.
+            "returned": ",".join(refs[i] for i in returned[:ARGUS_RETURNED_REFS]),
+            "withheld": [w.ref for w in withheld],
         }
         # A read never writes: it takes no lock a writer holds and does not move the audit head that
         # write-invalidated caches follow. The record goes to Argus and to an in-process log.
@@ -359,9 +529,106 @@ class SearchRecallMixin:
         return RecallResult(results=results, withheld=withheld, receipt=receipt)
 
     def recent_recalls(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """The newest recall records this process made (K-R5), newest last; the Argus ledger is the durable copy."""
+        """The newest recall records this process made (K-R5), newest last: the counts, the refs returned
+        and the withheld refs named. When ``ARGUS_LEDGER_PATH`` is set the Argus ledger is the durable copy;
+        the vault's own journal holds none."""
         items = list(self._recent_recalls)
         return items[-limit:] if limit else items
+
+    def _search_mode(self) -> str:
+        """Which index ranked search reads: ``index`` (the entry index of a SQLCipher vault), ``terms`` (the
+        keyed term index), ``scan`` (an in-memory index of the opened entries) or ``plain`` (plaintext FTS5)."""
+        if self._search_index:
+            return "index"
+        if self._term_index:
+            return "terms"
+        if self.crypto_provider is not None and self.passphrase:
+            return "scan"
+        return "plain"
+
+    def _coverage_sets(self, terms: Sequence[str], match: str, scope: Optional[str]) -> List[Optional[set]]:
+        """For each query word of the recall gate, the ids of the entries the search index matches it in,
+        or None when every match holds the word and nothing needs looking up.
+
+        The gate's coverage is read from the index that produced the matches, so the two agree: a word
+        found in the key or the category counts, and so does a word the index folds to the query's
+        (case, accents) or completes from it (prefixes, where the index matches them). No entry is opened.
+        """
+        if match != "any" or len(terms) < 2:
+            # match="all": a match holds every query word, and the gate's words are among them.
+            # One word under match="any": the match is that word.
+            return [None for _ in terms]
+        target_scope = "default" if scope is None or scope == "" else scope
+        mode = self._search_mode()
+        sets: List[Optional[set]] = []
+        for term in terms:
+            fts_query = _fts_query([term], "any")
+            if mode == "index":
+                found = self._conn.execute(
+                    "SELECT rowid FROM entities_search WHERE entities_search MATCH ?", (fts_query,)
+                ).fetchall()
+            elif mode == "terms":
+                phrase = self._tokens(term)
+                found = []
+                if phrase:
+                    joins = " ".join(
+                        f"JOIN entities_terms t{k} ON t{k}.id = t0.id AND t{k}.pos = t0.pos + {k} AND t{k}.token = ?"
+                        for k in range(1, len(phrase))
+                    )
+                    tokens = [self._term_token(target_scope, word) for word in phrase]
+                    found = self._conn.execute(
+                        f"SELECT DISTINCT t0.id FROM entities_terms t0 {joins} WHERE t0.token = ?",
+                        [*tokens[1:], tokens[0]],
+                    ).fetchall()
+            elif mode == "scan":
+                found = self._scan_index().execute("SELECT rowid FROM m WHERE m MATCH ?", (fts_query,)).fetchall()
+            else:
+                try:
+                    found = self._conn.execute(
+                        "SELECT rowid FROM entities_fts WHERE entities_fts MATCH ?", (fts_query,)
+                    ).fetchall()
+                except _OPERATIONAL_ERRORS:
+                    # Where the FTS query cannot run, search falls back to LIKE on content and key: so does this.
+                    pattern = f"%{term}%"
+                    found = self._conn.execute(
+                        "SELECT id FROM entities WHERE content LIKE ? OR key LIKE ?", (pattern, pattern)
+                    ).fetchall()
+            sets.append({row[0] for row in found})
+        return sets
+
+    def _rows_by_id(self, columns: str, ids: Sequence[int]) -> Dict[int, Any]:
+        """Stored rows by id, reading ``columns``; any number of ids."""
+        stored: Dict[int, Any] = {}
+        for start in range(0, len(ids), _ID_CHUNK):
+            chunk = list(ids[start:start + _ID_CHUNK])
+            marks = ", ".join("?" for _ in chunk)
+            for r in self._conn.execute(f"SELECT {columns} FROM entities e WHERE e.id IN ({marks})", chunk).fetchall():
+                stored[r["id"]] = r
+        return stored
+
+    def _full_rows(self, ids: Sequence[int], fts_query: str) -> Dict[int, Tuple[Any, Optional[str]]]:
+        """Whole rows by id for entries a ranked query found, each with the snippet :meth:`search` would
+        give it: FTS5's in a plaintext vault, None elsewhere (the caller builds it from the opened content)."""
+        if self._search_mode() != "plain":
+            return {i: (r, None) for i, r in self._rows_by_id(_ENTITY_COLUMNS, ids).items()}
+        out: Dict[int, Tuple[Any, Optional[str]]] = {}
+        for start in range(0, len(ids), _ID_CHUNK):
+            chunk = list(ids[start:start + _ID_CHUNK])
+            marks = ", ".join("?" for _ in chunk)
+            try:
+                found = self._conn.execute(
+                    f"""
+                    SELECT {_ENTITY_COLUMNS}, snippet(entities_fts, 2, '<b>', '</b>', '...', 16) AS snip
+                    FROM entities_fts
+                    CROSS JOIN entities e ON e.id = entities_fts.rowid
+                    WHERE entities_fts MATCH ? AND entities_fts.rowid IN ({marks})
+                    """,
+                    [fts_query, *chunk],
+                ).fetchall()
+                out.update((r["id"], (r, r["snip"])) for r in found)
+            except _OPERATIONAL_ERRORS:
+                out.update((i, (r, "")) for i, r in self._rows_by_id(_ENTITY_COLUMNS, chunk).items())
+        return out
 
     def search_keys(
         self,
@@ -419,17 +686,18 @@ class SearchRecallMixin:
         terms = _search_terms(query, match)
         if not terms:
             return terms, []
-        fts_query = (" OR " if match == "any" else " ").join('"' + t.replace('"', '""') + '"*' for t in terms)
+        fts_query = _fts_query(terms, match)
         # Normalize scope: None or empty string defaults to "default"
         target_scope = "default" if scope is None or scope == "" else scope
         filter_sql, filter_params = self._search_filters(
             target_scope, category, epistemic_state, as_of_valid_time, include_unverified, active_only
         )
-        if self._search_index:
+        mode = self._search_mode()
+        if mode == "index":
             rows = self._indexed_rows(fts_query, filter_sql, filter_params, limit, columns)
-        elif self._term_index:
+        elif mode == "terms":
             rows = self._term_rows(terms, match, target_scope, filter_sql, filter_params, limit, columns)
-        elif self.crypto_provider is not None and self.passphrase:
+        elif mode == "scan":
             rows = self._scanned_rows(fts_query, filter_sql, filter_params, limit, columns)
         else:
             rows = self._plaintext_rows(query, fts_query, filter_sql, filter_params, limit, columns, snippets)
@@ -613,14 +881,8 @@ class SearchRecallMixin:
                 score += idf * ((freq * (k1 + 1.0)) / (freq + k1 * (1 - b + b * length / avgdl)))
             scored.append((-1.0 * score, entity_id))
         scored.sort()
-        ranked = scored[:limit]
-        marks = ", ".join("?" for _ in ranked)
-        stored = {
-            r["id"]: r
-            for r in self._conn.execute(
-                f"SELECT {columns} FROM entities e WHERE e.id IN ({marks})", [entity_id for _, entity_id in ranked]
-            ).fetchall()
-        }
+        ranked = scored if limit < 0 else scored[:limit]  # a negative limit is none, as in SQL
+        stored = self._rows_by_id(columns, [entity_id for _, entity_id in ranked])
         return [(stored[entity_id], score, None) for score, entity_id in ranked if entity_id in stored]
 
     def _scanned_rows(
@@ -639,13 +901,7 @@ class SearchRecallMixin:
         ).fetchall()
         if not ranked:
             return []
-        marks = ", ".join("?" for _ in ranked)
-        stored = {
-            r["id"]: r
-            for r in self._conn.execute(
-                f"SELECT {columns} FROM entities e WHERE e.id IN ({marks})", [row[0] for row in ranked]
-            ).fetchall()
-        }
+        stored = self._rows_by_id(columns, [row[0] for row in ranked])
         return [(stored[i], score, None) for i, score in ranked if i in stored]
 
     def _scan_index(self) -> Any:

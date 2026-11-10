@@ -239,7 +239,12 @@ def _attr(value: Any) -> str:
     return html.escape(str(value), quote=True)
 
 
-def fence_recall(scope: str, entries: List[MemoryEntity], withheld: Optional[List[Any]] = None) -> str:
+def fence_recall(
+    scope: str,
+    entries: List[MemoryEntity],
+    withheld: Optional[List[Any]] = None,
+    below_gate: Optional[int] = None,
+) -> str:
     """Wrap recalled entries in a ``<kibisis-recall>`` envelope.
 
     Entry text and attributes are XML-escaped, so stored text cannot close an ``<entry>`` or the
@@ -248,12 +253,16 @@ def fence_recall(scope: str, entries: List[MemoryEntity], withheld: Optional[Lis
     ``withheld`` is the gated recall's list of :class:`~kibisis.models.WithheldEntry`. Entries held
     back as an unresolved conflict or as stale are named, each on a ``<withheld>`` line with the
     entries it conflicts with, so the agent can raise the conflict with a person; matches below the
-    relevance gate are only counted.
+    relevance gate are only counted. ``below_gate`` is that count when the caller has it (the recall
+    receipt's ``n_withheld_gate``: the list names the best matches only); without it the list is counted.
     """
     withheld = list(withheld or [])
+    named = [item for item in withheld if getattr(item, "reason", "") != "below_gate"]
+    if below_gate is None:
+        below_gate = len(withheld) - len(named)
     head = f'<kibisis-recall scope="{_attr(scope)}" count="{len(entries)}"'
-    if withheld:
-        head += f' withheld="{len(withheld)}"'
+    if named or below_gate:
+        head += f' withheld="{len(named) + below_gate}"'
     lines = [head + ">", RECALL_NOTICE]
     for entity in entries:
         meta = entity.metadata or {}
@@ -272,12 +281,8 @@ def fence_recall(scope: str, entries: List[MemoryEntity], withheld: Optional[Lis
         lines.append(f"<entry {' '.join(attrs)}>")
         lines.append(html.escape(entity.content or "", quote=False))
         lines.append("</entry>")
-    below_gate = 0
-    for item in withheld:
+    for item in named:
         reason = getattr(item, "reason", "")
-        if reason == "below_gate":
-            below_gate += 1
-            continue
         line = f'<withheld ref="{_attr(getattr(item, "ref", ""))}" reason="{_attr(reason)}"'
         sources = list(getattr(item, "sources", None) or [])
         if sources:
@@ -575,7 +580,9 @@ class KibisisMCPServer:
             entries.append(entity)
             if len(entries) >= limit:
                 break
-        return fence_recall(self.scope, entries, withheld=recalled.withheld)
+        return fence_recall(
+            self.scope, entries, withheld=recalled.withheld, below_gate=recalled.receipt.get("n_withheld_gate")
+        )
 
     def _forget(self, args: Dict[str, Any]) -> Dict[str, Any]:
         category = _required(args, "category")
