@@ -101,6 +101,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entry is elsewhere, the scopes that hold it. A refused open prints one line and exits 2.
 - `kibisis aml-serve` answers malformed or unexpected input with `400`/`422` instead of `500`, and exits 2 before
   binding when a passphrase is set without `sqlcipher3` and without `KIBISIS_ALLOW_PLAINTEXT`.
+- `recall()` gates the whole matched set. `n_matched` and the withheld counts are those of every match and the
+  z-score's mean and deviation are taken over all of them (with four or more matches, as before). The receipt's
+  `hits` and the `withheld` list name the best `max(limit * 8, 64)` matches in BM25 order, plus any entry that
+  was returned or withheld for a conflict; the counts say how many more there are, and the MCP envelope's
+  `below_gate` count is the receipt's.
+- Recall coverage is read from the search index: a query word is covered wherever the index matched it
+  (category, key, content or scope, with the index's folding of case and accents, and as the start of a longer
+  word where the index matches prefixes). A word that names a category is covered in every entry of that
+  category, so a query that shares words with keys or categories passes more entries than before.
+- Recall gates on what the vault keeps unsealed (scores, keys, metadata, times) and opens only the entries it
+  returns, compares for a slot conflict or digests. An entry that fails its integrity check is still never
+  returned; it can now be counted among the matches and named as withheld.
 
 ### Added
 - `SQLiteMemoryVault` / `config.open_vault` keywords `strict`, `read_only`, `pin_quorum`, `adopt_keyless`,
@@ -113,6 +125,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   admit`; `kibisis-review list` marks a candidate that `approving retires <cat>:<key>`, and forget requests are
   journaled as their own `forget_request` action so other refusals cannot hide them.
 - `kibisis_health` reports `verification_quorum` (`accounts`, `pinned`, `note`) and `keyless_adoption`.
+- `recall(prefer_recent=True, recency_boost_bp=5000, recency_half_life_days=30)`: off by default. When on, a hit
+  that passed the gate is ranked by its score times `1 + boost * 2^(-age / half_life)`, the age taken from
+  `updated_at`; which hits pass does not change. The receipt carries the setting (`recency`) and each boosted
+  hit's factor (`recency_bp`). For "what is the latest state" questions; leave it off for "what is the rule".
+- Withheld rows below the gate carry `coverage_bp`, `rank` (position in BM25 order) and `updated_at`, and every
+  receipt hit carries `rank` and `updated_at`, so a caller can pick a key to read. They carry no content unless
+  the caller passes `recall(withheld_digest_chars=N)`: then rows below the gate, never rows withheld for a
+  conflict or as stale, also carry the first N characters of the content on one line (`digest`).
+- The `kibisis.memory_recall` Argus event and `recent_recalls()` carry `returned`: the refs of the entries a
+  recall returned, in order, as one comma-separated string of at most 40 `category:key` refs.
 - `kibisis aml-serve --socket-timeout` and `--max-connections`; `--gate-verbose` on the OKF commands.
 - Rust: `kibisis::journal::verify_chain_with(.., head_required)` and `kibisis_native.verify_chain`, with the same
   rules in Python's `kibisis._vault_audit.ChainVerifier`. `extension-module` is a default feature of
@@ -131,6 +153,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `KIBISIS_VERIFICATION_QUORUM` is validated (positive decimal only) and a bad value prints one line (exit 2).
 - `kibisis-review list` refused on a keyless file no longer suggests a flag it does not accept; the OKF commands'
   import-time `DEFAULT_DB_PATH` is gone (a lazy alias of `default_db_path()` remains).
+- `recall()`: the verdict for a hit no longer depends on `limit`, and `n_matched` is no longer capped at
+  `max(limit * 8, 64)`; the gate used to see only that many of the best matches.
+- `recall()`: a hit found through its key or category, or through the index's folding of accents, is no longer
+  withheld as `below_gate` with a coverage of 0.
 
 ### Documentation
 - SECURITY.md and README state the residual limits: the terminal check stops pipes and cron jobs but not an agent
@@ -146,6 +172,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--plaintext`, retries and `409`, the timestamp rule, `--max-inflight` vs `--max-connections`, retention and
   draining. README documents the tombstone fold limits, forget/lift, the fencing highest-token file and the
   quorum default.
+- The `recall()` docstring no longer says each call is journaled as a `recall` event: a recall writes nothing to
+  the vault or its journal. It is kept in `recent_recalls()` and, when `ARGUS_LEDGER_PATH` is set, in the Argus
+  ledger.
 
 ## [0.1.0-alpha.16] - 2026-11-05
 
