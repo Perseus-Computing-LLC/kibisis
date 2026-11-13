@@ -298,7 +298,11 @@ class SQLiteMemoryVault(
         ``verification_quorum`` argument or ``KIBISIS_VERIFICATION_QUORUM`` names it; otherwise the
         open is refused with :class:`~kibisis.config.ConfigError`, so a pinned ``1`` is never taken
         up in silence. :attr:`verification_quorum_stored` is the file's value (``None`` until a
-        verdict pins one).
+        verdict pins one). A verdict that can mint ``verified`` (``review_entity``, ``admit``, a
+        ``user``-origin write that asks for ``verified``) is settled against the larger of the
+        process's quorum and the file's, read in the verdict's own write transaction: a quorum another
+        process pinned after this one opened applies to this one's next verdict, and is adopted into
+        both attributes (they are raised, never lowered).
 
         ``trust_caller_identity`` is for embedders only. By default the attester of a ``user``-origin
         write or review is the operating-system account running the process
@@ -1263,6 +1267,31 @@ class SQLiteMemoryVault(
             return None
         return stored
 
+    def _quorum_in_force(self) -> int:
+        """The quorum a verdict that can mint ``verified`` is settled against, and records.
+
+        The larger of this process's ``verification_quorum`` and the file's stored quorum, read with
+        :meth:`_stored_quorum` (an untrusted stored value is ignored, as at open). The quorum is a
+        property of the vault file: another connection's pinning open may have raised it after this
+        vault was opened, and a stored quorum is a floor. Callers run inside the write transaction that
+        records the verdict (``_put``, ``review_entity``), which holds the write lock, so the value read
+        is the one in force when the verdict commits. A raised value is adopted:
+        ``verification_quorum`` and ``verification_quorum_stored`` go up to it, never down, and a
+        process that asked for more than the file's keeps its own.
+        """
+        stored = self._stored_quorum()
+        if stored is not None:
+            if stored > self.verification_quorum:
+                logger.info(
+                    "%s: the file's verification quorum was raised to %d since this vault was opened with %d; "
+                    "verdicts now need %d",
+                    self.db_path, stored, self.verification_quorum, stored,
+                )
+                self.verification_quorum = stored
+            if self.verification_quorum_stored is None or stored > self.verification_quorum_stored:
+                self.verification_quorum_stored = stored
+        return self.verification_quorum
+
     def _dropped_quorum(self) -> Optional[int]:
         """``vault_meta.quorum_dropped_from`` as a positive integer, or None (absent or malformed)."""
         try:
@@ -1746,12 +1775,15 @@ class SQLiteMemoryVault(
                 if attested:
                     meta["attestations"] = attested
                 if requested_verified and entry_class == "principal":
-                    if len(attested) >= self.verification_quorum:
+                    # Settled against the quorum in force now, in this transaction (the file's may
+                    # have been raised since this vault was opened).
+                    quorum = self._quorum_in_force()
+                    if len(attested) >= quorum:
                         ep_state = EpistemicState.VERIFIED
                         meta.pop("verification_pending", None)
-                        meta["quorum_at_verification"] = self.verification_quorum
+                        meta["quorum_at_verification"] = quorum
                     else:
-                        meta["verification_pending"] = {"have": len(attested), "need": self.verification_quorum}
+                        meta["verification_pending"] = {"have": len(attested), "need": quorum}
                         meta.pop("quorum_at_verification", None)
             if ep_state != EpistemicState.CANDIDATE and entry_class != "principal" and not _review_verdict:
                 # An origin-less rewrite resolved to a non-principal class: same cap as an explicit one.

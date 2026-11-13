@@ -269,8 +269,12 @@ also stored in plain text.
   the legacy key set no stored quorum is trusted, whatever its value (the MAC never covered it, so a
   file writer can lower a pinned 3 to 2 as easily as to 1): it is ignored, logged at WARNING with the
   value, and dropped before the re-sign; the next verdict run under the person's
-  `KIBISIS_VERIFICATION_QUORUM` pins it again under the full-set MAC. A verified entry carries
-  `quorum_at_verification`. `_review_verdict` / `_trusted_metadata` are not parameters of the public
+  `KIBISIS_VERIFICATION_QUORUM` pins it again under the full-set MAC. Every verdict that can mint
+  `verified` (`review_entity`, `admit`, `put(origin="user")` asking for `verified`) is settled against
+  the larger of the process's quorum and the file's trusted stored one, read in the verdict's own write
+  transaction (`_quorum_in_force`), so a vault opened before a pinning open raised the quorum applies the
+  raised value to its next verdict. A verified entry carries `quorum_at_verification`, the quorum its
+  verdict applied. `_review_verdict` / `_trusted_metadata` are not parameters of the public
   `put()`; `put_batch` rejects items that carry them.
 - Recall returns entries inside a `<kibisis-recall>` envelope with text escaped (`fence_recall`,
   mcp_server.py ), so a stored instruction cannot close the envelope.
