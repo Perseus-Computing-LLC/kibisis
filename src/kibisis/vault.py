@@ -2375,6 +2375,14 @@ class SQLiteMemoryVault(
         A dict item is the keyword arguments of :meth:`put`; keys that are not ``put`` parameters
         (private flags such as ``_review_verdict`` and ``_trusted_metadata`` included) raise
         ``TypeError`` before anything is written.
+
+        A :class:`MemoryEntity` item is written with the ``put`` parameters it carries
+        (:func:`_entity_put_arguments`): category, key, content, metadata, epistemic_state,
+        valid_from, valid_until and scope, and ``origin``, ``source_ref`` and ``confidence`` when the
+        entity's caller set them. An entity that says ``origin="model"`` is a model write (the class
+        check and the trust cap apply), and an entity a vault read returned carries its stored origin.
+        An entity that never set an origin is written with none, like a ``put`` that states none: a
+        re-write keeps the entry's origin and a new key is stored as ``unknown``.
         """
         fence = {"fencing_token": fencing_token, "resource": resource, "holder_id": holder_id}
         allowed = _PUT_PARAMETERS
@@ -2387,17 +2395,7 @@ class SQLiteMemoryVault(
         with self._conn:
             for item in items:
                 if isinstance(item, MemoryEntity):
-                    res = self.put(
-                        category=item.category,
-                        key=item.key,
-                        content=item.content,
-                        metadata=item.metadata,
-                        epistemic_state=item.epistemic_state.value if isinstance(item.epistemic_state, EpistemicState) else str(item.epistemic_state),
-                        valid_from=item.valid_from,
-                        valid_until=item.valid_until,
-                        scope=item.scope,
-                        **fence,
-                    )
+                    res = self.put(**_entity_put_arguments(item), **fence)
                 elif isinstance(item, dict):
                     res = self.put(**{**fence, **item})
                 else:
@@ -2668,3 +2666,30 @@ class SQLiteMemoryVault(
 _PUT_PARAMETERS = frozenset(
     name for name in inspect.signature(SQLiteMemoryVault.put).parameters if name != "self"
 )
+#: The :meth:`SQLiteMemoryVault.put` parameters a :class:`MemoryEntity` carries: its fields that are put
+#: keywords (category, key, content, metadata, epistemic_state, valid_from, valid_until, scope, origin,
+#: source_ref and confidence).
+_ENTITY_PUT_FIELDS = frozenset(MemoryEntity.model_fields) & _PUT_PARAMETERS
+#: The ones ``put_batch`` passes for every entity item, set or not (an unset one passes its default).
+_ENTITY_PUT_ALWAYS = ("category", "key", "content", "metadata", "epistemic_state", "valid_from", "valid_until", "scope")
+
+
+def _entity_put_arguments(item: MemoryEntity) -> Dict[str, Any]:
+    """The :meth:`SQLiteMemoryVault.put` keyword arguments a :class:`MemoryEntity` batch item stands for.
+
+    :data:`_ENTITY_PUT_ALWAYS` are passed as they always were. Every other parameter the entity carries
+    (:data:`_ENTITY_PUT_FIELDS`: ``origin``, ``source_ref``, ``confidence``) is passed when the entity's
+    caller set it (pydantic's ``model_fields_set``: at construction, by assignment or through
+    ``model_copy(update=...)``), an explicit ``origin="unknown"`` included, and left out when the caller
+    did not. So the provenance a caller states reaches ``put``'s class check and trust cap instead of
+    being dropped, and none is invented for an entity that states none. An entity a vault read built
+    (:meth:`SQLiteMemoryVault._entity`) states the row's origin, source_ref and confidence.
+    """
+    args: Dict[str, Any] = {name: getattr(item, name) for name in _ENTITY_PUT_ALWAYS}
+    state = args["epistemic_state"]
+    args["epistemic_state"] = state.value if isinstance(state, EpistemicState) else str(state)
+    stated = item.model_fields_set
+    for name in sorted(_ENTITY_PUT_FIELDS.difference(_ENTITY_PUT_ALWAYS)):
+        if name in stated:
+            args[name] = getattr(item, name)
+    return args
