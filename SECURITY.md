@@ -269,8 +269,12 @@ also stored in plain text.
   the legacy key set no stored quorum is trusted, whatever its value (the MAC never covered it, so a
   file writer can lower a pinned 3 to 2 as easily as to 1): it is ignored, logged at WARNING with the
   value, and dropped before the re-sign; the next verdict run under the person's
-  `KIBISIS_VERIFICATION_QUORUM` pins it again under the full-set MAC. A verified entry carries
-  `quorum_at_verification`. `_review_verdict` / `_trusted_metadata` are not parameters of the public
+  `KIBISIS_VERIFICATION_QUORUM` pins it again under the full-set MAC. Every verdict that can mint
+  `verified` (`review_entity`, `admit`, `put(origin="user")` asking for `verified`) is settled against
+  the larger of the process's quorum and the file's trusted stored one, read in the verdict's own write
+  transaction (`_quorum_in_force`), so a vault opened before a pinning open raised the quorum applies the
+  raised value to its next verdict. A verified entry carries `quorum_at_verification`, the quorum its
+  verdict applied. `_review_verdict` / `_trusted_metadata` are not parameters of the public
   `put()`; `put_batch` rejects items that carry them.
 - Recall returns entries inside a `<kibisis-recall>` envelope with text escaped (`fence_recall`,
   mcp_server.py ), so a stored instruction cannot close the envelope.
@@ -345,7 +349,11 @@ in front of the adapter.
 `okf-import` reads a directory of Markdown files written by someone else. Every imported row is a
 model-origin candidate; `human_reviews` and other reserved metadata in a bundle's frontmatter are dropped by
 `_put` like any caller-supplied metadata, so a bundle cannot forge a review or a verified state. Bodies are
-stored as text and never executed. `okf-export` and `okf-import --dry-run` open the vault read-only
+stored as text and never executed. A real `okf-import` judges each concept on its row as it is inside that
+row's own write transaction (`SQLiteMemoryVault._judged_put`, vault.py: the row is re-read under the write
+lock) and writes in the same transaction, so a row another connection archives, marks confidential, rewrites
+as a person, disputes or tombstones after the importer's scan is reported as a conflict and left as it is;
+nothing lands between the judgement and the write. `okf-export` and `okf-import --dry-run` open the vault read-only
 (`SQLiteMemoryVault(read_only=True)`: `mode=ro`, no migration, no integrity upgrade, no index build), so
 running them against a vault changes none of the vault file's bytes; `okf-check` reads only the bundle and
 opens no vault. A read-only open of a WAL-mode vault still needs SQLite's shared-memory index, so it may

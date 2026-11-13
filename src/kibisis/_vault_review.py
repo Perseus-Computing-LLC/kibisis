@@ -541,11 +541,14 @@ class AdmissionReviewMixin:
                 attested.append(signer)
             if attested:
                 meta["attestations"] = attested
-            if len(attested) >= self.verification_quorum:
+            # Settled against the quorum in force now, in this verdict's transaction: the file's
+            # quorum may have been raised since this vault was opened (a stored quorum is a floor).
+            quorum = self._quorum_in_force()
+            if len(attested) >= quorum:
                 meta.pop("verification_pending", None)
-                meta["quorum_at_verification"] = self.verification_quorum
+                meta["quorum_at_verification"] = quorum
             else:
-                meta["verification_pending"] = {"have": len(attested), "need": self.verification_quorum}
+                meta["verification_pending"] = {"have": len(attested), "need": quorum}
                 meta.pop("quorum_at_verification", None)
                 stored_state = EpistemicState.CANDIDATE.value
         proposal = meta.pop("proposed_supersedes", None) if stored_state == EpistemicState.VERIFIED.value else None

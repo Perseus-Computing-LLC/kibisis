@@ -21,7 +21,7 @@ import threading
 import time
 from pathlib import Path
 from collections import deque
-from typing import Any, Deque, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Deque, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 from .admission import AdmissionDecision, FactDisposition, MemoryAdmissionGate
 from .crypto import (
     ENTRY_BINDING,
@@ -298,7 +298,11 @@ class SQLiteMemoryVault(
         ``verification_quorum`` argument or ``KIBISIS_VERIFICATION_QUORUM`` names it; otherwise the
         open is refused with :class:`~kibisis.config.ConfigError`, so a pinned ``1`` is never taken
         up in silence. :attr:`verification_quorum_stored` is the file's value (``None`` until a
-        verdict pins one).
+        verdict pins one). A verdict that can mint ``verified`` (``review_entity``, ``admit``, a
+        ``user``-origin write that asks for ``verified``) is settled against the larger of the
+        process's quorum and the file's, read in the verdict's own write transaction: a quorum another
+        process pinned after this one opened applies to this one's next verdict, and is adopted into
+        both attributes (they are raised, never lowered).
 
         ``trust_caller_identity`` is for embedders only. By default the attester of a ``user``-origin
         write or review is the operating-system account running the process
@@ -1263,6 +1267,31 @@ class SQLiteMemoryVault(
             return None
         return stored
 
+    def _quorum_in_force(self) -> int:
+        """The quorum a verdict that can mint ``verified`` is settled against, and records.
+
+        The larger of this process's ``verification_quorum`` and the file's stored quorum, read with
+        :meth:`_stored_quorum` (an untrusted stored value is ignored, as at open). The quorum is a
+        property of the vault file: another connection's pinning open may have raised it after this
+        vault was opened, and a stored quorum is a floor. Callers run inside the write transaction that
+        records the verdict (``_put``, ``review_entity``), which holds the write lock, so the value read
+        is the one in force when the verdict commits. A raised value is adopted:
+        ``verification_quorum`` and ``verification_quorum_stored`` go up to it, never down, and a
+        process that asked for more than the file's keeps its own.
+        """
+        stored = self._stored_quorum()
+        if stored is not None:
+            if stored > self.verification_quorum:
+                logger.info(
+                    "%s: the file's verification quorum was raised to %d since this vault was opened with %d; "
+                    "verdicts now need %d",
+                    self.db_path, stored, self.verification_quorum, stored,
+                )
+                self.verification_quorum = stored
+            if self.verification_quorum_stored is None or stored > self.verification_quorum_stored:
+                self.verification_quorum_stored = stored
+        return self.verification_quorum
+
     def _dropped_quorum(self) -> Optional[int]:
         """``vault_meta.quorum_dropped_from`` as a positive integer, or None (absent or malformed)."""
         try:
@@ -1746,12 +1775,15 @@ class SQLiteMemoryVault(
                 if attested:
                     meta["attestations"] = attested
                 if requested_verified and entry_class == "principal":
-                    if len(attested) >= self.verification_quorum:
+                    # Settled against the quorum in force now, in this transaction (the file's may
+                    # have been raised since this vault was opened).
+                    quorum = self._quorum_in_force()
+                    if len(attested) >= quorum:
                         ep_state = EpistemicState.VERIFIED
                         meta.pop("verification_pending", None)
-                        meta["quorum_at_verification"] = self.verification_quorum
+                        meta["quorum_at_verification"] = quorum
                     else:
-                        meta["verification_pending"] = {"have": len(attested), "need": self.verification_quorum}
+                        meta["verification_pending"] = {"have": len(attested), "need": quorum}
                         meta.pop("quorum_at_verification", None)
             if ep_state != EpistemicState.CANDIDATE and entry_class != "principal" and not _review_verdict:
                 # An origin-less rewrite resolved to a non-principal class: same cap as an explicit one.
@@ -2170,6 +2202,60 @@ class SQLiteMemoryVault(
                 **kwargs,
             )
 
+    def _judged_put(
+        self,
+        category: str,
+        key: str,
+        scope: str,
+        judge: Callable[[Optional[MemoryEntity]], Optional[Dict[str, Any]]],
+        *,
+        author_id: Optional[str],
+        origin: Optional[str],
+    ) -> Optional[MemoryEntity]:
+        """Judge the entry at ``(category, key, scope)`` as it is now and write what the judgement asks
+        for, in one outermost write transaction. Internal: the OKF importer's write path.
+
+        The transaction (``BEGIN IMMEDIATE``, so the write lock is held from the read on) re-reads the
+        entry as :meth:`list_entities` reads it (``None`` when there is none or it fails its integrity
+        check) and passes it to ``judge``, which reads anything else it decides on through this vault,
+        inside the same transaction. ``judge`` returns ``None`` to write nothing, or :meth:`put`'s
+        keyword arguments other than the entry, ``author_id``, ``origin`` and ``revive``; ``_put`` then
+        writes them to this entry as ``author_id`` with ``origin``. A write another connection commits
+        lands before the read, and is judged, or after this write, never between the two. A refusal
+        ``_put`` raises rolls the transaction back and is journaled once, after the rollback, as
+        :meth:`put` journals it; then it is re-raised. Any other exception rolls back as well.
+        """
+        with self._journal_put_refusals(category, key, scope, author_id, origin), self._write_tx() as cursor:
+            cursor.execute(
+                f"SELECT {_ENTITY_COLUMNS} FROM entities e WHERE e.category = ? AND e.key = ? AND e.scope = ?",
+                (category, key, scope),
+            )
+            row = cursor.fetchone()
+            content = None if row is None else self._readable_content(row)
+            fields = judge(None if content is None else self._entity(row, content))
+            if fields is None:
+                return None
+            return self._put(category=category, key=key, scope=scope, author_id=author_id, origin=origin, **fields)
+
+    def _readable_paths(self, wanted: Callable[[str, str, str], bool]) -> List[Tuple[str, str, str]]:
+        """``(scope, category, key)`` of each entry ``list_entities(scope="*", include_archived=True,
+        include_unverified=True)`` would return whose path ``wanted`` accepts. Read on this connection, so
+        inside an open transaction it sees that transaction's view; only the accepted entries are opened.
+        """
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT scope, category, key FROM entities")
+        accepted = [(r[0], r[1], r[2]) for r in cursor.fetchall() if wanted(r[0], r[1], r[2])]
+        found: List[Tuple[str, str, str]] = []
+        for scope, category, key in accepted:
+            cursor.execute(
+                f"SELECT {_ENTITY_COLUMNS} FROM entities e WHERE e.category = ? AND e.key = ? AND e.scope = ?",
+                (category, key, scope),
+            )
+            row = cursor.fetchone()
+            if row is not None and self._readable_content(row) is not None:
+                found.append((scope, category, key))
+        return found
+
     def store(
         self,
         category: str,
@@ -2375,6 +2461,14 @@ class SQLiteMemoryVault(
         A dict item is the keyword arguments of :meth:`put`; keys that are not ``put`` parameters
         (private flags such as ``_review_verdict`` and ``_trusted_metadata`` included) raise
         ``TypeError`` before anything is written.
+
+        A :class:`MemoryEntity` item is written with the ``put`` parameters it carries
+        (:func:`_entity_put_arguments`): category, key, content, metadata, epistemic_state,
+        valid_from, valid_until and scope, and ``origin``, ``source_ref`` and ``confidence`` when the
+        entity's caller set them. An entity that says ``origin="model"`` is a model write (the class
+        check and the trust cap apply), and an entity a vault read returned carries its stored origin.
+        An entity that never set an origin is written with none, like a ``put`` that states none: a
+        re-write keeps the entry's origin and a new key is stored as ``unknown``.
         """
         fence = {"fencing_token": fencing_token, "resource": resource, "holder_id": holder_id}
         allowed = _PUT_PARAMETERS
@@ -2387,17 +2481,7 @@ class SQLiteMemoryVault(
         with self._conn:
             for item in items:
                 if isinstance(item, MemoryEntity):
-                    res = self.put(
-                        category=item.category,
-                        key=item.key,
-                        content=item.content,
-                        metadata=item.metadata,
-                        epistemic_state=item.epistemic_state.value if isinstance(item.epistemic_state, EpistemicState) else str(item.epistemic_state),
-                        valid_from=item.valid_from,
-                        valid_until=item.valid_until,
-                        scope=item.scope,
-                        **fence,
-                    )
+                    res = self.put(**_entity_put_arguments(item), **fence)
                 elif isinstance(item, dict):
                     res = self.put(**{**fence, **item})
                 else:
@@ -2668,3 +2752,30 @@ class SQLiteMemoryVault(
 _PUT_PARAMETERS = frozenset(
     name for name in inspect.signature(SQLiteMemoryVault.put).parameters if name != "self"
 )
+#: The :meth:`SQLiteMemoryVault.put` parameters a :class:`MemoryEntity` carries: its fields that are put
+#: keywords (category, key, content, metadata, epistemic_state, valid_from, valid_until, scope, origin,
+#: source_ref and confidence).
+_ENTITY_PUT_FIELDS = frozenset(MemoryEntity.model_fields) & _PUT_PARAMETERS
+#: The ones ``put_batch`` passes for every entity item, set or not (an unset one passes its default).
+_ENTITY_PUT_ALWAYS = ("category", "key", "content", "metadata", "epistemic_state", "valid_from", "valid_until", "scope")
+
+
+def _entity_put_arguments(item: MemoryEntity) -> Dict[str, Any]:
+    """The :meth:`SQLiteMemoryVault.put` keyword arguments a :class:`MemoryEntity` batch item stands for.
+
+    :data:`_ENTITY_PUT_ALWAYS` are passed as they always were. Every other parameter the entity carries
+    (:data:`_ENTITY_PUT_FIELDS`: ``origin``, ``source_ref``, ``confidence``) is passed when the entity's
+    caller set it (pydantic's ``model_fields_set``: at construction, by assignment or through
+    ``model_copy(update=...)``), an explicit ``origin="unknown"`` included, and left out when the caller
+    did not. So the provenance a caller states reaches ``put``'s class check and trust cap instead of
+    being dropped, and none is invented for an entity that states none. An entity a vault read built
+    (:meth:`SQLiteMemoryVault._entity`) states the row's origin, source_ref and confidence.
+    """
+    args: Dict[str, Any] = {name: getattr(item, name) for name in _ENTITY_PUT_ALWAYS}
+    state = args["epistemic_state"]
+    args["epistemic_state"] = state.value if isinstance(state, EpistemicState) else str(state)
+    stated = item.model_fields_set
+    for name in sorted(_ENTITY_PUT_FIELDS.difference(_ENTITY_PUT_ALWAYS)):
+        if name in stated:
+            args[name] = getattr(item, name)
+    return args

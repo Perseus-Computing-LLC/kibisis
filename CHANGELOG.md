@@ -20,6 +20,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the request fail with `ReviewedEntryError` and nothing written, or lands after the write and stays in place.
 - **AML `add` request id.** The request-id marker is read inside the transaction that writes the request, so two
   `add` calls with one `request_id` from different connections cannot both write it.
+- **Provenance, quorum and import decisions use what the caller set and the file holds now.** `put_batch` passes
+  a `MemoryEntity` item's `origin`, `source_ref` and `confidence` to `put` when the caller set them (an explicit
+  `origin="unknown"` included), as it already did for a dict item; an item that never set `origin` still keeps a
+  re-written entry's stored origin and stores a new one as `unknown`. `review_entity`, `admit` and a principal
+  write (`origin="user"` or `"import"`) that asks for `verified` count attestations against the larger of the
+  process's `verification_quorum` and the vault file's stored quorum (one whose seal does not verify is ignored,
+  as at open), read in the verdict's own write transaction: a vault object opened before another process raised
+  the file's quorum no longer marks an entry `verified` under the lower one, adopts the raised value, and records
+  it in `quorum_at_verification`; a process that asked for a higher quorum keeps it. A real `okf-import` judges each
+  concept on its row re-read inside that row's own write transaction and writes in the same transaction: a row
+  another connection archived, marked confidential, rewrote as a person, disputed, tombstoned or shadowed with a
+  case-colliding key after the importer's scan is reported as that conflict and left as it is, a row that
+  changed since the scan is compared as it is now, and a refusal the vault still raises is still that row's
+  conflict, journaled once, with the other rows written. `--dry-run` output is unchanged.
 
 ## [0.1.0-alpha.17] - 2026-11-10
 
