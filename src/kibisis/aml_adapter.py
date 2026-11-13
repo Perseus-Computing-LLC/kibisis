@@ -514,14 +514,17 @@ class AMLService:
                           metadata={"messages": len(rows), "payload": payload_digest}))
         with self.pool.use(user_id, create=True) as vault:
             assert vault is not None  # create=True always yields a vault
-            marker = vault.get(REQUEST_CATEGORY, rid, scope=SCOPE)
-            if marker is None:
-                with vault._write_tx():  # one transaction: the request lands whole or not at all
+            # One transaction from the marker check to the write: the request lands whole or not at
+            # all, and a request under the same id from another connection lands before the check
+            # (this one is then a retry or a 409) or after the write, never in between.
+            with vault._write_tx():
+                marker = vault.get(REQUEST_CATEGORY, rid, scope=SCOPE)
+                if marker is None:
                     vault.put_batch(items)
-            else:  # a retry of a committed request is a no-op; a different payload under the same id is not
-                stored = (marker.metadata or {}).get("payload")
-                if isinstance(stored, str) and not hmac.compare_digest(stored, payload_digest):
-                    raise ContractError(409, "request_id was already used with a different payload")
+                else:  # a retry of a committed request is a no-op; a different payload under the same id is not
+                    stored = (marker.metadata or {}).get("payload")
+                    if isinstance(stored, str) and not hmac.compare_digest(stored, payload_digest):
+                        raise ContractError(409, "request_id was already used with a different payload")
         return {"success": True, "request_id": request_id, "user_id": user_id, "session_id": session_id}
 
     #: ``top_k`` as a digit string: ASCII digits, few enough that ``int()`` cannot refuse them (CPython

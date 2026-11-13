@@ -21,7 +21,7 @@ import threading
 import time
 from pathlib import Path
 from collections import deque
-from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Deque, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 from .admission import AdmissionDecision, FactDisposition, MemoryAdmissionGate
 from .crypto import (
     ENTRY_BINDING,
@@ -883,6 +883,27 @@ class SQLiteMemoryVault(
         if fencing_token is None and resource is None and not self.enforce_fencing:
             return
         self._validate_fencing(fencing_token, resource, holder_id)
+
+    @contextlib.contextmanager
+    def _fence_first(
+        self,
+        fencing_token: Optional[int],
+        resource: Optional[str],
+        holder_id: Optional[str],
+    ) -> Iterator[None]:
+        """Check the caller's fence before the block's origin and argument checks, when it applies.
+
+        When a token or resource is passed, or ``enforce_fencing`` is on, the block runs inside a
+        write transaction that checks the fence first, and the writes the block makes join it; a
+        caller fenced out gets :class:`LeaseConflictError` before any refusal and changes nothing.
+        When the fence does not apply the block runs as it is, with no transaction of its own.
+        """
+        if fencing_token is None and resource is None and not self.enforce_fencing:
+            yield
+            return
+        with self._write_tx() as cursor:
+            self._fence(cursor, fencing_token, resource, holder_id)
+            yield
 
     @contextlib.contextmanager
     def _write_tx(self):
@@ -2073,30 +2094,22 @@ class SQLiteMemoryVault(
             attester=attester,
         )
 
-    def _put_journaled(
+    @contextlib.contextmanager
+    def _journal_put_refusals(
         self,
         category: str,
         key: str,
-        content: str,
-        *,
-        scope: str = "default",
-        author_id: Optional[str] = None,
-        origin: Optional[str] = None,
-        **kwargs: Any,
-    ) -> MemoryEntity:
-        """Run :meth:`_put` and journal the refusals it raises (each in its own transaction, after the
-        write's rolled back). Internal paths (the review write, the snapshot import) use this with the
-        private flags; :meth:`put` uses it without them."""
+        scope: str,
+        author_id: Optional[str],
+        origin: Optional[str],
+        revive: bool = False,
+    ) -> Iterator[None]:
+        """Journal the refusals :meth:`_put` raises in the block (each in its own transaction, after the
+        block's transaction has rolled back) and re-raise them. Enter it outside the outermost
+        :meth:`_write_tx` of the block: a refusal journaled inside a transaction that then rolls back
+        is lost."""
         try:
-            return self._put(
-                category=category,
-                key=key,
-                content=content,
-                scope=scope,
-                author_id=author_id,
-                origin=origin,
-                **kwargs,
-            )
+            yield
         except TombstonedValueError as exc:
             # The write's transaction rolled back; journal the refusal in its own transaction.
             self.record_refusal(
@@ -2125,9 +2138,34 @@ class SQLiteMemoryVault(
             self.record_refusal(
                 path="put", reason="superseded_entry", scope=scope, category=category, key=key,
                 author_id=author_id,
-                detail={"origin": origin or "", "revive": "yes" if kwargs.get("revive") else "no"},
+                detail={"origin": origin or "", "revive": "yes" if revive else "no"},
             )
             raise
+
+    def _put_journaled(
+        self,
+        category: str,
+        key: str,
+        content: str,
+        *,
+        scope: str = "default",
+        author_id: Optional[str] = None,
+        origin: Optional[str] = None,
+        **kwargs: Any,
+    ) -> MemoryEntity:
+        """Run :meth:`_put` and journal the refusals it raises (each in its own transaction, after the
+        write's rolled back). Internal paths (the review write, the snapshot import) use this with the
+        private flags; :meth:`put` uses it without them."""
+        with self._journal_put_refusals(category, key, scope, author_id, origin, bool(kwargs.get("revive"))):
+            return self._put(
+                category=category,
+                key=key,
+                content=content,
+                scope=scope,
+                author_id=author_id,
+                origin=origin,
+                **kwargs,
+            )
 
     def store(
         self,
@@ -2542,16 +2580,9 @@ class SQLiteMemoryVault(
         candidate whatever it claims.
         """
         requester = self._requester_class(origin)
-        if requester != "principal":
-            with self._journal_protected_refusal(
-                "set_persona_slot", "persona", "user_profile", scope, author_id, origin
-            ), self._write_tx() as cursor:
-                row = self._fetch_row(cursor, "persona", "user_profile", scope)
-                if row is not None:
-                    self._refuse_if_protected(row, requester, origin, "replace the persona slot of")
         meta = metadata.copy() if metadata else {}
         meta["is_persona_slot"] = True
-        return self.put(
+        fields: Dict[str, Any] = dict(
             category="persona",
             key="user_profile",
             content=content,
@@ -2565,6 +2596,26 @@ class SQLiteMemoryVault(
             origin=origin,
             attester=attester,
         )
+        if requester == "principal":
+            # Nothing to check before the write; ``put`` checks the fence first, inside its write.
+            return self.put(**fields)
+        # The fence, the protection check and the write run in one outermost write transaction, so a
+        # review another connection commits lands before the check, which refuses, or after the
+        # write, never in between. A failing fence raises before the check and is never journaled.
+        # The write is ``put``'s (``_put`` under ``_put_journaled``'s refusal journaling), widened to
+        # this transaction; both journaling wrappers sit outside it, so each refusal is journaled
+        # once, after the rollback, with the same fields as before.
+        with self._journal_put_refusals("persona", "user_profile", scope, author_id, origin), \
+                self._journal_protected_refusal(
+                    "set_persona_slot", "persona", "user_profile", scope, author_id, origin,
+                    refusals=(ReviewedEntryError,),
+                ), \
+                self._write_tx() as cursor:
+            self._fence(cursor, fencing_token, resource, holder_id)
+            row = self._fetch_row(cursor, "persona", "user_profile", scope)
+            if row is not None:
+                self._refuse_if_protected(row, requester, origin, "replace the persona slot of")
+            return self._put(**fields)
 
     def get_persona_slot(
         self,

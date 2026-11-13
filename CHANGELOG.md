@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Fence first.** When a call's fence applies (a `fencing_token` or `resource` is passed, or the vault has
+  `enforce_fencing=True`), `set_persona_slot`, `tombstone`, `lift_tombstone`, `review_entity` and `admit` now
+  check it before any origin, scope or protection check: a missing, stale or expired token raises
+  `LeaseConflictError` and leaves entries, tombstones and the audit journal unchanged. Previously a non-principal
+  `set_persona_slot` over a protected slot, `tombstone(scope="*")` or `lift_tombstone` was refused and journaled
+  as a `refuse` event first, and `review_entity` / `admit` with a non-`user` reviewer raised `PermissionError`.
+  When the fence passes or does not apply, the same exceptions and `refuse` events as before.
+- **Persona slot check and write in one transaction.** A non-principal `set_persona_slot` now checks the slot's
+  protection and writes it in one write transaction, so a review committed by another connection either makes
+  the request fail with `ReviewedEntryError` and nothing written, or lands after the write and stays in place.
+- **AML `add` request id.** The request-id marker is read inside the transaction that writes the request, so two
+  `add` calls with one `request_id` from different connections cannot both write it.
+
 ## [0.1.0-alpha.17] - 2026-11-10
 
 ### Security
