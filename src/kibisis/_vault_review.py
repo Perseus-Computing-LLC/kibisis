@@ -362,27 +362,29 @@ class AdmissionReviewMixin:
         The human path is ``python -m kibisis admit --category C --key K --by user``. ``reviewer`` is the
         identity the quorum counts (see :meth:`review_entity`); ``reviewer_label`` is recorded beside it.
         """
-        _validate_origin(reviewer_origin, "reviewer_origin")
-        if reviewer_origin != "user":
-            entity = self.get(category=category, key=key, scope=scope)
-            raise AdmissionRefused(
-                f"'{category}:{key}' [scope={scope}] cannot be promoted to verified by a {reviewer_origin} reviewer "
-                f"(entry origin={entity.origin if entity else 'missing'}). A person admits it with: "
-                f"python -m kibisis admit --category {category} --key {key} --scope {scope} --by user"
+        # A fenced call checks its fence before the origin check (see ``_fence_first``).
+        with self._fence_first(fencing_token, resource, holder_id):
+            _validate_origin(reviewer_origin, "reviewer_origin")
+            if reviewer_origin != "user":
+                entity = self.get(category=category, key=key, scope=scope)
+                raise AdmissionRefused(
+                    f"'{category}:{key}' [scope={scope}] cannot be promoted to verified by a {reviewer_origin} reviewer "
+                    f"(entry origin={entity.origin if entity else 'missing'}). A person admits it with: "
+                    f"python -m kibisis admit --category {category} --key {key} --scope {scope} --by user"
+                )
+            return self.review_entity(
+                category=category,
+                key=key,
+                verdict=EpistemicState.VERIFIED.value,
+                scope=scope,
+                reviewer_id=reviewer,
+                notes=note,
+                reviewer_origin=reviewer_origin,
+                fencing_token=fencing_token,
+                resource=resource,
+                holder_id=holder_id,
+                reviewer_label=reviewer_label,
             )
-        return self.review_entity(
-            category=category,
-            key=key,
-            verdict=EpistemicState.VERIFIED.value,
-            scope=scope,
-            reviewer_id=reviewer,
-            notes=note,
-            reviewer_origin=reviewer_origin,
-            fencing_token=fencing_token,
-            resource=resource,
-            holder_id=holder_id,
-            reviewer_label=reviewer_label,
-        )
 
     def _clear_pending_supersession(self, category: str, key: str, scope: str, proposer_ref: str) -> None:
         """Drop ``proposer_ref`` from the target's ``pending_supersession_by`` mark (K-R2 proposal rejected)."""
@@ -434,27 +436,30 @@ class AdmissionReviewMixin:
         only on a vault opened with ``trust_caller_identity=True`` (see :class:`SQLiteMemoryVault`).
         ``reviewer_label`` keeps a typed name alongside without counting.
         """
-        valid_verdicts = {EpistemicState.VERIFIED.value, EpistemicState.DISPUTED.value, EpistemicState.REVOKED.value}
-        if verdict not in valid_verdicts:
-            raise ValueError(f"Verdict must be one of {valid_verdicts}, got '{verdict}'")
-        _validate_origin(reviewer_origin, "reviewer_origin")
-        if reviewer_origin != "user":
-            raise PermissionError(
-                f"review_entity records a person's verdict only (reviewer_origin='user'); "
-                f"got reviewer_origin={reviewer_origin!r} for {category}:{key} [scope={scope}]"
-            )
-        if reviewer_id is None or not str(reviewer_id).strip():
-            raise ValueError("review_entity needs a reviewer_id: a verdict nobody signed is not a review")
-        reviewer_id = str(reviewer_id).strip()
-        signer = self._resolve_attester(reviewer_origin, attester)
+        # A fenced call checks its fence before the verdict, origin and attester checks below, which
+        # then run in the review's write transaction (see ``_fence_first``).
+        with self._fence_first(fencing_token, resource, holder_id):
+            valid_verdicts = {EpistemicState.VERIFIED.value, EpistemicState.DISPUTED.value, EpistemicState.REVOKED.value}
+            if verdict not in valid_verdicts:
+                raise ValueError(f"Verdict must be one of {valid_verdicts}, got '{verdict}'")
+            _validate_origin(reviewer_origin, "reviewer_origin")
+            if reviewer_origin != "user":
+                raise PermissionError(
+                    f"review_entity records a person's verdict only (reviewer_origin='user'); "
+                    f"got reviewer_origin={reviewer_origin!r} for {category}:{key} [scope={scope}]"
+                )
+            if reviewer_id is None or not str(reviewer_id).strip():
+                raise ValueError("review_entity needs a reviewer_id: a verdict nobody signed is not a review")
+            reviewer_id = str(reviewer_id).strip()
+            signer = self._resolve_attester(reviewer_origin, attester)
 
-        # One write transaction from the read to the re-write: the entry a reviewer looked at is the
-        # entry the verdict lands on, and a concurrent write cannot slip in between the two.
-        with self._write_tx():
-            return self._review_locked(
-                category, key, verdict, scope, reviewer_id, notes, fencing_token, resource, holder_id, reviewer_origin,
-                reviewer_label, signer,
-            )
+            # One write transaction from the read to the re-write: the entry a reviewer looked at is the
+            # entry the verdict lands on, and a concurrent write cannot slip in between the two.
+            with self._write_tx():
+                return self._review_locked(
+                    category, key, verdict, scope, reviewer_id, notes, fencing_token, resource, holder_id,
+                    reviewer_origin, reviewer_label, signer,
+                )
 
     def _review_locked(
         self,
@@ -536,11 +541,14 @@ class AdmissionReviewMixin:
                 attested.append(signer)
             if attested:
                 meta["attestations"] = attested
-            if len(attested) >= self.verification_quorum:
+            # Settled against the quorum in force now, in this verdict's transaction: the file's
+            # quorum may have been raised since this vault was opened (a stored quorum is a floor).
+            quorum = self._quorum_in_force()
+            if len(attested) >= quorum:
                 meta.pop("verification_pending", None)
-                meta["quorum_at_verification"] = self.verification_quorum
+                meta["quorum_at_verification"] = quorum
             else:
-                meta["verification_pending"] = {"have": len(attested), "need": self.verification_quorum}
+                meta["verification_pending"] = {"have": len(attested), "need": quorum}
                 meta.pop("quorum_at_verification", None)
                 stored_state = EpistemicState.CANDIDATE.value
         proposal = meta.pop("proposed_supersedes", None) if stored_state == EpistemicState.VERIFIED.value else None

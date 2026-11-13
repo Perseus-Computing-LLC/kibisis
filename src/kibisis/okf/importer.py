@@ -46,10 +46,14 @@ then the vault's own refusals in the order it checks them: ``superseded`` (Super
 ``pending_review`` (a supersession proposal waits on the row, which carries ``proposed_supersedes`` or
 ``pending_supersession_by``; review_entity reads both) and ``disputed`` (the review cascade or a
 contradiction disputed the row, and a rewrite would land it as a plain candidate). Where the vault would
-refuse, its reason is the one reported. Conflicts are predicted before any write, so a dry run reports
-what a real run does. A real run never sends a predicted conflict to the vault, and it records any
-refusal the vault still raises as a conflict. Writes are one row at a time: an unexpected error stops the
-run, and the rows written before it stay written.
+refuse, its reason is the one reported. A dry run judges every concept on one read of the vault, so it
+reports what a real run does on a vault nobody changes meanwhile. A real run judges each concept again in
+the write transaction of its own row, on the row as it is then (re-read under the vault's write lock),
+and writes in that transaction: a row another connection changed after the read is judged as an import
+started after the change would judge it. A real run never sends a judged conflict to the vault, and it
+records any refusal the vault still raises as a conflict: the refusal rolls back that row's transaction
+only, and the vault journals it as it journals a refused ``put``. Writes are one row at a time: an
+unexpected error stops the run, and the rows written before it stay written.
 
 ``dry_run=True`` reads the bundle and the vault and writes nothing. Live use in P13 is dry-run only.
 """
@@ -63,7 +67,7 @@ import stat
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple, Union
 
 from .._vault_review import ORIGIN_CLASSES, _class_rank, origin_class_of
 from ..vault import (
@@ -395,16 +399,57 @@ def _reserved(key: str) -> bool:
     return key in RESERVED_METADATA_KEYS or key.startswith(RESERVED_METADATA_PREFIX)
 
 
-def _write(vault: Any, c: _Concept, row: Any, claims: List[Dict[str, Any]]) -> None:
+def _fold(scope: str, category: str, key: str) -> str:
+    """A row's concept path, case-folded: two paths that differ only in case fold alike."""
+    return ("%s/%s/%s.md" % (scope, category, key)).lower()
+
+
+class _Verdict(NamedTuple):
+    """What importing a concept over its row does: ``outcome`` is ``unchanged``, ``conflict`` (named by
+    ``reason``), ``new`` or ``changed``; ``recorded`` are the claims the row records, ``fresh`` the
+    bundle's claims it does not."""
+
+    outcome: str
+    reason: Optional[str]
+    recorded: List[Dict[str, Any]]
+    fresh: List[Dict[str, Any]]
+
+
+def _judge(vault: Any, c: _Concept, row: Any, collides: Callable[[], bool]) -> _Verdict:
+    """Judge ``c`` against ``row`` (``None``: there is none); ``collides()`` says whether a row's path
+    differs from the concept's only in case. A dry run judges on its scan, a real run on the row as it
+    is inside the write's transaction (:func:`_judge_and_write`), so both judge alike."""
+    if row is None:
+        if collides():
+            return _Verdict("conflict", "key_collision", [], [])
+        if vault.is_tombstoned(c.category, c.key, c.body, scope=c.scope):
+            return _Verdict("conflict", "tombstoned", [], [])
+        return _Verdict("new", None, [], list(c.claims))
+    meta = row.metadata if isinstance(row.metadata, dict) else {}
+    recorded = _stored_claims(meta)
+    known = {(x.get("by"), x.get("at")) for x in recorded}
+    if c.claims:
+        known |= {(s["by"], s["at"]) for s in _person_admit_stamps(vault, row)}
+    fresh = [x for x in c.claims if (x["by"], x["at"]) not in known]
+    extra_now = dump_extra(c.extra) if c.extra else None
+    if c.body == row.content and extra_now == _stored_extra(meta) and not fresh:
+        return _Verdict("unchanged", None, recorded, fresh)
+    reason = _row_conflict(vault, row, c.body)
+    if reason is not None:
+        return _Verdict("conflict", reason, recorded, fresh)
+    return _Verdict("changed", None, recorded, fresh)
+
+
+def _put_fields(c: _Concept, row: Any, claims: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """``put``'s arguments for writing ``c`` over ``row`` (``None``: there is none), other than the entry,
+    the origin and the author, which :func:`_judge_and_write` fixes. A rewrite carries ``row`` forward."""
     if row is None:
         meta: Dict[str, Any] = {}
         if c.extra:
             meta["okf_extra"] = dump_extra(c.extra)
         if claims:
             meta["okf_verified_claims"] = claims
-        vault.put(c.category, c.key, c.body, metadata=meta or None, scope=c.scope, origin=_ORIGIN,
-                  author_id=IMPORTER_ID, auto_gate=False)
-        return
+        return dict(content=c.body, metadata=meta or None, auto_gate=False)
     old = row.metadata if isinstance(row.metadata, dict) else {}
     meta = {k: v for k, v in old.items() if not _reserved(k) and k not in _REWRITTEN_KEYS}
     if c.extra:
@@ -415,14 +460,42 @@ def _write(vault: Any, c: _Concept, row: Any, claims: List[Dict[str, Any]]) -> N
     principal = old.get("principal_id")
     lineage = old.get("derived_from")
     derived = [r for r in lineage if isinstance(r, str)] if isinstance(lineage, list) else []
-    vault.put(
-        row.category, row.key, c.body, metadata=meta, scope=row.scope, origin=_ORIGIN, author_id=IMPORTER_ID,
+    return dict(
+        content=c.body, metadata=meta,
         tenant_id=tenant if isinstance(tenant, str) and tenant else None,
         principal_id=principal if isinstance(principal, str) and principal else None,
         derived_from=derived or None,
         valid_from=row.valid_from, valid_until=row.valid_until, source_ref=row.source_ref,
         confidence=row.confidence, auto_gate=False,
     )
+
+
+def _judge_and_write(vault: Any, c: _Concept) -> _Verdict:
+    """Judge ``c`` on its row as it is now and write it if it is new or changed, in one write transaction.
+
+    The vault re-reads the row under its write lock and runs the judgement on it inside the same
+    transaction (with the tombstone, journal and case-collision reads the judgement makes), then the
+    write; a write another connection commits lands before the read, and is judged as an import that
+    started after it would judge it, or after this write. A refusal the vault still raises rolls the
+    transaction back, so nothing of the concept is written; the vault journals it as ``put`` does and
+    it propagates to the caller.
+    """
+    verdicts: List[_Verdict] = []
+    folded = c.rel.lower()
+
+    def collides() -> bool:
+        return bool(vault._readable_paths(lambda scope, category, key: _fold(scope, category, key) == folded))
+
+    def judge(row: Any) -> Optional[Dict[str, Any]]:
+        verdict = _judge(vault, c, row, collides)
+        verdicts.append(verdict)
+        if verdict.outcome not in ("new", "changed"):
+            return None
+        stamped = verdict.recorded + [dict(x, file_sha256=c.sha256) for x in verdict.fresh]
+        return _put_fields(c, row, stamped)
+
+    vault._judged_put(c.category, c.key, c.scope, judge, author_id=IMPORTER_ID, origin=_ORIGIN)
+    return verdicts[-1]
 
 
 def import_bundle(
@@ -446,9 +519,13 @@ def import_bundle(
 
     skipped: Counter = Counter()
     concepts = _scan(root, profile, skipped)
+    # Every row is read as before (a strict vault still refuses a damaged row before anything is written).
+    # A dry run judges each concept on this scan. A real run judges each again on its row as it is inside
+    # the concept's own write transaction, so a row that changed since the scan is judged as an import
+    # that started after the change would judge it, and the scan never decides a write.
     rows = vault.list_entities(scope="*", include_archived=True, include_unverified=True)
     by_ref = {(r.scope, r.category, r.key): r for r in rows}
-    row_folds = {("%s/%s/%s.md" % (r.scope, r.category, r.key)).lower() for r in rows}
+    row_folds = {_fold(r.scope, r.category, r.key) for r in rows}
 
     report = ImportReport(bundle=str(root), dry_run=bool(dry_run), profile_digest=profile.digest,
                           examined=len(concepts), skipped=dict(skipped))
@@ -456,42 +533,23 @@ def import_bundle(
     for rel in sorted(concepts):
         c = concepts[rel]
         dropped.update(c.dropped)
-        row = by_ref.get((c.scope, c.category, c.key))
-        if row is None:
-            fresh = list(c.claims)
-            if rel.lower() in row_folds:
-                report.conflicts[rel] = "key_collision"
-                continue
-            if vault.is_tombstoned(c.category, c.key, c.body, scope=c.scope):
-                report.conflicts[rel] = "tombstoned"
-                continue
-            outcome = report.new
-            recorded: List[Dict[str, Any]] = []
+        if dry_run:
+            verdict = _judge(vault, c, by_ref.get((c.scope, c.category, c.key)), lambda: rel.lower() in row_folds)
         else:
-            meta = row.metadata if isinstance(row.metadata, dict) else {}
-            recorded = _stored_claims(meta)
-            known = {(x.get("by"), x.get("at")) for x in recorded}
-            if c.claims:
-                known |= {(s["by"], s["at"]) for s in _person_admit_stamps(vault, row)}
-            fresh = [x for x in c.claims if (x["by"], x["at"]) not in known]
-            extra_now = dump_extra(c.extra) if c.extra else None
-            if c.body == row.content and extra_now == _stored_extra(meta) and not fresh:
-                report.unchanged += 1
-                continue
-            reason = _row_conflict(vault, row, c.body)
-            if reason is not None:
-                report.conflicts[rel] = reason
-                continue
-            outcome = report.changed
-        if not dry_run:
-            stamped = recorded + [dict(x, file_sha256=c.sha256) for x in fresh]
             try:
-                _write(vault, c, row, stamped)
+                verdict = _judge_and_write(vault, c)
             except tuple(cls for cls, _ in _REFUSALS) as exc:
                 report.conflicts[rel] = next(name for cls, name in _REFUSALS if isinstance(exc, cls))
                 continue
+        if verdict.outcome == "unchanged":
+            report.unchanged += 1
+            continue
+        if verdict.outcome == "conflict":
+            report.conflicts[rel] = str(verdict.reason)
+            continue
+        if not dry_run:
             report.written.append(rel)
-        outcome.append(rel)
-        report.claims += len(fresh)
+        (report.new if verdict.outcome == "new" else report.changed).append(rel)
+        report.claims += len(verdict.fresh)
     report.dropped_keys = dict(sorted(dropped.items()))
     return report
