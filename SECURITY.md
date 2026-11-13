@@ -349,7 +349,11 @@ in front of the adapter.
 `okf-import` reads a directory of Markdown files written by someone else. Every imported row is a
 model-origin candidate; `human_reviews` and other reserved metadata in a bundle's frontmatter are dropped by
 `_put` like any caller-supplied metadata, so a bundle cannot forge a review or a verified state. Bodies are
-stored as text and never executed. `okf-export` and `okf-import --dry-run` open the vault read-only
+stored as text and never executed. A real `okf-import` judges each concept on its row as it is inside that
+row's own write transaction (`SQLiteMemoryVault._judged_put`, vault.py: the row is re-read under the write
+lock) and writes in the same transaction, so a row another connection archives, marks confidential, rewrites
+as a person, disputes or tombstones after the importer's scan is reported as a conflict and left as it is;
+nothing lands between the judgement and the write. `okf-export` and `okf-import --dry-run` open the vault read-only
 (`SQLiteMemoryVault(read_only=True)`: `mode=ro`, no migration, no integrity upgrade, no index build), so
 running them against a vault changes none of the vault file's bytes; `okf-check` reads only the bundle and
 opens no vault. A read-only open of a WAL-mode vault still needs SQLite's shared-memory index, so it may

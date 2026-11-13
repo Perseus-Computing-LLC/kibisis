@@ -21,7 +21,7 @@ import threading
 import time
 from pathlib import Path
 from collections import deque
-from typing import Any, Deque, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Deque, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 from .admission import AdmissionDecision, FactDisposition, MemoryAdmissionGate
 from .crypto import (
     ENTRY_BINDING,
@@ -2201,6 +2201,60 @@ class SQLiteMemoryVault(
                 origin=origin,
                 **kwargs,
             )
+
+    def _judged_put(
+        self,
+        category: str,
+        key: str,
+        scope: str,
+        judge: Callable[[Optional[MemoryEntity]], Optional[Dict[str, Any]]],
+        *,
+        author_id: Optional[str],
+        origin: Optional[str],
+    ) -> Optional[MemoryEntity]:
+        """Judge the entry at ``(category, key, scope)`` as it is now and write what the judgement asks
+        for, in one outermost write transaction. Internal: the OKF importer's write path.
+
+        The transaction (``BEGIN IMMEDIATE``, so the write lock is held from the read on) re-reads the
+        entry as :meth:`list_entities` reads it (``None`` when there is none or it fails its integrity
+        check) and passes it to ``judge``, which reads anything else it decides on through this vault,
+        inside the same transaction. ``judge`` returns ``None`` to write nothing, or :meth:`put`'s
+        keyword arguments other than the entry, ``author_id``, ``origin`` and ``revive``; ``_put`` then
+        writes them to this entry as ``author_id`` with ``origin``. A write another connection commits
+        lands before the read, and is judged, or after this write, never between the two. A refusal
+        ``_put`` raises rolls the transaction back and is journaled once, after the rollback, as
+        :meth:`put` journals it; then it is re-raised. Any other exception rolls back as well.
+        """
+        with self._journal_put_refusals(category, key, scope, author_id, origin), self._write_tx() as cursor:
+            cursor.execute(
+                f"SELECT {_ENTITY_COLUMNS} FROM entities e WHERE e.category = ? AND e.key = ? AND e.scope = ?",
+                (category, key, scope),
+            )
+            row = cursor.fetchone()
+            content = None if row is None else self._readable_content(row)
+            fields = judge(None if content is None else self._entity(row, content))
+            if fields is None:
+                return None
+            return self._put(category=category, key=key, scope=scope, author_id=author_id, origin=origin, **fields)
+
+    def _readable_paths(self, wanted: Callable[[str, str, str], bool]) -> List[Tuple[str, str, str]]:
+        """``(scope, category, key)`` of each entry ``list_entities(scope="*", include_archived=True,
+        include_unverified=True)`` would return whose path ``wanted`` accepts. Read on this connection, so
+        inside an open transaction it sees that transaction's view; only the accepted entries are opened.
+        """
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT scope, category, key FROM entities")
+        accepted = [(r[0], r[1], r[2]) for r in cursor.fetchall() if wanted(r[0], r[1], r[2])]
+        found: List[Tuple[str, str, str]] = []
+        for scope, category, key in accepted:
+            cursor.execute(
+                f"SELECT {_ENTITY_COLUMNS} FROM entities e WHERE e.category = ? AND e.key = ? AND e.scope = ?",
+                (category, key, scope),
+            )
+            row = cursor.fetchone()
+            if row is not None and self._readable_content(row) is not None:
+                found.append((scope, category, key))
+        return found
 
     def store(
         self,
