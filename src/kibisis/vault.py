@@ -880,9 +880,13 @@ class SQLiteMemoryVault(
         begin a transaction itself: taking the lock here, after the caller's reads, is what let a
         tombstone check run unlocked.
         """
-        if fencing_token is None and resource is None and not self.enforce_fencing:
+        if not self._fence_applies(fencing_token, resource):
             return
         self._validate_fencing(fencing_token, resource, holder_id)
+
+    def _fence_applies(self, fencing_token: Optional[int], resource: Optional[str]) -> bool:
+        """Whether a call is fenced: it passes a token or a resource, or ``enforce_fencing`` is on."""
+        return fencing_token is not None or resource is not None or bool(self.enforce_fencing)
 
     @contextlib.contextmanager
     def _fence_first(
@@ -893,12 +897,11 @@ class SQLiteMemoryVault(
     ) -> Iterator[None]:
         """Check the caller's fence before the block's origin and argument checks, when it applies.
 
-        When a token or resource is passed, or ``enforce_fencing`` is on, the block runs inside a
-        write transaction that checks the fence first, and the writes the block makes join it; a
-        caller fenced out gets :class:`LeaseConflictError` before any refusal and changes nothing.
-        When the fence does not apply the block runs as it is, with no transaction of its own.
+        A fenced call runs the block inside a write transaction that checks the fence first (the
+        block's writes join it), so a caller fenced out gets :class:`LeaseConflictError` before any
+        refusal and changes nothing. Any other call runs the block as it is, with no transaction.
         """
-        if fencing_token is None and resource is None and not self.enforce_fencing:
+        if not self._fence_applies(fencing_token, resource):
             yield
             return
         with self._write_tx() as cursor:
@@ -2599,12 +2602,10 @@ class SQLiteMemoryVault(
         if requester == "principal":
             # Nothing to check before the write; ``put`` checks the fence first, inside its write.
             return self.put(**fields)
-        # The fence, the protection check and the write run in one outermost write transaction, so a
-        # review another connection commits lands before the check, which refuses, or after the
-        # write, never in between. A failing fence raises before the check and is never journaled.
-        # The write is ``put``'s (``_put`` under ``_put_journaled``'s refusal journaling), widened to
-        # this transaction; both journaling wrappers sit outside it, so each refusal is journaled
-        # once, after the rollback, with the same fields as before.
+        # One outermost write transaction holds the fence, the protection check and the write, so a
+        # review another connection commits lands before the check (refused) or after the write. The
+        # write is put's own (``_put``, journaled as ``_put_journaled`` does); both journals sit outside
+        # the transaction, so a refusal is journaled once, after the rollback, and a failing fence never.
         with self._journal_put_refusals("persona", "user_profile", scope, author_id, origin), \
                 self._journal_protected_refusal(
                     "set_persona_slot", "persona", "user_profile", scope, author_id, origin,

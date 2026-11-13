@@ -110,29 +110,32 @@ def test_a_fenced_out_call_raises_lease_conflict_and_changes_nothing(fenced, nam
     assert _state(vault) == before
 
 
+@pytest.fixture
+def unfenced():
+    vault = SQLiteMemoryVault(":memory:")
+    _seed(vault)
+    yield vault, {}
+    vault.close()
+
+
+@pytest.fixture
+def current_token(fenced):
+    vault, _seeder, worker = fenced
+    return vault, _fence(worker)
+
+
 @pytest.mark.parametrize("mode", ["unfenced", "current_token"])
 @pytest.mark.parametrize("name", sorted(CALLS))
-def test_a_refusal_past_the_fence_is_raised_and_journaled_as_before(fenced, name, mode):
-    if mode == "unfenced":
-        vault = SQLiteMemoryVault(":memory:")
-        _seed(vault)
-        kw = {}
-    else:
-        vault, _seeder, worker = fenced
-        kw = _fence(worker)
+def test_a_refusal_past_the_fence_is_raised_and_journaled_as_before(request, name, mode):
+    vault, kw = request.getfixturevalue(mode)
     call, expected, refusal = CALLS[name]
-    before_entries, before_tombstones, _ = _state(vault)
-    before_refusals = _refusals(vault)
+    entries, tombstones, _ = _state(vault)
+    assert _refusals(vault) == []
     with pytest.raises(expected) as raised:
         call(vault, kw)
     assert not isinstance(raised.value, LeaseConflictError)
-    after_entries, after_tombstones, _ = _state(vault)
-    assert (after_entries, after_tombstones) == (before_entries, before_tombstones)
-    new = _refusals(vault)[len(before_refusals):] if _refusals(vault)[: len(before_refusals)] == before_refusals \
-        else _refusals(vault)
-    assert new == ([refusal] if refusal else []), f"{name} journaled {new}"
-    if mode == "unfenced":
-        vault.close()
+    assert _state(vault)[:2] == (entries, tombstones)
+    assert _refusals(vault) == ([refusal] if refusal else []), name
 
 
 def test_a_current_token_still_writes_the_persona_slot_and_lifts(fenced):
