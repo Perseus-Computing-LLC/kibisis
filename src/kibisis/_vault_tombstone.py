@@ -21,7 +21,7 @@ from __future__ import annotations
 import contextlib
 import json
 import time
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Type
 
 from ._vault_crypto import value_digests
 
@@ -112,13 +112,26 @@ class TombstoneMixin:
 
     @contextlib.contextmanager
     def _journal_protected_refusal(
-        self, path: str, category: str, key: str, scope: str, author_id: Optional[str], origin: Optional[str]
+        self,
+        path: str,
+        category: str,
+        key: str,
+        scope: str,
+        author_id: Optional[str],
+        origin: Optional[str],
+        refusals: Tuple[Type[BaseException], ...] = (PermissionError,),
     ) -> Iterator[None]:
         """Journal a ``ReviewedEntryError`` or ``PermissionError`` raised in the block as a ``refuse``
-        event, after the block's transaction has rolled back, and re-raise it."""
+        event, after the block's transaction has rolled back, and re-raise it.
+
+        Enter it outside the block's :meth:`_write_tx`, and check the caller's fence first inside that
+        transaction (see :meth:`purge`): a ``LeaseConflictError`` is not a refusal and is never
+        journaled, so a caller fenced out changes nothing. ``refusals`` narrows what is journaled here
+        when the block also runs a write whose own refusals are journaled elsewhere
+        (:meth:`set_persona_slot` passes ``(ReviewedEntryError,)``)."""
         try:
             yield
-        except PermissionError as exc:  # ReviewedEntryError is one
+        except refusals as exc:  # ReviewedEntryError is a PermissionError
             self.record_refusal(
                 path=path,
                 reason="protected entry" if type(exc).__name__ == "ReviewedEntryError" else "scope not allowed",
@@ -341,7 +354,11 @@ class TombstoneMixin:
         agent's request passes its origin.
         """
         requester = self._requester_class(origin)
-        with self._journal_protected_refusal("tombstone", category, key, scope, author_id, origin):
+        with self._journal_protected_refusal(
+            "tombstone", category, key, scope, author_id, origin
+        ), self._write_tx() as cursor:
+            # The fence first, then the scope and protection checks, then the write: one transaction.
+            self._fence(cursor, fencing_token, resource, holder_id)
             if scope == "*" and requester != "principal":
                 raise PermissionError(
                     f"a {origin} request cannot tombstone a value in every scope (scope='*'); it may act in its own scope"
@@ -364,7 +381,9 @@ class TombstoneMixin:
         origin: Optional[str],
         requester: str,
     ) -> str:
-        """Body of :meth:`tombstone`: one write transaction from lookup to tombstone row."""
+        """Body of :meth:`tombstone`, inside its write transaction (this ``_write_tx`` joins it) after
+        its fence and scope checks: lookup, protection check, tombstone row. The repeated fence check
+        here is idempotent."""
         from ._vault_review import _class_rank
         from .vault import ReviewedEntryError  # vault.py imports this module
 
@@ -496,7 +515,11 @@ class TombstoneMixin:
         admitted again afterwards; the entry itself is not restored.
         """
         requester = self._requester_class(origin)
-        with self._journal_protected_refusal("lift_tombstone", category, key, scope, author_id, origin):
+        with self._journal_protected_refusal(
+            "lift_tombstone", category, key, scope, author_id, origin
+        ), self._write_tx() as cursor:
+            # The fence first, then the origin check, then the lift: one transaction.
+            self._fence(cursor, fencing_token, resource, holder_id)
             if requester != "principal":
                 raise PermissionError(
                     f"a {origin} request cannot lift a tombstone ('{category}:{key}' [scope={scope}]); lifting is a "
@@ -517,7 +540,8 @@ class TombstoneMixin:
         resource: Optional[str],
         holder_id: Optional[str],
     ) -> int:
-        """Body of :meth:`lift_tombstone`, after the origin check."""
+        """Body of :meth:`lift_tombstone`, inside its write transaction after its fence and origin
+        checks (the repeated fence check here is idempotent)."""
         sql = (
             "SELECT id, value_sha256, canonical_sha256, reason, origin_class FROM rejected_value_tombstones "
             "WHERE category = ? AND key = ? AND scope = ?"
