@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Shared vault over HTTP.** `python -m kibisis mcp-http-serve` serves the MCP tools over Streamable HTTP
+  (`POST /mcp`, JSON responses, batches, 202 for notifications) for one vault and one scope that several
+  members' agents share. Members authenticate with bearer tokens; the server keeps only their SHA-256 digests
+  (`--members` JSON). Each member's calls run as author `mcp-agent:<name>`, so the journal and recall name who
+  wrote each entry. Requests with an unlisted `Origin` get 403; the server refuses a vault that is not encrypted
+  at rest unless `--plaintext`. `python -m kibisis mcp-http-token NAME` issues a token. Container recipe in
+  `deploy/team/`.
+- `KibisisMCPServer(author=...)` sets the author recorded for that server's writes, refusals and recalls
+  (default `mcp-agent`, unchanged for the stdio server).
+
 ## [0.1.0-alpha.17] - 2026-11-10
 
 ### Security

@@ -241,6 +241,43 @@ def _aml_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _mcp_http_serve(args: argparse.Namespace) -> int:
+    import logging
+
+    from .mcp_http import HTTPConfig, load_members, run_server
+
+    # A shared vault's traffic is not mirrored into an operator's Argus ledger unless ARGUS_LEDGER_PATH says so.
+    os.environ.setdefault("ARGUS_LEDGER_PATH", "")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    try:
+        members = load_members(args.members)
+        scope = validate_scope(args.scope or os.environ.get("KIBISIS_SCOPE") or "team")
+        vault = open_vault(args.db)
+    except (OSError, ValueError, ConfigError, EncryptionRequiredError) as exc:
+        print(f"mcp-http-serve: {exc}", file=sys.stderr)
+        return 2
+    if not vault.encrypted_at_rest and not args.plaintext:
+        print("mcp-http-serve: the vault is not encrypted at rest (needs sqlcipher3 and a key); "
+              "pass --plaintext to serve it anyway", file=sys.stderr)
+        return 2
+    config = HTTPConfig(members=members, scope=scope, allowed_origins=tuple(args.allow_origin or ()),
+                        max_body_bytes=args.max_body_bytes, socket_timeout=args.socket_timeout)
+    run_server(vault, config, host=args.host, port=args.port)
+    return 0
+
+
+def _mcp_http_token(args: argparse.Namespace) -> int:
+    from .mcp_http import _MEMBER_RE, new_token, token_digest
+
+    if not _MEMBER_RE.match(args.name):
+        print("mcp-http-token: member name must be 1-64 of a-z 0-9 . _ - (lowercase)", file=sys.stderr)
+        return 2
+    token = new_token()
+    print(f"token  (give to {args.name} only; it is not stored): {token}")
+    print(f'members.json entry: "{args.name}": "{token_digest(token)}"')
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m kibisis")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -323,6 +360,27 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--retention-days", type=float, default=28.0,
                    help="delete vaults not used (no Add or Search) for this many days; 0 keeps them (default: 28)")
     s.set_defaults(func=_aml_serve)
+
+    h = sub.add_parser("mcp-http-serve", help="serve the MCP tools over Streamable HTTP for a vault members share",
+                       description="Serve one vault and one scope to several members' agents over HTTP (POST /mcp). "
+                                   "Members authenticate with bearer tokens whose SHA-256 digests are listed in "
+                                   "--members; each member's writes are attributed to mcp-agent:<name>.")
+    h.add_argument("--members", required=True, help='JSON file {"members": {"<name>": "<hex sha256 of token>"}}')
+    h.add_argument("--db", default=None, help=_DB_HELP)
+    h.add_argument("--scope", default=None, help="the one scope served (default: $KIBISIS_SCOPE, else 'team')")
+    h.add_argument("--host", default="127.0.0.1",
+                   help="bind host (default: 127.0.0.1; pass 0.0.0.0 to listen on every interface)")
+    h.add_argument("--port", type=int, default=8080, help="bind port (default: 8080)")
+    h.add_argument("--allow-origin", action="append", default=None,
+                   help="a browser Origin to accept (repeatable); requests with any other Origin get 403")
+    h.add_argument("--max-body-bytes", type=int, default=1 << 20, help="largest request body (default: 1 MiB)")
+    h.add_argument("--socket-timeout", type=float, default=30.0, help="idle connection timeout, seconds (default: 30)")
+    h.add_argument("--plaintext", action="store_true", help="serve a vault that is not encrypted at rest")
+    h.set_defaults(func=_mcp_http_serve)
+
+    t = sub.add_parser("mcp-http-token", help="print a new member token and its members.json line")
+    t.add_argument("name", help="member name (lowercase)")
+    t.set_defaults(func=_mcp_http_token)
 
     args = parser.parse_args(argv)
     return int(args.func(args))
