@@ -82,3 +82,10 @@ The vault key needs the `sqlcipher3` driver (the image installs it). Without the
 a key refuses to start unless `KIBISIS_ALLOW_PLAINTEXT=1` is set, in which case the files are plain SQLite
 (entry content sealed; roles, timestamps and request markers in the clear), the startup line says
 `encrypted_at_rest=False` with a warning, and retention treats them as plaintext vaults.
+
+## Deployments under evaluation
+
+A deployment that a leaderboard is evaluating stays on the commit it was submitted with, so the results describe
+that commit (`GET /health` reports it). Label such a container when you start it, for example
+`--label com.perseus.pinned="<leaderboard> evaluation of <commit>"`, so a routine update does not rebuild it. Once
+the evaluation is over, back up the data directory and rebuild from the current release tag.
