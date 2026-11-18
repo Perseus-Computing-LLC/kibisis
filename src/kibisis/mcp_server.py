@@ -357,9 +357,13 @@ class KibisisMCPServer:
         vault: Optional[SQLiteMemoryVault] = None,
         db_path: Optional[str] = None,
         scope: Optional[str] = None,
+        author: str = MCP_AUTHOR,
     ) -> None:
         self.scope = validate_scope(scope) if scope is not None else resolve_scope()
         self.vault = vault if vault is not None else open_vault(db_path)
+        #: Recorded as the author of every write, refusal and recall this server makes. The stdio server keeps
+        #: ``mcp-agent``; a shared HTTP server gives each member its own (``mcp-agent:<member>``).
+        self.author = author
 
     # -- JSON-RPC -----------------------------------------------------------------------------
 
@@ -404,7 +408,7 @@ class KibisisMCPServer:
                 scope=self.scope,
                 category=exc.category,
                 key=exc.key,
-                author_id=MCP_AUTHOR,
+                author_id=self.author,
                 detail={"tool": str(name)[:64], **exc.detail},
             )
             return _result(req_id, f"Refused: {exc}", is_error=True)
@@ -422,7 +426,7 @@ class KibisisMCPServer:
                     scope=self.scope,
                     category=str(args.get("category") or "") if isinstance(args, dict) else "",
                     key=str(args.get("key") or "") if isinstance(args, dict) else "",
-                    author_id=MCP_AUTHOR,
+                    author_id=self.author,
                     detail={"tool": str(name)[:64], "error": type(exc).__name__},
                 )
             return _result(req_id, f"Refused: {exc}", is_error=True)
@@ -460,7 +464,7 @@ class KibisisMCPServer:
                 raise ToolRefused(
                     "authority_claim",
                     f"'{arg}' cannot be set through MCP. Entries written here are stored as candidates by "
-                    f"{MCP_AUTHOR}; a person reviews them with `python -m kibisis.review`",
+                    f"{self.author}; a person reviews them with `python -m kibisis.review`",
                     category=str(args.get("category") or "")[:128],
                     key=str(args.get("key") or "")[:128],
                     detail={"argument": arg},
@@ -507,7 +511,7 @@ class KibisisMCPServer:
                 valid_from=_number(args, "valid_from"),
                 valid_until=_number(args, "valid_until"),
                 scope=self.scope,
-                author_id=MCP_AUTHOR,
+                author_id=self.author,
                 supersedes_key=_text(args, "supersedes_key"),
                 supersedes_category=_text(args, "supersedes_category"),
                 trust_ceiling=EpistemicState.CANDIDATE.value,
@@ -523,7 +527,7 @@ class KibisisMCPServer:
             "scope": self.scope,
             "version": entity.version,
             "epistemic_state": state,
-            "author": MCP_AUTHOR,
+            "author": self.author,
         }
         notes = []
         if state == EpistemicState.CANDIDATE.value:
@@ -567,7 +571,7 @@ class KibisisMCPServer:
             as_of_valid_time=_number(args, "as_of_valid_time"),
             match=match,
             channel="mcp",
-            actor=MCP_AUTHOR,
+            actor=self.author,
         )
         shown = {EpistemicState.VERIFIED.value, EpistemicState.DISPUTED.value}
         if include_candidates:
@@ -590,7 +594,7 @@ class KibisisMCPServer:
         reason = (_text(args, "reason") or "forgotten through MCP")[:200]
         try:
             digest = self.vault.tombstone(
-                category=category, key=key, reason=reason, author_id=MCP_AUTHOR, scope=self.scope, origin="model"
+                category=category, key=key, reason=reason, author_id=self.author, scope=self.scope, origin="model"
             )
         except KeyError:
             return {"status": "not_found", "category": category, "key": key, "scope": self.scope}
