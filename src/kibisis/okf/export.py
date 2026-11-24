@@ -51,6 +51,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -650,8 +651,90 @@ def _exchange_dirs(a: str, b: str) -> bool:
     raise OSError(err, os.strerror(err), a)
 
 
+#: Hidden names beside ``out``: a staged bundle (``.okf-stage-<pid>-…``) and, in the two-rename fallback,
+#: the previous bundle moved aside (``.okf-old-<pid>-<hex>.<out name>``). The pid names the export that owns
+#: it, so a later export can tell a killed run's leftovers from a concurrent run's live work.
+_STAGE_PREFIX = ".okf-stage-"
+_OLD_PREFIX = ".okf-old-"
+#: Leftovers from before pids were in the names are only swept once older than any gate may run (900 s).
+_LEGACY_STALE_SECONDS = 3600.0
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:  # PermissionError: alive, another user's
+        return True
+    return True
+
+
+def _leftover_owner(name: str, prefix: str) -> int:
+    """The pid in a leftover name, or -1 for a name from before pids were recorded."""
+    rest = name[len(prefix):]
+    head, sep, _tail = rest.partition("-")
+    if sep and head.isdigit():
+        return int(head)
+    return -1
+
+
+def _is_stale(path: Path, owner: int) -> bool:
+    if owner >= 0:
+        return owner != os.getpid() and not _pid_alive(owner)
+    try:
+        return time.time() - path.lstat().st_mtime > _LEGACY_STALE_SECONDS
+    except OSError:
+        return False
+
+
+def _sweep_stale_leftovers(out: Path) -> None:
+    """Clean up after an export of ``out`` that was killed (SIGKILL, power loss) part way.
+
+    A staged bundle left beside ``out`` holds rendered plaintext that may never have been gated: it
+    is removed. A previous bundle moved aside by the two-rename fallback is put back when ``out`` is
+    missing (the kill fell between the two renames) and removed otherwise. Only leftovers whose
+    owning process is gone are touched, never a directory a concurrent export is still using, and
+    never a symbolic link or a non-directory."""
+    parent = out.parent
+    try:
+        names = sorted(os.listdir(parent))
+    except OSError:
+        return
+    suffix = "." + out.name
+    for name in names:
+        if name.startswith(_STAGE_PREFIX):
+            prefix = _STAGE_PREFIX
+        elif name.startswith(_OLD_PREFIX):
+            prefix = _OLD_PREFIX
+        else:
+            continue
+        path = parent / name
+        if path.is_symlink() or not path.is_dir():
+            continue
+        owner = _leftover_owner(name, prefix)
+        if not _is_stale(path, owner):
+            continue
+        if prefix == _OLD_PREFIX and owner >= 0 and not name.endswith(suffix):
+            # Another output's previous bundle: removed only once that output is back in place.
+            other = name[len(prefix):].partition("-")[2].partition(".")[2]
+            if not other or not (parent / other).exists():
+                continue
+        elif prefix == _OLD_PREFIX and owner < 0 and not out.exists():
+            continue  # a pre-pid previous bundle while out is missing: whose it is is unknown; leave it
+        if prefix == _OLD_PREFIX and owner >= 0 and name.endswith(suffix) and not os.path.lexists(out):
+            try:
+                os.rename(path, out)  # the killed run had moved the previous bundle aside: restore it
+                continue
+            except OSError:
+                continue
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def _write_stage(parent: Path, files: Dict[str, str]) -> Path:
-    stage = Path(tempfile.mkdtemp(prefix=".okf-stage-", dir=str(parent)))
+    stage = Path(tempfile.mkdtemp(prefix="%s%d-" % (_STAGE_PREFIX, os.getpid()), dir=str(parent)))
     try:
         os.chmod(stage, 0o700)
         root = os.path.realpath(stage)
@@ -688,7 +771,7 @@ def _swap_into_place(stage: Path, out: Path, existed: bool) -> None:
     if _exchange_dirs(str(stage), str(out)):
         shutil.rmtree(stage, ignore_errors=True)  # the staging path now holds the previous bundle
         return
-    old = out.parent / (".okf-old-" + secrets.token_hex(8))
+    old = out.parent / ("%s%d-%s.%s" % (_OLD_PREFIX, os.getpid(), secrets.token_hex(8), out.name))
     os.rename(out, old)
     try:
         os.rename(stage, out)
@@ -776,6 +859,8 @@ def export_bundle(
         raise ExportError("profile must be an ExportProfile from load_profile or parse_profile")
     day = _log_day(at)
     out_path = Path(os.path.abspath(os.fspath(out)))
+    if out_path.parent.is_dir():
+        _sweep_stale_leftovers(out_path)  # a killed earlier export's stage (ungated plaintext) or set-aside bundle
     existed, prior_log = _prepare_out(out_path, require_digest=index_profile_digest)
 
     withheld: Counter = Counter()

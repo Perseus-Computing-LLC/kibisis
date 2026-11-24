@@ -525,6 +525,7 @@ class SearchRecallMixin:
         # write-invalidated caches follow. The record goes to Argus and to an in-process log.
         record = {**journal_meta, "scope": scope or "*", "actor": actor or "", "at": int(now)}
         self._recent_recalls.append(record)
+        # A recall is not a state change: its record is appended at once, whatever transaction is open.
         _argus_append("kibisis.memory_recall", actor or "kibisis", {**journal_meta, "scope": scope or "*"})
         return RecallResult(results=results, withheld=withheld, receipt=receipt)
 

@@ -520,16 +520,24 @@ class SQLiteMemoryVault(
         if passphrase:
             try:
                 self._was_keyed = self._has_meta_key("kdf_salt")  # written by an earlier open with a passphrase
-                salt = self._vault_salt()
-                if crypto_provider is None:
-                    self.crypto_provider = AESGCMCryptoEnvelopeProvider(salt=salt)
-                if self._prechecked_keys is not None and self._prechecked_keys[0] == salt:
-                    self._signing_key, self._digest_key, self._term_key = self._prechecked_keys[1]
-                else:
-                    self._signing_key, self._digest_key, self._term_key = derive_vault_keys(passphrase, salt)
-                self._prechecked_keys = None
-                self._keyed = True
-                self._upgrade_integrity()
+                # A vault that is not yet at the current integrity format (a new vault, or an older one
+                # being upgraded) is brought there in ONE transaction: the salt, the key derivation and
+                # every integrity record (key check, format, journal floor, meta MAC) commit together or
+                # not at all. Committed one by one, a kill in between (the PBKDF2 stretch is seconds of
+                # it) left a salt without a key check, which every later open refuses as tampered. A
+                # vault already at the current format is only checked, outside any write lock.
+                initialise = self._needs_keyed_initialisation()
+                with self._write_tx() if initialise else contextlib.nullcontext():
+                    salt = self._vault_salt()
+                    if crypto_provider is None:
+                        self.crypto_provider = AESGCMCryptoEnvelopeProvider(salt=salt)
+                    if self._prechecked_keys is not None and self._prechecked_keys[0] == salt:
+                        self._signing_key, self._digest_key, self._term_key = self._prechecked_keys[1]
+                    else:
+                        self._signing_key, self._digest_key, self._term_key = derive_vault_keys(passphrase, salt)
+                    self._prechecked_keys = None
+                    self._keyed = True
+                    self._upgrade_integrity()
                 # After the integrity records are checked: the stored quorum is one of the values the meta
                 # MAC covers, so it is adopted, compared or raised (and re-signed) only once the MAC held.
                 self._persist_verification_quorum()
@@ -556,6 +564,9 @@ class SQLiteMemoryVault(
                 self._adopt_converted(converted_temp, self.db_path)
                 self._connect(self.db_path, passphrase, memory_security)
         if on_disk:
+            # An erasure committed by an earlier process that died before its scrub finished is completed
+            # here, before this open hands the vault to anyone (the debt is recorded with the delete).
+            self._resume_owed_scrub()
             self._restrict_permissions()
 
     def _connect(self, path: str, passphrase: Optional[str], memory_security: bool) -> None:
@@ -895,22 +906,54 @@ class SQLiteMemoryVault(
         commit a tombstone or a review between the check and the insert. Every mutating method
         enters this first so check-then-write is atomic against other connections.
 
-        Nested use inside an open transaction yields a cursor and leaves commit and rollback to the
-        outermost block, so a compound operation (review, then re-write) stays one transaction.
+        Nested use inside an open transaction runs the block under a SAVEPOINT of the outer
+        transaction: when the block raises, everything it did is undone (``ROLLBACK TO``) before the
+        exception leaves it, so a caller that catches a refused nested write and carries on (an import
+        that refuses one entity) commits none of that write's partial effects; when the block finishes,
+        the savepoint is released and commit is left to the outermost block, so a compound operation
+        (review, then re-write) stays one transaction. Argus records queued by the block
+        (:func:`~kibisis._vault_audit._argus_append`) are appended only after the outermost commit,
+        and dropped with the savepoint or transaction that rolled back.
         """
         if getattr(self, "read_only", False):  # area C: a read-only open never writes
             raise ReadOnlyVaultError(f"vault {self.db_path} was opened read-only")
         if self._conn.in_transaction:
-            yield self._conn.cursor()
+            cursor = self._conn.cursor()
+            self.__dict__["_savepoint_seq"] = name_seq = self.__dict__.get("_savepoint_seq", 0) + 1
+            name = f"kibisis_sp_{name_seq}"
+            cursor.execute(f"SAVEPOINT {name}")
+            mark = len(self._argus_queue())
+            try:
+                yield cursor
+            except BaseException:
+                self._drop_argus(mark)
+                if self._conn.in_transaction:  # SQLite may already have rolled the whole transaction back
+                    with contextlib.suppress(sqlcipher3.Error):
+                        cursor.execute(f"ROLLBACK TO {name}")
+                        cursor.execute(f"RELEASE {name}")
+                raise
+            cursor.execute(f"RELEASE {name}")
             return
+        queued = self._argus_queue()
+        if queued:
+            # Left by a transaction that was not run through this method, whose outcome is unknown here:
+            # never mirrored, so the ledger cannot attest a change that may have rolled back.
+            logger.warning("%s: dropping %d Argus record(s) of a transaction of unknown outcome", self.db_path, len(queued))
+            self._drop_argus()
         cursor = self._conn.cursor()
         cursor.execute("BEGIN IMMEDIATE")
         try:
             yield cursor
         except BaseException:
+            self._drop_argus()
             self._conn.rollback()
             raise
-        self._conn.commit()
+        try:
+            self._conn.commit()
+        except BaseException:
+            self._drop_argus()
+            raise
+        self._flush_argus()
 
     @staticmethod
     def _migrate_file_to_sqlcipher(path: str, passphrase: str) -> str:
@@ -961,7 +1004,10 @@ class SQLiteMemoryVault(
     def _configure_db(self) -> None:
         if self.db_path != ":memory:":
             self._conn.execute("PRAGMA journal_mode = WAL")
-            self._conn.execute("PRAGMA synchronous = NORMAL")
+            # FULL: in WAL mode a commit is fsynced before it returns, so a write reported as committed
+            # (an AML Add's success, a review verdict, a tombstone) survives an OS crash or power loss.
+            # NORMAL only syncs at checkpoints, and a committed transaction could roll back.
+            self._conn.execute("PRAGMA synchronous = FULL")
         self._conn.execute("PRAGMA foreign_keys = ON")
 
     def _init_schema(self) -> None:
@@ -1189,6 +1235,14 @@ class SQLiteMemoryVault(
             return self._meta(key) is not None
         except sqlcipher3.OperationalError:
             return False  # no vault_meta table: the vault was never opened with a passphrase
+
+    def _needs_keyed_initialisation(self) -> bool:
+        """True when a keyed open will write integrity records: no key check yet (a new vault, or one
+        from before key checks) or an integrity format below the current one."""
+        try:
+            return self._meta("key_check") is None or self._integrity_format_record() < INTEGRITY_FORMAT
+        except sqlcipher3.OperationalError:
+            return True  # no vault_meta table yet
 
     def _refuse_foreign_database(self) -> None:
         """Refuse a SQLite file that holds tables but no ``entities`` table: another program's database,

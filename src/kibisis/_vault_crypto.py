@@ -341,6 +341,8 @@ class EntryIntegrityMixin:
                     refused += 1
                     continue
                 self._write_sealed(cursor, r, content, encrypt=True)
+            if rows:
+                self._owe_scrub(cursor)  # the old plaintext is erased by the scrub below, or by the next open
         self.scrub()
         return {"migrated": len(rows) - refused, "remaining_plaintext": self.encryption_status()["plaintext"]}
 
@@ -1326,6 +1328,8 @@ class EntryIntegrityMixin:
             self._set_meta(cursor, "integrity_format", 2)
             if opened or verified or self._sqlcipher_active or not was_keyed:
                 self._set_meta(cursor, "key_check", self._key_check_value())
+            if self.db_path != ":memory:":
+                self._owe_scrub(cursor)  # the replaced digests and envelopes: erased by the scrub below
         if counts["entries_left_unsigned"]:
             logger.warning(
                 "%s: %d entries have no signature and the file had no whole-file encryption, so they cannot "

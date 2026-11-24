@@ -155,10 +155,12 @@ class AdmissionReviewMixin:
             author_id=reviewer,
             metadata=payload,
         )
+        # Queued on the open transaction: appended to Argus after it commits, dropped if it rolls back.
         _argus_append(
             "kibisis.state_transition",
             reviewer or "kibisis",
             {**payload, "category": category, "key": key, "scope": scope},
+            vault=self,
         )
 
     def _record_edges(

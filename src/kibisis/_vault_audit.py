@@ -14,7 +14,7 @@ import logging
 import os
 import sqlite3
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .models import AuditEvent
 
@@ -43,7 +43,22 @@ def _argus_ledger_path() -> Optional[str]:
     return DEFAULT_ARGUS_LEDGER_PATH if os.path.exists(DEFAULT_ARGUS_LEDGER_PATH) else None
 
 
-def _argus_append(event_type: str, actor: str, payload: Dict[str, Any]) -> None:
+def _argus_append(event_type: str, actor: str, payload: Dict[str, Any], *, vault: Any = None) -> None:
+    """Mirror an event to the Argus ledger. Never raises.
+
+    With ``vault`` given and a transaction open on its connection, nothing is written yet: the record
+    is queued on the vault and appended only after that transaction commits, and dropped when it
+    rolls back (a refused write, or a nested write undone to its savepoint). The ledger therefore
+    never attests a change the vault did not make; a process killed between the commit and the
+    append leaves the change in the vault's own journal without its mirror (the journal is the
+    record of truth). Without a transaction the record is appended at once.
+    """
+    if vault is not None and vault._defer_argus(event_type, actor, payload):
+        return
+    _argus_write(event_type, actor, payload)
+
+
+def _argus_write(event_type: str, actor: str, payload: Dict[str, Any]) -> None:
     """Append through the argus_ledger library only, so the hash chain stays valid. Never raises."""
     path = _argus_ledger_path()
     if not path:
@@ -189,6 +204,37 @@ def verify_journal_rows(
 
 class AuditJournalMixin:
     """Appends, lists and verifies the vault's audit journal."""
+
+    # --- Argus mirror, after commit only ---------------------------------------------------------
+
+    def _argus_queue(self) -> List[Tuple[str, str, Dict[str, Any]]]:
+        """Argus records queued by the open write transaction (see :func:`_argus_append`)."""
+        return self.__dict__.setdefault("_argus_pending", [])
+
+    def _defer_argus(self, event_type: str, actor: str, payload: Dict[str, Any]) -> bool:
+        """Queue an Argus record while a transaction is open on this vault's connection; False when
+        none is open (the caller appends at once)."""
+        conn = getattr(self, "_conn", None)
+        try:
+            in_tx = bool(conn is not None and conn.in_transaction)
+        except Exception:  # a closed connection
+            in_tx = False
+        if not in_tx:
+            return False
+        self._argus_queue().append((event_type, actor, dict(payload)))
+        return True
+
+    def _drop_argus(self, mark: int = 0) -> None:
+        """Forget the Argus records queued since ``mark``: their transaction (or savepoint) rolled back."""
+        del self._argus_queue()[mark:]
+
+    def _flush_argus(self) -> None:
+        """Append the queued Argus records; runs once the transaction that queued them has committed."""
+        queue = self._argus_queue()
+        pending = list(queue)
+        queue.clear()
+        for event_type, actor, payload in pending:
+            _argus_write(event_type, actor, payload)
 
     def _record_audit_event(
         self,
