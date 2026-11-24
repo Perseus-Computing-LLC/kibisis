@@ -50,10 +50,8 @@ def _pid_alive(pid: int) -> bool:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    except PermissionError:
-        return True
-    except OSError:
-        return True
+    except OSError:  # PermissionError: alive, another user's
+        pass
     return True
 
 
