@@ -88,9 +88,13 @@ from ._vault_search import (  # noqa: F401  (re-exported)
     _SEARCH_STOPWORDS,
     _WORD,
     _bounded,
+    _fts_query,
+    _porter_stem,
     _search_terms,
     _snippet,
     _snippet_patterns,
+    _term_forms,
+    _term_whole_words,
     _within_bounds,
 )
 from ._vault_snapshot import SnapshotMixin

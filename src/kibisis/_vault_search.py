@@ -15,6 +15,7 @@ import logging
 import math
 import re
 import sqlite3
+import threading
 import time
 try:
     import sqlcipher3
@@ -123,9 +124,99 @@ def _search_terms(query: str, match: str) -> List[str]:
     return [w for w in content if len(w) > 1] or content
 
 
-def _fts_query(terms: Sequence[str], match: str) -> str:
+_STEM_LOCK = threading.Lock()
+_STEM_CONN: Optional[sqlite3.Connection] = None
+_STEM_CACHE: Dict[str, str] = {}
+_STEM_CACHE_MAX = 16384
+
+
+def _porter_stem(word: str) -> str:
+    """The stem of a single alphabetic word as SQLite FTS5's ``porter unicode61`` tokenizer folds it."""
+    global _STEM_CONN
+    low = word.lower()
+    if not low.isalpha():
+        return low
+    cached = _STEM_CACHE.get(low)
+    if cached is not None:
+        return cached
+    with _STEM_LOCK:
+        cached = _STEM_CACHE.get(low)
+        if cached is not None:
+            return cached
+        if _STEM_CONN is None:
+            _STEM_CONN = sqlite3.connect(":memory:", check_same_thread=False)
+            _STEM_CONN.execute("CREATE VIRTUAL TABLE p USING fts5(x, tokenize='porter unicode61')")
+            _STEM_CONN.execute("CREATE VIRTUAL TABLE pv USING fts5vocab(p, 'instance')")
+        _STEM_CONN.execute("DELETE FROM p")
+        _STEM_CONN.execute("INSERT INTO p (rowid, x) VALUES (1, ?)", (low,))
+        rows = _STEM_CONN.execute("SELECT term FROM pv").fetchall()
+        stem = str(rows[0][0]) if len(rows) == 1 else low
+        if len(_STEM_CACHE) >= _STEM_CACHE_MAX:
+            _STEM_CACHE.clear()
+        _STEM_CACHE[low] = stem
+        return stem
+
+
+def _term_forms(term: str, word_forms: bool = False) -> List[str]:
+    """Prefix forms of ``term`` for FTS5 query expansion when ``word_forms=True`` (unchanged when False)."""
+    if not word_forms or not term.isalpha():
+        return [term]
+    low = term.lower()
+    stem = _porter_stem(low)
+    if len(stem) >= 3 and len(stem) < len(low) and low.startswith(stem):
+        forms = [stem]
+    elif len(stem) >= 3 and stem != low:
+        forms = [low, stem]
+    else:
+        forms = [low]
+    if stem.endswith("i") and len(stem) >= 4:
+        yf = stem[:-1] + "y"
+        if yf not in forms:
+            forms.append(yf)
+    if stem.endswith("e") and len(stem) >= 4:
+        ing = stem[:-1] + "ing"
+        if _porter_stem(ing) == stem and ing not in forms:
+            forms.append(ing)
+    return forms
+
+
+def _term_whole_words(word: str, word_forms: bool = False) -> List[str]:
+    """Whole-word inflections sharing ``word``'s Porter stem, for the keyed term index when ``word_forms=True``."""
+    if not word_forms or not word.isalpha():
+        return [word]
+    low = word.lower()
+    stem = _porter_stem(low)
+    if len(stem) < 3:
+        return [low]
+    candidates: List[str] = [low, stem]
+    if stem.endswith("i") and len(stem) >= 4:
+        base_y = stem[:-1] + "y"
+        candidates.extend([base_y, stem + "es", stem + "ed", base_y + "ing"])
+    elif stem.endswith("e") and len(stem) >= 4:
+        candidates.extend([stem + "s", stem + "d", stem[:-1] + "ing"])
+    else:
+        candidates.extend([
+            stem + "s", stem + "es", stem + "ed", stem + "ing",
+            stem + "e", stem + "es", stem + "ed",
+        ])
+        if stem[-1] not in "aeiouy":
+            candidates.extend([stem + stem[-1] + "ed", stem + stem[-1] + "ing"])
+    out: List[str] = []
+    for cand in candidates:
+        if cand not in out and (cand == low or _porter_stem(cand) == stem):
+            out.append(cand)
+    return out
+
+
+def _fts_query(terms: Sequence[str], match: str, word_forms: bool = False) -> str:
     """The FTS5 query for search terms: each a quoted prefix phrase, any of them or all of them."""
-    return (" OR " if match == "any" else " ").join('"' + t.replace('"', '""') + '"*' for t in terms)
+    if not word_forms:
+        return (" OR " if match == "any" else " ").join('"' + t.replace('"', '""') + '"*' for t in terms)
+    clauses: List[str] = []
+    for t in terms:
+        parts = ['"' + f.replace('"', '""') + '"*' for f in _term_forms(t, True)]
+        clauses.append(parts[0] if len(parts) == 1 else "(" + " OR ".join(parts) + ")")
+    return (" OR " if match == "any" else " AND ").join(clauses)
 
 
 def _bounded(
@@ -155,10 +246,11 @@ def _within_bounds(
     return True
 
 
-def _snippet_patterns(terms: Sequence[str]) -> Optional[Tuple[Any, Any]]:
+def _snippet_patterns(terms: Sequence[str], word_forms: bool = False) -> Optional[Tuple[Any, Any]]:
     """Patterns for :func:`_snippet`, built once per search: where a query term begins a word (as FTS5
     prefix queries match), and the whole whitespace-separated word around such a place."""
-    prefixes = sorted({w.lower() for term in terms for w in _WORD.findall(term)}, key=len, reverse=True)
+    expanded = [f for t in terms for f in _term_forms(t, word_forms)] if word_forms else list(terms)
+    prefixes = sorted({w.lower() for term in expanded for w in _WORD.findall(term)}, key=len, reverse=True)
     if not prefixes:
         return None
     alternatives = "|".join(map(re.escape, prefixes))
@@ -200,13 +292,15 @@ class SearchRecallMixin:
         principal_id: Optional[str] = None,
         authorized_lineage_roots: Optional[List[str]] = None,
         match: str = "all",
+        word_forms: bool = False,
     ) -> List[SearchResult]:
         """Entries that match ``query``, best first by BM25 (``rank_score``: lower is better).
 
         ``match="all"`` (the default) wants every word of the query. ``match="any"`` wants at least one and
         leaves out common words such as "what" and "the": use it for questions in natural language. A word
         also matches longer words that start with it, except in a vault with a passphrase whose file is not
-        SQLCipher-encrypted, which matches whole words only (below).
+        SQLCipher-encrypted, which matches whole words only (below). ``word_forms=True`` (off by default)
+        also expands each query word through its Porter stem so inflected forms such as "tanks" find "tank".
 
         A vault with a passphrase ranks its sealed entries with the scores a plaintext vault would give
         them. With SQLCipher it searches an index of entry terms kept inside the encrypted file. Without
@@ -216,11 +310,11 @@ class SearchRecallMixin:
         """
         terms, rows = self._ranked_rows(
             query, category, limit, scope, epistemic_state, as_of_valid_time, include_unverified, active_only,
-            match, _ENTITY_COLUMNS, snippets=True,
+            match, _ENTITY_COLUMNS, snippets=True, word_forms=word_forms,
         )
         bounded = _bounded(tenant_id, principal_id, authorized_lineage_roots)
         results: List[SearchResult] = []
-        patterns = _snippet_patterns(terms) if any(snip is None for _, _, snip in rows) else None
+        patterns = _snippet_patterns(terms, word_forms=word_forms) if any(snip is None for _, _, snip in rows) else None
         for r, score, snip in rows:
             if bounded and not _within_bounds(r, tenant_id, principal_id, authorized_lineage_roots):
                 continue  # outside the caller's tenant, principal or lineage: never opened
@@ -254,6 +348,7 @@ class SearchRecallMixin:
         recency_boost_bp: int = DEFAULT_RECENCY_BOOST_BP,
         recency_half_life_days: float = DEFAULT_RECENCY_HALF_LIFE_DAYS,
         withheld_digest_chars: int = 0,
+        word_forms: bool = False,
     ) -> RecallResult:
         """Model-facing recall: :meth:`search` plus what was withheld and why, with a receipt (K-R3..K-R5).
 
@@ -301,7 +396,7 @@ class SearchRecallMixin:
         # depend on how many the caller asked for. Entries are opened further down, a few of them.
         fts_terms, ranked = self._ranked_rows(
             query, category, _EVERY_MATCH, scope, epistemic_state, as_of_valid_time, True, active_only, match,
-            _GATE_COLUMNS, snippets=False,
+            _GATE_COLUMNS, snippets=False, word_forms=word_forms,
         )
         if _bounded(tenant_id, principal_id, authorized_lineage_roots):
             # Outside the caller's tenant, principal or lineage: not a match, and never opened.
@@ -328,7 +423,7 @@ class SearchRecallMixin:
         # evidence that any one of them answers the query: every z is 0 and the default gate drops them.
         use_z = n >= 4
         # Per query word, the ids the index matches it in (None: every match holds it).
-        term_ids = self._coverage_sets(terms, match, scope) if n else []
+        term_ids = self._coverage_sets(terms, match, scope, word_forms=word_forms) if n else []
 
         metas: Dict[int, Dict[str, Any]] = {}
 
@@ -346,7 +441,7 @@ class SearchRecallMixin:
             need = [i for i in positions if i not in opened]
             if not need:
                 return
-            full = self._full_rows([rows[i]["id"] for i in need], _fts_query(fts_terms, match))
+            full = self._full_rows([rows[i]["id"] for i in need], _fts_query(fts_terms, match, word_forms=word_forms))
             for i in need:
                 got = full.get(rows[i]["id"])
                 content = self._readable_content(got[0]) if got is not None else None
@@ -450,7 +545,7 @@ class SearchRecallMixin:
                     continue
                 row, content, snip = got
                 if snip is None:
-                    patterns = patterns or _snippet_patterns(fts_terms)
+                    patterns = patterns or _snippet_patterns(fts_terms, word_forms=word_forms)
                     snip = _snippet(content, patterns)
                 results.append(SearchResult(
                     entity=self._entity(row, content), rank_score=scores[i] * boost.get(i, 1.0), snippet=str(snip)
@@ -546,7 +641,9 @@ class SearchRecallMixin:
             return "scan"
         return "plain"
 
-    def _coverage_sets(self, terms: Sequence[str], match: str, scope: Optional[str]) -> List[Optional[set]]:
+    def _coverage_sets(
+        self, terms: Sequence[str], match: str, scope: Optional[str], word_forms: bool = False
+    ) -> List[Optional[set]]:
         """For each query word of the recall gate, the ids of the entries the search index matches it in,
         or None when every match holds the word and nothing needs looking up.
 
@@ -562,7 +659,7 @@ class SearchRecallMixin:
         mode = self._search_mode()
         sets: List[Optional[set]] = []
         for term in terms:
-            fts_query = _fts_query([term], "any")
+            fts_query = _fts_query([term], "any", word_forms=word_forms)
             if mode == "index":
                 found = self._conn.execute(
                     "SELECT rowid FROM entities_search WHERE entities_search MATCH ?", (fts_query,)
@@ -575,10 +672,13 @@ class SearchRecallMixin:
                         f"JOIN entities_terms t{k} ON t{k}.id = t0.id AND t{k}.pos = t0.pos + {k} AND t{k}.token = ?"
                         for k in range(1, len(phrase))
                     )
-                    tokens = [self._term_token(target_scope, word) for word in phrase]
+                    head_words = _term_whole_words(phrase[0], word_forms) if len(phrase) == 1 else [phrase[0]]
+                    head_tokens = [self._term_token(target_scope, w) for w in head_words]
+                    tail_tokens = [self._term_token(target_scope, word) for word in phrase[1:]]
+                    marks = ", ".join("?" for _ in head_tokens)
                     found = self._conn.execute(
-                        f"SELECT DISTINCT t0.id FROM entities_terms t0 {joins} WHERE t0.token = ?",
-                        [*tokens[1:], tokens[0]],
+                        f"SELECT DISTINCT t0.id FROM entities_terms t0 {joins} WHERE t0.token IN ({marks})",
+                        [*tail_tokens, *head_tokens],
                     ).fetchall()
             elif mode == "scan":
                 found = self._scan_index().execute("SELECT rowid FROM m WHERE m MATCH ?", (fts_query,)).fetchall()
@@ -644,6 +744,7 @@ class SearchRecallMixin:
         principal_id: Optional[str] = None,
         authorized_lineage_roots: Optional[List[str]] = None,
         match: str = "all",
+        word_forms: bool = False,
     ) -> List[SearchHit]:
         """Keys and scores of the entries :meth:`search` returns, best first, without opening any entry.
 
@@ -657,7 +758,7 @@ class SearchRecallMixin:
         """
         _, rows = self._ranked_rows(
             query, category, limit, scope, epistemic_state, as_of_valid_time, include_unverified, active_only,
-            match, _HIT_COLUMNS, snippets=False,
+            match, _HIT_COLUMNS, snippets=False, word_forms=word_forms,
         )
         bounded = _bounded(tenant_id, principal_id, authorized_lineage_roots)
         return [
@@ -679,6 +780,7 @@ class SearchRecallMixin:
         match: str,
         columns: str,
         snippets: bool,
+        word_forms: bool = False,
     ) -> Tuple[List[str], List[Tuple[Any, float, Optional[str]]]]:
         """Query words and ranked ``(row, score, snippet)`` rows for search, reading ``columns`` of each row."""
         if match not in ("all", "any"):
@@ -686,7 +788,7 @@ class SearchRecallMixin:
         terms = _search_terms(query, match)
         if not terms:
             return terms, []
-        fts_query = _fts_query(terms, match)
+        fts_query = _fts_query(terms, match, word_forms=word_forms)
         # Normalize scope: None or empty string defaults to "default"
         target_scope = "default" if scope is None or scope == "" else scope
         filter_sql, filter_params = self._search_filters(
@@ -696,7 +798,7 @@ class SearchRecallMixin:
         if mode == "index":
             rows = self._indexed_rows(fts_query, filter_sql, filter_params, limit, columns)
         elif mode == "terms":
-            rows = self._term_rows(terms, match, target_scope, filter_sql, filter_params, limit, columns)
+            rows = self._term_rows(terms, match, target_scope, filter_sql, filter_params, limit, columns, word_forms=word_forms)
         elif mode == "scan":
             rows = self._scanned_rows(fts_query, filter_sql, filter_params, limit, columns)
         else:
@@ -805,6 +907,7 @@ class SearchRecallMixin:
         params: List[Any],
         limit: int,
         columns: str = _ENTITY_COLUMNS,
+        word_forms: bool = False,
     ) -> List[Tuple[Any, float, Optional[str]]]:
         """Ranked rows from the keyed term index (:meth:`_ensure_term_index`): a vault with a passphrase
         whose file is not SQLCipher-encrypted.
@@ -845,18 +948,21 @@ class SearchRecallMixin:
             n_hit = 0
             found: Dict[int, Tuple[int, int]] = {}
             for scope in scopes:
-                tokens = [self._term_token(scope, word) for word in phrase]
+                head_words = _term_whole_words(phrase[0], word_forms) if len(phrase) == 1 else [phrase[0]]
+                head_tokens = [self._term_token(scope, w) for w in head_words]
+                tail_tokens = [self._term_token(scope, word) for word in phrase[1:]]
+                marks = ", ".join("?" for _ in head_tokens)
                 n_hit += self._conn.execute(
-                    f"SELECT count(DISTINCT t0.id) FROM entities_terms t0 {joins} WHERE t0.token = ?",
-                    [*tokens[1:], tokens[0]],
+                    f"SELECT count(DISTINCT t0.id) FROM entities_terms t0 {joins} WHERE t0.token IN ({marks})",
+                    [*tail_tokens, *head_tokens],
                 ).fetchone()[0]
                 if scope not in searched:
                     continue
                 for row in self._conn.execute(
                     f"SELECT t0.id, count(*), d.ntok FROM entities_terms t0 {joins} "
                     f"JOIN entities_terms_docs d ON d.id = t0.id JOIN entities e ON e.id = t0.id "
-                    f"WHERE t0.token = ? AND {filter_sql} GROUP BY t0.id",
-                    [*tokens[1:], tokens[0], *params],
+                    f"WHERE t0.token IN ({marks}) AND {filter_sql} GROUP BY t0.id",
+                    [*tail_tokens, *head_tokens, *params],
                 ):
                     found[row[0]] = (row[1], row[2])
             idf = math.log((n_row - n_hit + 0.5) / (n_hit + 0.5))
