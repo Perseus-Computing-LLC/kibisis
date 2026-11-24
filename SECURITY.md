@@ -182,8 +182,9 @@ also stored in plain text.
   labels on disk are integrity-protected only by file permissions (`_restrict_permissions`, lease.py,
   sets mode 0600).
 - *Rolling back the whole file.* An older copy of the file carries an older but valid head MAC. Nothing in
-  the vault detects that. The Argus mirror (`_argus_append`, _vault_audit.py) records state transitions, not
-  the journal head, so it does not catch a rollback either; only a copy of the head's sequence and hash kept
+  the vault detects that. The Argus mirror (`_argus_append`, _vault_audit.py) records state transitions (appended
+  only after the vault transaction that made them commits; a killed process can leave a committed transition
+  without its mirror, never a mirror without the transition), not the journal head, so it does not catch a rollback either; only a copy of the head's sequence and hash kept
   outside the file would.
 - *Deleting the file.*
 - *Deleting the whole journal together with its head, and the integrity record.* `journal_anchored` under
@@ -385,4 +386,7 @@ in one of two reduced modes. `_ranked_rows` () picks the search path:
 In the middle row with `term_index=False`, the search index lives in a `:memory:` SQLite connection; it is
 as exposed as the rest of the process's memory and no more. In every mode, words (or tokens) of deleted or
 replaced entries stay in index pages and free pages until `scrub()` () rebuilds the index and vacuums;
-the MCP server's `forget` runs it, the library does not run it for you.
+the MCP server's `forget` runs it, the library does not run it for you after a `tombstone()`. A tombstone
+that deletes content (and `migrate_plaintext`) records in its own transaction that a scrub is owed; the
+record is cleared only once a scrub has finished, so if the process stops in between, the next writable
+open runs the scrub before it returns.

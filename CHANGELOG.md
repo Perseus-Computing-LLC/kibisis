@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Crash consistency of writes.** State transitions are mirrored to the Argus ledger only after the vault
+  transaction commits, and never for a write that rolled back or was refused. A nested write that is refused
+  inside a larger one (a protected entry during a snapshot import) now undoes its own partial changes.
+- **First open with a passphrase.** Creating the key salt, deriving the keys and writing the integrity
+  records (or upgrading an older vault to the current format) happen in one transaction, so an open
+  interrupted part way no longer leaves a file every later open refuses as tampered.
+- **Forget and erasure.** A delete that promises a scrub records that debt in the same transaction; if the
+  process stops before the scrub finishes, the next writable open completes it.
+- **Durable commits.** File vaults run with `synchronous = FULL`: a write reported as committed (an AML
+  Add's acknowledgement included) survives an OS crash or power loss. Writes are somewhat slower.
+- **Key files.** `python -m kibisis.keys` writes the key under a temporary name and links it into place, so
+  an interrupted run never leaves an empty key file; an empty key file named by `KIBISIS_PASSPHRASE_FILE`
+  is now an error rather than "no key".
+- **OKF export leftovers.** An export killed part way no longer leaves its staged (possibly ungated)
+  bundle beside the output for good: the next export removes it, and puts back a previous bundle the killed
+  run had moved aside.
+
 ## [0.1.0-alpha.17] - 2026-11-10
 
 ### Security

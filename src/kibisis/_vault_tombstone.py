@@ -20,10 +20,13 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import time
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 from ._vault_crypto import value_digests
+
+logger = logging.getLogger("kibisis.vault")
 
 #: How a refused forget names the class of the entry it would have deleted (K-R1 classes above a requester).
 _WRITTEN_BY = {
@@ -469,7 +472,13 @@ class TombstoneMixin:
                     "entry_deleted": bool(target is not None and target_matches),
                 },
             )
-            self._purge_value_copies(cursor, scope, val_hash, can_hash, author_id, f"{category}:{key}", copies=copies)
+            purged_copies = self._purge_value_copies(
+                cursor, scope, val_hash, can_hash, author_id, f"{category}:{key}", copies=copies
+            )
+            if purged_copies or (target is not None and target_matches):
+                # Deleted text stays in index segments and free pages until a scrub; the debt commits
+                # with the delete, so a process killed before its scrub leaves it for the next open.
+                self._owe_scrub(cursor)
             return plain_exact
 
     def lift_tombstone(
@@ -624,6 +633,42 @@ class TombstoneMixin:
         cursor.execute(query_sql, params)
         return [dict(r) for r in cursor.fetchall()]
 
+    #: One row while an erasure is owed: written in the transaction that deleted the content, removed
+    #: only after the scrub that erases it has finished, so a process killed in between leaves the debt
+    #: on disk and the next writable open pays it (:meth:`_resume_owed_scrub`).
+    _SCRUB_DEBT_TABLE = "pending_scrub"
+
+    def _owe_scrub(self, cursor: Any) -> None:
+        """Record, inside the caller's write transaction, that deleted content still has to be scrubbed."""
+        cursor.execute(
+            f"CREATE TABLE IF NOT EXISTS {self._SCRUB_DEBT_TABLE} "
+            "(id INTEGER PRIMARY KEY CHECK (id = 1), requested_at REAL NOT NULL)"
+        )
+        cursor.execute(f"INSERT OR REPLACE INTO {self._SCRUB_DEBT_TABLE} (id, requested_at) VALUES (1, ?)", (time.time(),))
+
+    def scrub_owed(self) -> bool:
+        """True when an erasure was committed and the scrub that completes it has not finished yet."""
+        conn = self._conn
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (self._SCRUB_DEBT_TABLE,)
+        ).fetchone():
+            return False
+        return conn.execute(f"SELECT 1 FROM {self._SCRUB_DEBT_TABLE} WHERE id = 1").fetchone() is not None
+
+    def _resume_owed_scrub(self) -> None:
+        """At a writable open: finish the scrub an earlier process committed to and did not complete
+        (killed between the delete and the end of :meth:`scrub`). A failure is logged and the debt kept
+        for the next open; the open itself goes on."""
+        if getattr(self, "read_only", False) or self.db_path == ":memory:":
+            return
+        try:
+            if not self.scrub_owed():
+                return
+            logger.warning("%s: an earlier erasure did not finish its scrub; scrubbing now", self.db_path)
+            self.scrub()
+        except Exception as exc:  # noqa: BLE001 - the debt stays recorded; the next open retries
+            logger.warning("%s: the owed scrub did not complete (%s); it is retried at the next open", self.db_path, exc)
+
     def scrub(self) -> None:
         """Remove deleted or replaced content from the search indexes, the write-ahead log and free pages.
 
@@ -631,7 +676,17 @@ class TombstoneMixin:
         vault's entry index is rebuilt from its decrypted entries), and the write-ahead log and free
         pages keep old bytes until a checkpoint and VACUUM. Run after a delete (the MCP server's
         forget does) or after migrating plaintext.
+
+        Crash safety: a tombstone that deletes content (and every other erasure that promises a
+        scrub) records the debt in its own transaction; it is cleared only after the VACUUM and the
+        final checkpoint here, so a process killed before then leaves it, and the next writable open
+        runs the scrub. Called inside an open write transaction, nothing can be vacuumed yet: the debt
+        is recorded in that transaction and paid by the next scrub after it commits (at the latest,
+        the next open).
         """
+        if self._conn.in_transaction:
+            self._owe_scrub(self._conn.cursor())
+            return
         self._conn.execute("INSERT INTO entities_fts(entities_fts) VALUES ('rebuild')")
         self._conn.execute("INSERT INTO entities_fts(entities_fts) VALUES ('optimize')")
         self._conn.commit()
@@ -641,4 +696,10 @@ class TombstoneMixin:
             self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             self._conn.execute("VACUUM")
             self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        if self.scrub_owed():
+            with self._write_tx() as cursor:  # paid: the erased bytes are gone from the file and the WAL
+                cursor.execute(f"DELETE FROM {self._SCRUB_DEBT_TABLE}")
+            if self.db_path != ":memory:":
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        if self.db_path != ":memory:":
             self._restrict_permissions()
