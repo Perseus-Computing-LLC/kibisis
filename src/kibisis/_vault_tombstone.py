@@ -635,30 +635,60 @@ class TombstoneMixin:
 
     #: One row while an erasure is owed: written in the transaction that deleted the content, removed
     #: only after the scrub that erases it has finished, so a process killed in between leaves the debt
-    #: on disk and the next writable open pays it (:meth:`_resume_owed_scrub`).
+    #: on disk and the next writable open pays it (:meth:`_resume_owed_scrub`). Its ``generation`` goes
+    #: up with every erasure that records the debt; a scrub clears the row only if the generation is
+    #: still the one it saw before it started, so an erasure committed by another connection while the
+    #: scrub ran keeps its debt.
     _SCRUB_DEBT_TABLE = "pending_scrub"
+
+    def _ensure_scrub_debt_table(self, cursor: Any) -> None:
+        """Create the debt table, or add the ``generation`` column to one an earlier release created
+        (its row, if any, reads as generation 0). Runs inside the caller's write transaction."""
+        cursor.execute(
+            f"CREATE TABLE IF NOT EXISTS {self._SCRUB_DEBT_TABLE} "
+            "(id INTEGER PRIMARY KEY CHECK (id = 1), requested_at REAL NOT NULL, generation INTEGER NOT NULL DEFAULT 0)"
+        )
+        columns = {row[1] for row in cursor.execute(f"PRAGMA table_info({self._SCRUB_DEBT_TABLE})").fetchall()}
+        if "generation" not in columns:
+            cursor.execute(f"ALTER TABLE {self._SCRUB_DEBT_TABLE} ADD COLUMN generation INTEGER NOT NULL DEFAULT 0")
 
     def _owe_scrub(self, cursor: Any) -> None:
         """Record, inside the caller's write transaction, that deleted content still has to be scrubbed."""
+        self._ensure_scrub_debt_table(cursor)
+        now = time.time()
         cursor.execute(
-            f"CREATE TABLE IF NOT EXISTS {self._SCRUB_DEBT_TABLE} "
-            "(id INTEGER PRIMARY KEY CHECK (id = 1), requested_at REAL NOT NULL)"
+            f"INSERT OR IGNORE INTO {self._SCRUB_DEBT_TABLE} (id, requested_at, generation) VALUES (1, ?, 0)", (now,)
         )
-        cursor.execute(f"INSERT OR REPLACE INTO {self._SCRUB_DEBT_TABLE} (id, requested_at) VALUES (1, ?)", (time.time(),))
+        cursor.execute(
+            f"UPDATE {self._SCRUB_DEBT_TABLE} SET requested_at = ?, generation = generation + 1 WHERE id = 1", (now,)
+        )
 
-    def scrub_owed(self) -> bool:
-        """True when an erasure was committed and the scrub that completes it has not finished yet."""
+    def _scrub_debt_mark(self) -> Optional[Tuple[int, float]]:
+        """The recorded debt as ``(generation, requested_at)``, or None when no scrub is owed (reads
+        only). Any erasure recorded since changes it (an earlier release's writer, which knows no
+        generation, still changes the time)."""
         conn = self._conn
         if not conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (self._SCRUB_DEBT_TABLE,)
         ).fetchone():
-            return False
-        return conn.execute(f"SELECT 1 FROM {self._SCRUB_DEBT_TABLE} WHERE id = 1").fetchone() is not None
+            return None
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({self._SCRUB_DEBT_TABLE})").fetchall()}
+        generation = "generation" if "generation" in columns else "0"  # no column: recorded by an earlier release
+        row = conn.execute(
+            f"SELECT {generation}, requested_at FROM {self._SCRUB_DEBT_TABLE} WHERE id = 1"
+        ).fetchone()
+        return None if row is None else (int(row[0]), row[1])
+
+    def scrub_owed(self) -> bool:
+        """True when an erasure was committed and the scrub that completes it has not finished yet."""
+        return self._scrub_debt_mark() is not None
 
     def _resume_owed_scrub(self) -> None:
         """At a writable open: finish the scrub an earlier process committed to and did not complete
         (killed between the delete and the end of :meth:`scrub`). A failure is logged and the debt kept
-        for the next open; the open itself goes on."""
+        for the next open; the open itself goes on, with its connection outside any transaction (a
+        connection handed out inside a failed scrub's transaction would turn every later write into a
+        savepoint that is never committed). Should the transaction not roll back, the open fails."""
         if getattr(self, "read_only", False) or self.db_path == ":memory:":
             return
         try:
@@ -667,6 +697,7 @@ class TombstoneMixin:
             logger.warning("%s: an earlier erasure did not finish its scrub; scrubbing now", self.db_path)
             self.scrub()
         except Exception as exc:  # noqa: BLE001 - the debt stays recorded; the next open retries
+            self._leave_failed_transaction()  # scrub() already did; raises if it cannot be rolled back
             logger.warning("%s: the owed scrub did not complete (%s); it is retried at the next open", self.db_path, exc)
 
     def scrub(self) -> None:
@@ -679,27 +710,41 @@ class TombstoneMixin:
 
         Crash safety: a tombstone that deletes content (and every other erasure that promises a
         scrub) records the debt in its own transaction; it is cleared only after the VACUUM and the
-        final checkpoint here, so a process killed before then leaves it, and the next writable open
-        runs the scrub. Called inside an open write transaction, nothing can be vacuumed yet: the debt
-        is recorded in that transaction and paid by the next scrub after it commits (at the latest,
-        the next open).
+        final checkpoint here, and only the debt this scrub covers: one recorded (by any connection)
+        after this scrub read it stays owed. A process killed before then leaves it, and the next
+        writable open runs the scrub. Called inside an open write transaction, nothing can be vacuumed
+        yet: the debt is recorded in that transaction and paid by the next scrub after it commits (at
+        the latest, the next open). When any step fails (a busy lock, a full disk), whatever
+        transaction the scrub had open is rolled back before the error is raised, so the connection
+        is never left inside it.
         """
         if self._conn.in_transaction:
             self._owe_scrub(self._conn.cursor())
             return
-        self._conn.execute("INSERT INTO entities_fts(entities_fts) VALUES ('rebuild')")
-        self._conn.execute("INSERT INTO entities_fts(entities_fts) VALUES ('optimize')")
-        self._conn.commit()
-        if self._search_index or self._term_index:
-            self._rebuild_search_index()
-        if self.db_path != ":memory:":
-            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            self._conn.execute("VACUUM")
-            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        if self.scrub_owed():
-            with self._write_tx() as cursor:  # paid: the erased bytes are gone from the file and the WAL
-                cursor.execute(f"DELETE FROM {self._SCRUB_DEBT_TABLE}")
+        covered = self._scrub_debt_mark()  # the debt this scrub pays: the one recorded before it starts
+        try:
+            self._conn.execute("INSERT INTO entities_fts(entities_fts) VALUES ('rebuild')")
+            self._conn.execute("INSERT INTO entities_fts(entities_fts) VALUES ('optimize')")
+            self._conn.commit()
+            if self._search_index or self._term_index:
+                self._rebuild_search_index()
             if self.db_path != ":memory:":
                 self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                self._conn.execute("VACUUM")
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            if self.scrub_owed() and covered is not None:
+                with self._write_tx() as cursor:  # paid: the erased bytes are gone from the file and the WAL
+                    self._ensure_scrub_debt_table(cursor)
+                    # Compare and clear: an erasure committed since ``covered`` was read changed the
+                    # mark, and its bytes may have been written after the VACUUM; it stays owed.
+                    cursor.execute(
+                        f"DELETE FROM {self._SCRUB_DEBT_TABLE} WHERE id = 1 AND generation = ? AND requested_at = ?",
+                        covered,
+                    )
+                if self.db_path != ":memory:":
+                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except BaseException:
+            self._leave_failed_transaction()
+            raise
         if self.db_path != ":memory:":
             self._restrict_permissions()

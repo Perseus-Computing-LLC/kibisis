@@ -28,9 +28,12 @@ field-map key, or a key the vault owns (:func:`is_vault_owned_key`), is never wr
 ``okf_extra`` cannot add a stamp, a state, an identity or a lineage mark to a concept. A malformed ``okf_extra`` (not a
 JSON object, or a non-finite number) withholds the row as ``render_error``.
 
-The bundle is written to a fresh staging directory beside ``out`` and moved into place by rename, or,
+The bundle is written to a fresh staging directory beside ``out`` (every file and directory fsynced) and
+moved into place by rename, or,
 when ``out`` already holds a bundle, by one exchange call (renameat2 / renamex_np) so ``out`` never
-goes missing; other platforms fall back to two renames.
+goes missing; other platforms fall back to two renames. The parent directory is fsynced before the
+previous bundle is deleted. A run killed part way leaves locked-name leftovers the next export into the
+same directory removes (``_sweep_stale_leftovers``).
 ``out`` must be absent, empty, or a bundle this exporter wrote; anything else is refused untouched.
 The library refuses to write without a gate choice: ``row_gate``, ``bundle_gate`` or an explicit
 ``ungated=True`` (synthetic fixtures).
@@ -50,7 +53,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -58,6 +60,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
+from .. import _atomic
 from .frontmatter import FrontmatterError, parse_frontmatter, render_document, split_document
 from ..vault import RESERVED_METADATA_KEYS, RESERVED_METADATA_PREFIX
 from .profile import ExportProfile
@@ -651,25 +654,23 @@ def _exchange_dirs(a: str, b: str) -> bool:
     raise OSError(err, os.strerror(err), a)
 
 
-#: Hidden names beside ``out``: a staged bundle (``.okf-stage-<pid>-…``) and, in the two-rename fallback,
-#: the previous bundle moved aside (``.okf-old-<pid>-<hex>.<out name>``). The pid names the export that owns
-#: it, so a later export can tell a killed run's leftovers from a concurrent run's live work.
+#: Hidden names beside ``out``: a staged bundle (``.okf-stage-<pid>-<16 hex>.<out name>``) and, in the
+#: two-rename fallback, the previous bundle moved aside (``.okf-old-<pid>-<16 hex>.<out name>``). The name
+#: carries the exact name of the output it belongs to; the pid is informational only. The export that
+#: made one holds an exclusive lock on it for as long as it may still need it (:mod:`kibisis._atomic`),
+#: so a later export tells a killed run's leftovers from a concurrent run's live work by that lock,
+#: never by a pid (a container's pid 1 on every run, or a reused pid).
 _STAGE_PREFIX = ".okf-stage-"
 _OLD_PREFIX = ".okf-old-"
-#: Leftovers from before pids were in the names are only swept once older than any gate may run (900 s).
+#: Leftovers named by earlier releases (no lock) are swept by their pid, and once older than any gate
+#: may run (900 s) whatever their pid says.
 _LEGACY_STALE_SECONDS = 3600.0
+#: What follows the prefix in a name this release writes: ``<pid>-<16 hex>.<out name>``.
+_LEFTOVER_NAME = re.compile(r"([0-9]+)-([0-9a-f]{16})\.(.+)\Z", re.S)
 
 
 def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return True
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:  # PermissionError: alive, another user's
-        return True
-    return True
+    return _atomic.pid_alive(pid)
 
 
 def _leftover_owner(name: str, prefix: str) -> int:
@@ -681,60 +682,97 @@ def _leftover_owner(name: str, prefix: str) -> int:
     return -1
 
 
-def _is_stale(path: Path, owner: int) -> bool:
-    if owner >= 0:
-        return owner != os.getpid() and not _pid_alive(owner)
+def _leftover_output(name: str, prefix: str) -> Optional[str]:
+    """The exact output name a leftover this release wrote belongs to, or None for any other name."""
+    match = _LEFTOVER_NAME.match(name[len(prefix):])
+    return match.group(3) if match else None
+
+
+def _leftover_name(prefix: str, out: Path) -> str:
+    return "%s%d-%s.%s" % (prefix, os.getpid(), secrets.token_hex(8), out.name)
+
+
+def _legacy_stage_abandoned(path: Path, owner: int) -> bool:
+    """Whether a stage named by an earlier release (which held no lock) is a killed run's leftover."""
     try:
-        return time.time() - path.lstat().st_mtime > _LEGACY_STALE_SECONDS
+        if time.time() - path.lstat().st_mtime > _LEGACY_STALE_SECONDS:
+            return True
     except OSError:
         return False
+    if owner < 0:
+        return False
+    # This release never writes such a name, so one with this process's own pid is an earlier
+    # process's that had the same pid (a container's pid 1), not work in progress here.
+    return owner == os.getpid() or not _pid_alive(owner)
 
 
 def _sweep_stale_leftovers(out: Path) -> None:
-    """Clean up after an export of ``out`` that was killed (SIGKILL, power loss) part way.
+    """Clean up after an export that was killed (SIGKILL, power loss) part way.
 
-    A staged bundle left beside ``out`` holds rendered plaintext that may never have been gated: it
-    is removed. A previous bundle moved aside by the two-rename fallback is put back when ``out`` is
-    missing (the kill fell between the two renames) and removed otherwise. Only leftovers whose
-    owning process is gone are touched, never a directory a concurrent export is still using, and
-    never a symbolic link or a non-directory."""
+    A staged bundle is only ever a copy (rendered plaintext that may never have been gated, or, after
+    the exchange, the superseded previous bundle): every abandoned one in the parent is removed. A
+    previous bundle moved aside by the two-rename fallback may be its output's only copy: one whose
+    name says it belongs to exactly ``out`` is put back when ``out`` is missing (the kill fell between
+    the two renames) and removed when ``out`` is in place; one that belongs to another output is
+    removed only once that output is in place, and is otherwise left for that output's own next
+    export. A set-aside bundle named by a release before the output was part of the name is never
+    touched (whose it is cannot be told). Nothing is touched while the export that made it holds its
+    lock, and never a symbolic link or a non-directory."""
     parent = out.parent
     try:
         names = sorted(os.listdir(parent))
     except OSError:
         return
-    suffix = "." + out.name
+    changed = False
     for name in names:
-        if name.startswith(_STAGE_PREFIX):
-            prefix = _STAGE_PREFIX
-        elif name.startswith(_OLD_PREFIX):
-            prefix = _OLD_PREFIX
-        else:
-            continue
         path = parent / name
-        if path.is_symlink() or not path.is_dir():
-            continue
-        owner = _leftover_owner(name, prefix)
-        if not _is_stale(path, owner):
-            continue
-        if prefix == _OLD_PREFIX and owner >= 0 and not name.endswith(suffix):
-            # Another output's previous bundle: removed only once that output is back in place.
-            other = name[len(prefix):].partition("-")[2].partition(".")[2]
-            if not other or not (parent / other).exists():
+        if name.startswith(_STAGE_PREFIX):
+            if _leftover_output(name, _STAGE_PREFIX) is None and not _legacy_stage_abandoned(
+                path, _leftover_owner(name, _STAGE_PREFIX)
+            ):
                 continue
-        elif prefix == _OLD_PREFIX and owner < 0 and not out.exists():
-            continue  # a pre-pid previous bundle while out is missing: whose it is is unknown; leave it
-        if prefix == _OLD_PREFIX and owner >= 0 and name.endswith(suffix) and not os.path.lexists(out):
+            held = _atomic.claim(path, directory=True)
+            if held is None:
+                continue
             try:
-                os.rename(path, out)  # the killed run had moved the previous bundle aside: restore it
+                shutil.rmtree(path, ignore_errors=True)
+                changed = True
+            finally:
+                os.close(held)
+        elif name.startswith(_OLD_PREFIX):
+            owner_name = _leftover_output(name, _OLD_PREFIX)
+            if owner_name is None:
                 continue
-            except OSError:
+            mine = owner_name == out.name
+            if not mine and not os.path.lexists(parent / owner_name):
+                continue  # another output's only copy: its own next export restores it
+            held = _atomic.claim(path, directory=True)
+            if held is None:
                 continue
-        shutil.rmtree(path, ignore_errors=True)
+            try:
+                if mine and not os.path.lexists(out):
+                    try:
+                        os.rename(path, out)  # the killed run had moved the previous bundle aside: restore it
+                        changed = True
+                    except OSError:
+                        pass
+                    continue
+                shutil.rmtree(path, ignore_errors=True)  # superseded: its output is in place
+                changed = True
+            finally:
+                os.close(held)
+    if changed:
+        _atomic.fsync_dir(parent)
 
 
-def _write_stage(parent: Path, files: Dict[str, str]) -> Path:
-    stage = Path(tempfile.mkdtemp(prefix="%s%d-" % (_STAGE_PREFIX, os.getpid()), dir=str(parent)))
+def _write_stage(parent: Path, files: Dict[str, str], out: Path) -> Tuple[Path, int]:
+    """Write ``files`` to a new stage beside ``out`` and make them durable (every file and every
+    directory fsynced). Returns the stage and the descriptor that holds its lock; the caller closes
+    it once the stage is renamed into place or removed."""
+    stage_name, held = _atomic.create_unique(
+        lambda: str(parent / _leftover_name(_STAGE_PREFIX, out)), directory=True, mode=0o700
+    )
+    stage = Path(stage_name)
     try:
         os.chmod(stage, 0o700)
         root = os.path.realpath(stage)
@@ -754,31 +792,48 @@ def _write_stage(parent: Path, files: Dict[str, str]) -> Path:
             fd = os.open(target, flags, 0o600)
             with os.fdopen(fd, "wb") as fh:
                 fh.write(files[rel].encode("utf-8"))
+                fh.flush()
+                os.fsync(fh.fileno())  # durable before the bundle it is part of replaces the previous one
+        for directory in sorted(made, key=lambda d: d.count(os.sep), reverse=True) + [root]:
+            _atomic.fsync_dir(directory)
     except BaseException:
         shutil.rmtree(stage, ignore_errors=True)
+        os.close(held)
         raise
-    return stage
+    return stage, held
 
 
 def _swap_into_place(stage: Path, out: Path, existed: bool) -> None:
     """Move the staged bundle to ``out``: one rename when ``out`` is new, one exchange call when it exists.
 
     Without an exchange call (other platforms or filesystems) it falls back to two renames, which
-    leaves a moment with no ``out``; the previous bundle is restored if the second rename fails."""
+    leaves a moment with no ``out``: the previous bundle is locked before it is moved aside (so no
+    sweep takes it while this export runs) and restored if the second rename fails. The parent
+    directory is fsynced after the swap, before the previous bundle is deleted."""
+    parent = out.parent
     if not existed:
         os.rename(stage, out)
+        _atomic.fsync_dir(parent)
         return
     if _exchange_dirs(str(stage), str(out)):
+        _atomic.fsync_dir(parent)
         shutil.rmtree(stage, ignore_errors=True)  # the staging path now holds the previous bundle
         return
-    old = out.parent / ("%s%d-%s.%s" % (_OLD_PREFIX, os.getpid(), secrets.token_hex(8), out.name))
-    os.rename(out, old)
+    held = _atomic.hold(out, directory=True)
+    if held is None:
+        raise ExportError("%s is being replaced by another export" % out)
     try:
-        os.rename(stage, out)
-    except BaseException:
-        os.rename(old, out)
-        raise
-    shutil.rmtree(old, ignore_errors=True)
+        old = parent / _leftover_name(_OLD_PREFIX, out)
+        os.rename(out, old)
+        try:
+            os.rename(stage, out)
+        except BaseException:
+            os.rename(old, out)
+            raise
+        _atomic.fsync_dir(parent)
+        shutil.rmtree(old, ignore_errors=True)
+    finally:
+        os.close(held)
 
 
 def _staged_files(stage: Path) -> List[str]:
@@ -906,7 +961,7 @@ def export_bundle(
         files = dict(docs)
         files["index.md"] = _index_text(kept, profile.digest if index_profile_digest else None)
         files["log.md"] = _log_text(prior_log, day, _log_bullet(len(kept), counts))
-        stage = _write_stage(out_path.parent, files)
+        stage, stage_lock = _write_stage(out_path.parent, files, out_path)
         try:
             if bundle_gate is not None:
                 verdict = bundle_gate(str(stage), _staged_files(stage))
@@ -928,6 +983,8 @@ def export_bundle(
         except BaseException:
             shutil.rmtree(stage, ignore_errors=True)
             raise
+        finally:
+            os.close(stage_lock)  # held until the stage is in place or gone, so no sweep takes it first
         return ExportReport(
             out=str(out_path),
             day=day,

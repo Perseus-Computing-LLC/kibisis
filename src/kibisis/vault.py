@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 from collections import deque
 from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from . import _atomic
 from .admission import AdmissionDecision, FactDisposition, MemoryAdmissionGate
 from .crypto import (
     ENTRY_BINDING,
@@ -566,7 +567,11 @@ class SQLiteMemoryVault(
         if on_disk:
             # An erasure committed by an earlier process that died before its scrub finished is completed
             # here, before this open hands the vault to anyone (the debt is recorded with the delete).
-            self._resume_owed_scrub()
+            try:
+                self._resume_owed_scrub()
+            except BaseException:
+                self._conn.close()
+                raise
             self._restrict_permissions()
 
     def _connect(self, path: str, passphrase: Optional[str], memory_security: bool) -> None:
@@ -611,7 +616,8 @@ class SQLiteMemoryVault(
     @staticmethod
     def _adopt_converted(temp_path: str, path: str) -> None:
         """Put the converted copy in the plain file's place (``os.replace``) and drop the plain file's
-        WAL files. The copy's connection was checkpointed and closed before this runs."""
+        WAL files. The copy's connection was checkpointed and closed before this runs; the directory is
+        fsynced after the rename, so the encrypted file is the one a crash leaves at ``path``."""
         for ext in ("-wal", "-shm"):
             with contextlib.suppress(OSError):
                 os.unlink(path + ext)
@@ -619,6 +625,7 @@ class SQLiteMemoryVault(
         for ext in ("-wal", "-shm"):
             with contextlib.suppress(OSError):
                 os.unlink(temp_path + ext)
+        _atomic.fsync_dir(os.path.dirname(path) or ".")
 
     @property
     def encrypted_at_rest(self) -> bool:
@@ -952,8 +959,22 @@ class SQLiteMemoryVault(
             self._conn.commit()
         except BaseException:
             self._drop_argus()
+            # A COMMIT that fails (a busy lock, a full disk) leaves the transaction open; the caller is
+            # told the write failed, so it must not ride along with a later commit, and the connection
+            # must not be left inside it (every later write would nest and never commit).
+            if self._conn.in_transaction:
+                self._conn.rollback()
             raise
         self._flush_argus()
+
+    def _leave_failed_transaction(self) -> None:
+        """Roll back a transaction a failed step left open (a statement run outside :meth:`_write_tx`
+        opens one implicitly), dropping the Argus records queued in it. Raises if the rollback fails:
+        a connection must never be handed on inside a transaction nobody will commit."""
+        conn = getattr(self, "_conn", None)
+        if conn is not None and conn.in_transaction:
+            self._drop_argus()
+            conn.rollback()
 
     @staticmethod
     def _migrate_file_to_sqlcipher(path: str, passphrase: str) -> str:

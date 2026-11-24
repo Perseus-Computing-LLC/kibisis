@@ -359,6 +359,12 @@ next writable open removes them.
   by `KIBISIS_PASSPHRASE_FILE`, then `KIBISIS_PASSPHRASE`. A key file readable by group or others is refused
   (`_read_keyfile`, keys.py). `python -m kibisis.keys PATH` creates a 256-bit random key file with mode 0600
   and never prints it. Passphrases shorter than 12 characters are refused (`MIN_PASSPHRASE_LENGTH`, keys.py).
+- Temporary files: the key file, `export_snapshot(path=...)` (decrypted content) and an OKF export's staged
+  bundle are written under a name derived from the exact output name plus a random token, fsynced, renamed
+  (or linked) into place, and the directory fsynced. The writer holds an exclusive `flock` on its temporary
+  until it is gone; a later run for the same output removes a leftover once it can take that lock, whatever
+  pid either run had (`kibisis/_atomic.py`). A run killed after the key file was linked leaves a second name
+  of the key only until the next `kibisis.keys` run for that path.
 - Use: the content key is PBKDF2-HMAC-SHA256 at 600,000 iterations under a per-vault salt
   (`AESGCMCryptoEnvelopeProvider._derive_key`, crypto.py); each entry is sealed with AES-256-GCM under a
   fresh random nonce with the entry's identity as associated data (`encrypt`, protocols.py). The signing and digest
@@ -388,5 +394,7 @@ as exposed as the rest of the process's memory and no more. In every mode, words
 replaced entries stay in index pages and free pages until `scrub()` () rebuilds the index and vacuums;
 the MCP server's `forget` runs it, the library does not run it for you after a `tombstone()`. A tombstone
 that deletes content (and `migrate_plaintext`) records in its own transaction that a scrub is owed; the
-record is cleared only once a scrub has finished, so if the process stops in between, the next writable
-open runs the scrub before it returns.
+record is cleared only once a scrub has finished, and only if no other erasure was recorded (by any
+connection) since that scrub started, so if the process stops in between, the next writable open runs the
+scrub before it returns. A scrub that fails (a busy lock, a full disk) rolls its transaction back and keeps
+the record; the open that ran it carries on outside any transaction.
