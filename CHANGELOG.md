@@ -15,15 +15,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   records (or upgrading an older vault to the current format) happen in one transaction, so an open
   interrupted part way no longer leaves a file every later open refuses as tampered.
 - **Forget and erasure.** A delete that promises a scrub records that debt in the same transaction; if the
-  process stops before the scrub finishes, the next writable open completes it.
+  process stops before the scrub finishes, the next writable open completes it. A scrub clears only the debt
+  it covered, so an erasure committed by another process while it ran is still scrubbed later; a scrub that
+  fails (for example on a busy lock at open) rolls back fully, so writes made after it are committed.
+- **Failed commits.** A write whose commit fails is rolled back before the error is raised, so it cannot be
+  committed later by an unrelated write and the connection is not left inside a transaction.
 - **Durable commits.** File vaults run with `synchronous = FULL`: a write reported as committed (an AML
-  Add's acknowledgement included) survives an OS crash or power loss. Writes are somewhat slower.
+  Add's acknowledgement included) survives an OS crash or power loss. Writes are somewhat slower. Key
+  files, snapshot files and OKF bundles are fsynced (files and directories) before they replace anything,
+  and the directory again after the rename; the same directory sync follows the conversion of a plaintext
+  vault to SQLCipher.
 - **Key files.** `python -m kibisis.keys` writes the key under a temporary name and links it into place, so
   an interrupted run never leaves an empty key file; an empty key file named by `KIBISIS_PASSPHRASE_FILE`
-  is now an error rather than "no key".
+  is now an error rather than "no key". A temporary left by a killed run (even one that is a second name of
+  the installed key) is removed by the next run for that path, before it refuses an existing key.
+- **Temporary files of killed runs.** Snapshot files written with `export_snapshot(path=...)` and OKF
+  bundles use a fresh, locked temporary named after the exact output. The next export to the same output
+  removes a killed run's leftover (decrypted or ungated content) by checking its lock, not its pid, so
+  container runs (always pid 1) and reused pids no longer keep it, and a killed snapshot no longer makes
+  every later snapshot to that path fail.
 - **OKF export leftovers.** An export killed part way no longer leaves its staged (possibly ungated)
   bundle beside the output for good: the next export removes it, and puts back a previous bundle the killed
-  run had moved aside.
+  run had moved aside. A set-aside bundle is matched to its output by exact name, so exporting to `bundle`
+  no longer removes the previous bundle of `shared.bundle`.
 
 ## [0.1.0-alpha.17] - 2026-11-10
 

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import errno
 import os
+import re
 import secrets
 import stat
 from typing import Mapping, Optional
+
+from . import _atomic
 
 MIN_PASSPHRASE_LENGTH = 12
 ENV_FILE = "KIBISIS_PASSPHRASE_FILE"
@@ -39,92 +42,93 @@ def resolve_passphrase(explicit: Optional[str] = None, env: Optional[Mapping[str
 
 
 _TEMP_MARK = ".tmp-"
+#: What follows ``.<key file name>.tmp-`` in a temp name: ``<pid>-<hex>`` and nothing else. A sweep
+#: matches it whole, so the temp of another key file whose name starts with this one's is never taken
+#: for its own.
+_TEMP_TOKEN = re.compile(r"[0-9]+-[0-9a-f]+\Z")
 
 
 def _temp_prefix(path: str) -> str:
     return "." + os.path.basename(path) + _TEMP_MARK
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:  # PermissionError: alive, another user's
-        pass
-    return True
-
-
 def _sweep_stale_temps(path: str) -> None:
-    """Remove temp files a killed :func:`generate_keyfile` for ``path`` left beside it (its pid is gone).
-    They hold a key that was never installed, so nothing can depend on them."""
+    """Remove the temp files a killed :func:`generate_keyfile` for ``path`` left beside it.
+
+    A temp is removed only once its lock has been taken here, so never while the run that made it is
+    alive (that run holds the lock until the temp is gone), whatever pid either run has. A leftover is
+    either a key that was never installed or, when its run was killed between the link and the
+    unlink, a second name of the installed key: neither may outlive the run that made it."""
     directory = os.path.dirname(path) or "."
     prefix = _temp_prefix(path)
     try:
         names = os.listdir(directory)
     except OSError:
         return
+    removed = False
     for name in names:
-        if not name.startswith(prefix):
-            continue
-        pid_text = name[len(prefix):].split("-", 1)[0]
-        if not pid_text.isdigit() or _pid_alive(int(pid_text)):
+        if not name.startswith(prefix) or not _TEMP_TOKEN.match(name[len(prefix):]):
             continue
         full = os.path.join(directory, name)
+        fd = _atomic.claim(full)
+        if fd is None:
+            continue
         try:
-            if stat.S_ISREG(os.lstat(full).st_mode):
-                os.unlink(full)
+            os.unlink(full)
+            removed = True
         except OSError:
             pass
+        finally:
+            os.close(fd)
+    if removed:
+        _fsync_dir(directory)
 
 
 def _fsync_dir(directory: str) -> None:
-    try:
-        fd = os.open(directory or ".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
+    _atomic.fsync_dir(directory)
 
 
 def generate_keyfile(path: str) -> None:
     """Create a new 256-bit random key file with mode 0600. Refuses to overwrite.
 
     The key is written and fsynced under a temporary name beside ``path`` and then linked into place
-    in one step that fails when ``path`` exists, so ``path`` never exists without its whole key, and
-    a process killed part way leaves at most a temporary file (removed by the next run)."""
-    if os.path.lexists(path):
-        raise FileExistsError(errno.EEXIST, "File exists", path)
-    key = secrets.token_urlsafe(32) + "\n"
+    in one step that fails when ``path`` exists, so ``path`` never exists without its whole key. The
+    run holds a lock on the temp until it has removed it. A run killed part way leaves at most that
+    temp, and the next run for ``path`` removes it first, before it checks for (and refuses) an
+    existing key, so a temp that is a second name of the installed key does not survive either."""
     directory = os.path.dirname(path) or "."
     _sweep_stale_temps(path)
-    temp = os.path.join(directory, f"{_temp_prefix(path)}{os.getpid()}-{secrets.token_hex(4)}")
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    if os.path.lexists(path):
+        raise FileExistsError(errno.EEXIST, "File exists", path)
+    key = (secrets.token_urlsafe(32) + "\n").encode("utf-8")
+    temp, fd = _atomic.create_unique(
+        lambda: os.path.join(directory, f"{_temp_prefix(path)}{os.getpid()}-{secrets.token_hex(4)}")
+    )
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(key)
-            fh.flush()
-            os.fsync(fh.fileno())
         try:
-            os.link(temp, path)  # atomic, and never replaces an existing file
-        except FileExistsError:
-            raise
-        except OSError:
-            # A filesystem without hard links: an atomic rename instead, after a last check for a file
-            # at ``path`` (only a concurrent creator in the instant between the two could be replaced).
-            if os.path.lexists(path):
-                raise FileExistsError(errno.EEXIST, "File exists", path) from None
-            os.replace(temp, path)
+            view = memoryview(key)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+            try:
+                os.link(temp, path)  # atomic, and never replaces an existing file
+            except FileExistsError:
+                raise
+            except OSError:
+                # A filesystem without hard links: an atomic rename instead, after a last check for a file
+                # at ``path`` (only a concurrent creator in the instant between the two could be replaced).
+                if os.path.lexists(path):
+                    raise FileExistsError(errno.EEXIST, "File exists", path) from None
+                os.replace(temp, path)
+            _fsync_dir(directory)  # the key's own name is durable before its temp name goes
+        finally:
+            try:
+                os.unlink(temp)  # still under the lock, so no sweep takes the temp before this
+            except OSError:
+                pass
         _fsync_dir(directory)
     finally:
-        try:
-            os.unlink(temp)
-        except OSError:
-            pass
+        os.close(fd)
 
 
 def main(argv: Optional[list] = None) -> int:

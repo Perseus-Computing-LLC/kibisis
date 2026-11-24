@@ -13,10 +13,13 @@ import hmac
 import json
 import logging
 import os
+import re
+import secrets
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
+from . import _atomic
 from ._vault_crypto import EntryIntegrityError
 from ._vault_review import ORIGINS as VALID_ORIGINS
 from .models import EpistemicState
@@ -29,6 +32,50 @@ _TRUST_FACT_KEYS = ("attestations", "verification_pending", "human_reviews", "qu
 
 # The vault's logger: records keep the name callers filter on.
 logger = logging.getLogger("kibisis.vault")
+
+
+def _snapshot_temp_path(out_p: Path) -> Path:
+    """A fresh temp name for a snapshot written to ``out_p``: ``<stem>.tmp.<pid>-<16 hex><suffix>``."""
+    return out_p.parent / f"{out_p.stem}.tmp.{os.getpid()}-{secrets.token_hex(8)}{out_p.suffix}"
+
+
+def _sweep_snapshot_temps(out_p: Path) -> None:
+    """Remove the temps that killed exports to exactly ``out_p`` left beside it (decrypted content).
+
+    A name is matched whole against ``out_p``'s own pattern, never by prefix or suffix, and a temp is
+    removed only once its lock has been taken here, so never one a live export is still writing.
+    Temps named ``<stem>.tmp.<pid>`` by earlier releases (no lock) are removed once that pid is gone
+    or is this process's own (this release never writes that name)."""
+    stem, suffix = re.escape(out_p.stem), re.escape(out_p.suffix)
+    current = re.compile(stem + r"\.tmp\.[0-9]+-[0-9a-f]{16}" + suffix + r"\Z")
+    legacy = re.compile(stem + r"\.tmp\.([0-9]+)\Z")
+    parent = out_p.parent
+    try:
+        names = sorted(os.listdir(parent))
+    except OSError:
+        return
+    removed = False
+    for name in names:
+        if not current.match(name):
+            old = legacy.match(name)
+            if old is None:
+                continue
+            pid = int(old.group(1))
+            if pid != os.getpid() and _atomic.pid_alive(pid):
+                continue
+        full = parent / name
+        fd = _atomic.claim(full)
+        if fd is None:
+            continue
+        try:
+            os.unlink(full)
+            removed = True
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    if removed:
+        _atomic.fsync_dir(parent)
 
 
 class SnapshotMixin:
@@ -155,21 +202,32 @@ class SnapshotMixin:
         if path is not None:
             out_p = Path(path)
             out_p.parent.mkdir(parents=True, exist_ok=True)
-            tmp_p = out_p.with_suffix(f".tmp.{os.getpid()}")
             # The snapshot holds decrypted content. A plain open() inherited the umask (0644 on most
-            # hosts) and undid the vault's at-rest protection; create the file owner-only, refuse a
-            # pre-existing path, flush to disk, then rename so a reader sees all or nothing.
-            fd = os.open(tmp_p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            # hosts) and undid the vault's at-rest protection; create the file owner-only under a fresh
+            # name, flush it to disk, then rename it so a reader sees all or nothing. The temp is locked
+            # until it is renamed, so a killed export's temp (decrypted content) is recognised and
+            # removed by the next export to the same path, whatever pid either run has.
+            _sweep_snapshot_temps(out_p)
+            tmp_name, fd = _atomic.create_unique(lambda: _snapshot_temp_path(out_p), mode=0o600)
+            tmp_p = Path(tmp_name)
             try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(snapshot, f, indent=2, sort_keys=True)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp_p, out_p)
+                f = os.fdopen(fd, "w", encoding="utf-8")
             except BaseException:
+                os.close(fd)
                 with contextlib.suppress(OSError):
                     os.unlink(tmp_p)
                 raise
+            with f:  # closing it releases the temp's lock, only after the rename (or the cleanup)
+                try:
+                    json.dump(snapshot, f, indent=2, sort_keys=True)
+                    f.flush()
+                    os.fsync(f.fileno())
+                    os.replace(tmp_p, out_p)
+                except BaseException:
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp_p)
+                    raise
+            _atomic.fsync_dir(out_p.parent)  # the rename is durable before the export reports success
 
         return snapshot
 
