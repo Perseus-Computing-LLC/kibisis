@@ -490,3 +490,46 @@ def test_cache_mb_sets_the_page_cache_and_the_default_is_unchanged(tmp_path, mon
     assert before != -64 * 1024
     with pytest.raises(ValueError):
         SQLiteMemoryVault(str(tmp_path / "bad.db"), allow_plaintext=True, cache_mb=0)
+
+
+@pytest.mark.parametrize("kind", ("plain", "sqlcipher", "fallback"))
+def test_word_forms_is_off_by_default_and_matches_inflected_words_when_enabled(tmp_path, monkeypatch, kind):
+    if kind == "sqlcipher" and not vault_module._sqlcipher_available():
+        pytest.skip("sqlcipher3 is not installed")
+    vault = _open(kind, tmp_path / f"{kind}_forms.db", monkeypatch)
+    entries = [
+        ("aquarium", "reef", "We set up a 40-gallon saltwater tank in the living room."),
+        ("travel", "paris", "Alice moved to Paris in May 2023."),
+        ("school", "math", "Bob decide to study linear algebra every evening."),
+        ("hobbies", "hiking", "Carol enjoys weekend hikes in the hills."),
+        ("ops", "region", "Primary region is us-east-1 with failover to us-west-2."),
+    ]
+    for category, key, content in entries:
+        vault.put(category, key, content, epistemic_state="verified", origin="user")
+
+    # Off by default: "tanks" does not match singular "tank"; default == word_forms=False.
+    assert vault.search("tanks") == []
+    assert vault.search_keys("tanks") == []
+    assert vault.recall("tanks").results == []
+    for query in ("tank", "paris", "us-east-1"):
+        for match in ("all", "any"):
+            off_default = [(r.entity.key, round(r.rank_score, 9), r.snippet) for r in vault.search(query, match=match)]
+            off_explicit = [
+                (r.entity.key, round(r.rank_score, 9), r.snippet)
+                for r in vault.search(query, match=match, word_forms=False)
+            ]
+            assert off_default == off_explicit
+
+    # Enabled: inflections find base and sibling forms across search, search_keys, and recall.
+    assert [r.entity.key for r in vault.search("tanks", word_forms=True)] == ["reef"]
+    assert "<b>tank</b>" in vault.search("tanks", word_forms=True)[0].snippet.lower()
+    assert [h.key for h in vault.search_keys("tanks", word_forms=True)] == ["reef"]
+    assert [r.entity.key for r in vault.recall("tanks", word_forms=True).results] == ["reef"]
+
+    assert [r.entity.key for r in vault.search("alice moving", match="all", word_forms=True)] == ["paris"]
+    assert [r.entity.key for r in vault.search("where is bob studying", match="any", word_forms=True)] == ["math"]
+    assert [r.entity.key for r in vault.search("studies", word_forms=True)] == ["math"]
+    assert [r.entity.key for r in vault.search("carol hike", match="all", word_forms=True)] == ["hiking"]
+    assert [r.entity.key for r in vault.search("us-east-1", match="all", word_forms=True)] == ["region"]
+    vault.close()
+
