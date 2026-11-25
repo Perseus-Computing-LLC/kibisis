@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `KibisisMCPServer(author=...)` sets the author recorded for that server's writes, refusals and recalls
   (default `mcp-agent`, unchanged for the stdio server).
 
+### Fixed
+- **Search with control characters in the query.** A query word holding U+0000 (or another C0 control
+  character that `str.split` keeps inside a word) reached FTS5 as a quoted phrase the query parser stops reading
+  at the NUL, so `search` raised `OperationalError: unterminated string` and the AML adapter answered Search with
+  500. Control characters now separate query words, as the FTS5 tokenizer already treats them in stored text.
+  Found by a CL-bench question that carries a binary dump.
+
 ## [0.1.0-alpha.17] - 2026-11-10
 
 ### Security

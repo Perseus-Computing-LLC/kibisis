@@ -108,11 +108,17 @@ _EDGE_PUNCTUATION = re.compile(r"^[\W_]+|[\W_]+$")
 
 _WORD = re.compile(r"[^\W_]+")
 
+# C0 control characters (and DEL) that ``str.split`` keeps inside a word. The FTS5 tokenizer separates
+# words at them, and FTS5's query parser stops reading a quoted phrase at U+0000 ("unterminated
+# string"), so a query word carrying one made the whole search fail. They separate words here too.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0e-\x1b\x7f]")
+
 
 def _search_terms(query: str, match: str) -> List[str]:
     """Words of a search query, without surrounding punctuation and without words that have no letter or
-    digit. For ``match="any"`` also lowercased and without repeats, and without common function words and
-    single characters while other words remain."""
+    digit. Control characters separate words. For ``match="any"`` also lowercased and without repeats,
+    and without common function words and single characters while other words remain."""
+    query = _CONTROL_CHARS.sub(" ", query)
     words = [w for w in (_EDGE_PUNCTUATION.sub("", raw) for raw in query.split()) if _WORD.search(w)]
     if match != "any":
         return words
